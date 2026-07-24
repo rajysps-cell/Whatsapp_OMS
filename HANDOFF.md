@@ -25,7 +25,14 @@ single-file-per-page inline HTML/CSS/JS built as strings in `web.ts` (no framewo
 
 ## 1. ⚙️ Setup on a NEW PC (do this to make a copied folder work)
 
-**What to copy:** the ENTIRE `Whatsapp_OMS` folder. It can live at any path on the new PC (the code uses
+**Source of truth = GitHub (added 2026-07-24):** the project is a **private** repo at
+`https://github.com/rajysps-cell/Whatsapp_OMS` (branch `main`). To set up a new PC you can
+`git clone` it instead of copying the folder — but the repo **excludes secrets/state** (`.env`, `auth/`,
+`data.sqlite`, `node_modules/`), so after cloning you must recreate those (see **`CONVERSATION-LOG.md`** in the
+repo root, which also carries the latest session context + the pending read+send plan). To keep the GitHub copy
+current, commit + push after changes (`git add -A && git commit && git push`).
+
+**What to copy (if not cloning):** the ENTIRE `Whatsapp_OMS` folder. It can live at any path on the new PC (the code uses
 paths relative to the service dir, so it is not tied to `C:\Whatsapp_OMS`).
 
 **Files that MUST be in the copy** (they are git-ignored, so if you ever move via git they'd be missing — a
@@ -403,6 +410,16 @@ email:** `PRODUCT_REPORT_TO` (recipient; empty = no emails; set to `ruturajysps@
     suggestions, once the service is up). LAN reach = static IP `192.168.1.40:3000` + a manual firewall rule (§7).
 20. **Final Order ✕ remove button** — each Final Order row now has a ✕ that un-picks the item (`chosen=null`,
     `updateFinal`/`rmfinal` handler in `web.ts`), moving it back to the Unmatched section. Verified in-browser.
+21. **GitHub backup + read+send research (2026-07-24)** — pushed the project to a **private** GitHub repo
+    `github.com/rajysps-cell/Whatsapp_OMS` (secrets git-ignored; §1). Added `CONVERSATION-LOG.md` (session handoff
+    for continuing on another PC). Researched adding **read + send** WhatsApp messaging (user wants to send replies,
+    not just read): ruled out the official Meta Cloud API (**can't read existing customer group chats** — only 1:1
+    DMs + business-created ≤8-person groups) and whatsapp-web.js (user's choice). **Recommended: GREEN-API** — a
+    hosted service on the WhatsApp-Web linked-device protocol that reads **all incl. groups** on the existing number,
+    **sends**, delivers inbound via **polling** (no public URL needed), ~$8/mo; alternative is self-hosted **Baileys**.
+    Full plan (connector swap reusing the `WaEvent` core, phased/non-destructive rollout, open decisions) is in
+    **`CONVERSATION-LOG.md`**. **NOT yet implemented** — needs user decisions (hosted vs self-hosted; ban-risk on the
+    main number; dedicated number?). Implementing it will **reverse the §2 read-only hard constraint**.
 
 ---
 
