@@ -1,0 +1,22 @@
+# Linked-device credentials — NEVER commit. Whoever holds these controls the WhatsApp session.
+auth/
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Downloaded media / voice notes
+store/
+
+# Audit copies of daily product-export imports
+imports/
+
+# Deps & build
+node_modules/
+dist/
+
+# Local SQLite DB (aliases, processed msgs, chat names)
+data.sqlite
+data.sqlite-*
+
+# Env & logs
+.env
+*.log

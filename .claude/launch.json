@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "whatsapp-ingestion-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "services/whatsapp-ingestion"],
+      "port": 3000
+    },
+    {
+      "name": "whatsapp-ingestion",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start", "--prefix", "services/whatsapp-ingestion"],
+      "port": 3000
+    }
+  ]
+}

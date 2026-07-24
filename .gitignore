@@ -1,0 +1,26 @@
+# Root ignores. The service subtree also has its own services/whatsapp-ingestion/.gitignore;
+# these entries are belt-and-suspenders so secrets/state can NEVER be committed from the repo root.
+
+# Dependencies & build
+node_modules/
+dist/
+
+# Logs
+*.log
+
+# Claude Code local (machine-specific) settings — keep launch.json shared, ignore local overrides
+.claude/settings.local.json
+
+# --- Secrets & state that must NEVER be committed ---
+# WhatsApp linked-device session (whoever holds this controls the WhatsApp session)
+services/whatsapp-ingestion/auth/
+services/whatsapp-ingestion/.wwebjs_auth/
+services/whatsapp-ingestion/.wwebjs_cache/
+# Gmail app password + config
+services/whatsapp-ingestion/.env
+# Local SQLite DB (aliases, messages, chat catalog)
+services/whatsapp-ingestion/data.sqlite
+services/whatsapp-ingestion/data.sqlite-*
+# Downloaded media / audit copies of product-export imports
+services/whatsapp-ingestion/store/
+services/whatsapp-ingestion/imports/
