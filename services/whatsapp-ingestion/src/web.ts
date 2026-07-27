@@ -444,14 +444,11 @@ function matchPage(): string {
   .qty{width:52px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:6px;font-size:13px;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
   .pinfo{flex:1;min-width:0}
-  .pmain{font-size:13px;line-height:1.4;word-break:break-word}
+  .pmain{font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cust{font-size:11px;color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
-  .stock{display:inline-block;font-size:10px;font-weight:700;border-radius:10px;padding:1px 7px;white-space:nowrap;vertical-align:middle;background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0}
-  .stock.low{background:#fef3c7;color:#b45309;border-color:#fcd34d}
-  .stock.out{background:#fde8e8;color:var(--red);border-color:#f6b9b9}
   .exp{color:var(--mut);font-size:11px;flex-shrink:0;transition:transform .2s,color .2s}
   .row.open .exp{transform:rotate(90deg);color:var(--blue)}
   .expand{max-height:0;opacity:0;overflow:hidden;transition:max-height .25s ease,opacity .25s ease}
@@ -491,15 +488,14 @@ function el(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
 function cssq(s){return window.CSS&&CSS.escape?CSS.escape(s):s;}
-function stockBadge(p){if(!p||p.stock==null)return '';var s=+p.stock||0;var cls=s<=0?'out':(s<=5?'low':'');var n=Number.isInteger(s)?s:Math.round(s*100)/100;var txt=s<=0?'out of stock':(n.toLocaleString()+' in stock');return ' <span class="stock '+cls+'">'+txt+'</span>';}
-function fmt(p){var d=p.description||"";if(d.length>62)d=d.slice(0,62)+"…";return '<span class="code">'+esc(p.code)+'</span><span class="sep">—</span>'+esc(d)+stockBadge(p);}
+function fmt(p){var d=p.description||"";if(d.length>62)d=d.slice(0,62)+"…";return '<span class="code">'+esc(p.code)+'</span><span class="sep">—</span>'+esc(d);}
 function isOut(m){return m.outgoing!=null?!!m.outgoing:(m.fromMe||/warehouse/i.test(m.pushName||""));}
 function isBareUrl(s){s=String(s||"").trim().toLowerCase();return (s.indexOf("http://")===0||s.indexOf("https://")===0)&&s.indexOf(" ")<0&&s.indexOf("\\n")<0;}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
 async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];renderChats();}catch(e){}}
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(c.lastText||"")+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};navIdx=-1;renderChats();el("renamebtn").disabled=false;var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];el("msgs").innerHTML=ms.length?ms.map(function(m){var out=isOut(m);var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var tm=m.ts?new Date(m.ts*1000).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"";var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed)proc[m.messageId]=true;var mid=esc(m.messageId);var inner=(out?"":'<div class="who">'+esc(m.pushName||"customer")+'</div>')+esc(body)+'<span class="bt">'+tm+'<span class="sb" style="display:none"></span></span>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"");return '<div class="bubble '+(out?"out":"in")+(xable?" xable":"")+'" data-mid="'+mid+'">'+inner+'</div>';}).join(""):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];el("msgs").innerHTML=ms.length?ms.map(function(m){var out=isOut(m);var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var tm=m.ts?new Date(m.ts*1000).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"";var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed)proc[m.messageId]=true;var mid=esc(m.messageId);var inner=(out?"":'<div class="who">'+esc(m.pushName||"customer")+'</div>')+esc(body)+'<span class="bt">'+tm+'<span class="sb" style="display:none"></span></span>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"");return '<div class="bubble '+(out?"out":"in")+(xable?" xable":"")+'" data-mid="'+mid+'">'+inner+'</div>';}).join(""):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -569,7 +565,7 @@ function renderRight(){
   h+=matched.length?matched.map(rowHtml).join(""):'<div class="muted" style="font-size:12px;padding:0 2px 8px">None yet — resolve items below.</div>';
   h+='</div><div class="sect"><h2>Unmatched ('+unmatched.length+')</h2>';
   h+=unmatched.length?unmatched.map(rowHtml).join(""):'<div class="muted" style="font-size:12px;padding:0 2px 8px">All items matched.</div>';
-  h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><button class="btn green" id="copybtn">Copy</button></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table></div>';
+  h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table></div>';
   el("right").innerHTML=h;
   updateFinal();
 }
@@ -587,7 +583,7 @@ function expandRow(i){
 }
 function findProduct(i,code){var it=items[i];var pool=(it.results||[]).concat(it.suggestions||[]);for(var k=0;k<pool.length;k++)if(pool[k].code===code)return pool[k];return null;}
 function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[i].matched;items[i].chosen=p;items[i].learned=learn;if(learn){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:items[i].phrase,code:p.code,description:p.description})}).then(function(){loadCat();}).catch(function(){});}openIdx=null;renderRight();}
-function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+stockBadge(it.chosen)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
+function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
 
 // Typing in a row's search: <2 chars falls back to its suggestions; else live catalog search into .results.
 var doSearch=debounce(async function(i,q){if(!q||q.length<2){renderResults(i,items[i].suggestions||[]);return;}try{var d=await(await fetch("/api/products/search?limit=6&q="+encodeURIComponent(q))).json();items[i].results=d.results||[];var box=el("right").querySelector('.results[data-res="'+i+'"]');if(box)box.innerHTML=items[i].results.length?items[i].results.map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join(""):'<div class="noopt">No matches.</div>';}catch(e){}},220);
@@ -596,11 +592,15 @@ el("right").addEventListener("input",function(e){var t=e.target;if(t.classList.c
 el("right").addEventListener("click",function(e){
   var o=e.target.closest(".opt");if(o){choose(o.dataset.idx,o.dataset.code);return;}
   var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){items[ri].chosen=null;items[ri].learned=false;}renderRight();return;}
+  if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
   if(e.target.closest(".psearch")||e.target.closest(".expand"))return; // don't toggle when interacting inside the open panel
   var top=e.target.closest(".top");
   if(top&&!e.target.closest(".qty"))expandRow(+top.dataset.idx);
 });
+// Clear = discard the current extraction and reset the right panel (bubbles revert to Extract/Re-Extract).
+// Does NOT touch the database — nothing is un-processed; it just wipes the unsaved working order.
+function clearOrder(){active={};items=[];rebuildSources();renderRight();applyStates();}
 // Copy = complete the order: copy "qty,SKU", mark every extracted message Processed, then reset the panel.
 async function copyCsv(){
   var rows=items.filter(function(it){return it.chosen;});
@@ -613,8 +613,9 @@ async function copyCsv(){
   var saveItems=rows.map(function(it){return {qty:it.quantity||"1",code:it.chosen.code,description:it.chosen.description,phrase:it.phrase};});
   try{await fetch("/api/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,sources:sources,items:saveItems})});}catch(e){}
   mids.forEach(function(m){proc[m]=true;});
-  active={};items=[];rebuildSources();applyStates();
-  el("right").innerHTML='<div class="placeholder"><b style="color:var(--em2)">✓ Copied to clipboard</b><br>'+rows.length+' line item(s) · '+cnt+' message(s) marked <b>Processed</b>.<br><span class="muted">Click Extract on a message to start a new order.</span></div>';
+  // Keep the panel exactly as-is — just flash the button. The copy + "mark Processed" still happen (above);
+  // we only skip the reset so the extracted order stays visible after copying.
+  var cb=el("copybtn");if(cb){cb.textContent="Copied ✓";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},1600);}
 }
 
 loadCat();loadChats();setInterval(loadChats,6000);
