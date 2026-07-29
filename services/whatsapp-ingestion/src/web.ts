@@ -500,12 +500,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const srcs = Array.isArray(body['sources']) ? (body['sources'] as Array<{ messageId?: string; text?: string }>) : [];
     const itemsJson = JSON.stringify(body['items'] ?? []);
     let saved = 0;
+    const who = me.name || me.username; // attribute the completed order to whoever clicked Copy
     for (const s of srcs) {
       if (s && typeof s.messageId === 'string' && s.messageId) {
-        saveExtraction(s.messageId, cid, typeof s.text === 'string' ? s.text : '', itemsJson);
+        saveExtraction(s.messageId, cid, typeof s.text === 'string' ? s.text : '', itemsJson, who);
         saved++;
       }
     }
+    logger.info({ user: me.username, chatId: cid, messages: saved }, 'order marked processed');
     json(res, 200, { ok: saved > 0, saved });
     return;
   }
@@ -547,7 +549,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy })),
     });
     return;
   }
@@ -1036,9 +1038,12 @@ function matchPage(me: User): string {
   .live.warn .ldot{background:var(--amber);box-shadow:0 0 0 3px rgba(217,119,6,.15)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
   .user{font-size:12px;font-weight:600;color:var(--mut);padding-left:4px}
+  /* Columns: chat list fixed, order panel bounded, and the THREAD takes whatever is left.
+     (Previously .left was 40% while containing a fixed 262px list, so the thread — the main
+     content — collapsed to ~190px and messages wrapped at about 12 characters.) */
   .wrap{flex:1;display:flex;min-height:0}
-  .left{width:40%;border-right:1px solid var(--line);display:flex;min-height:0}
-  .chatcol{width:262px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
+  .left{flex:1;min-width:0;border-right:1px solid var(--line);display:flex;min-height:0}
+  .chatcol{width:280px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
   .chatsearch{margin:10px;padding:9px 11px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:9px;font-size:13px;outline:none;transition:border-color .15s}
   .chatsearch:focus{border-color:var(--blue)}
   .chatlist{flex:1;overflow-y:auto;padding:0 6px 6px}
@@ -1128,7 +1133,25 @@ function matchPage(me: User): string {
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes flash{0%,100%{box-shadow:0 1px .5px rgba(11,20,26,.13)}30%{box-shadow:0 0 0 3px var(--em2),0 0 16px var(--em)}}
   .flash{animation:flash 1s ease}
-  .right{width:60%;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:16px;background:var(--bg)}
+  .right{width:clamp(340px,32%,520px);flex-shrink:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:16px;background:var(--bg)}
+  /* Narrow desktop / tablet: give the thread even more of the remaining width. */
+  @media (max-width:1100px){
+    .chatcol{width:240px}
+    .right{width:clamp(300px,34%,420px)}
+  }
+  /* Phone: three side-by-side columns cannot work — stack them and scroll the page. */
+  @media (max-width:860px){
+    body{overflow:auto}
+    header{flex-wrap:wrap;gap:8px 10px;padding:10px 14px}
+    header h1{font-size:14px}
+    .wrap{flex-direction:column;min-height:0}
+    .left{flex:none;flex-direction:column;border-right:0}
+    .chatcol{width:100%;max-height:38vh;border-right:0;border-bottom:1px solid var(--line)}
+    .thread{min-height:60vh}
+    .right{width:100%;flex:none;border-top:1px solid var(--line)}
+    .bubble{max-width:86%}
+    .msgs{padding:12px 12px 20px}
+  }
   .sect h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 10px}
   .row{border:1px solid var(--line);border-radius:12px;margin-bottom:8px;background:var(--panel);border-left:3px solid var(--line);transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px #0000000f;overflow:hidden}
   .row.matched{border-left-color:var(--em)}.row.unmatched{border-left-color:var(--amber)}.row.resolved{border-left-color:var(--em)}
@@ -1182,7 +1205,8 @@ function matchPage(me: User): string {
   <div class="right" id="right"><div class="placeholder">Click <b>Extract</b> on any customer message to add its products here.</div></div>
 </div>
 <script>
-var chats=[],curChat=null,items=[],active={},sources=[],proc={},openIdx=null,lastSig="",mentionMap={};
+var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
+var meName=${JSON.stringify(me.name || me.username)};
 // Sign-out is a POST so a third-party page can't force it with an <img>/<a> to /logout.
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
@@ -1210,7 +1234,7 @@ function quoteHtml(m){
   var body=m.replyText?fmtBody(m.replyText):'<span class="qm">Media</span>';
   return '<div class="q"><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
 }
-function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed)proc[m.messageId]=true;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div><div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div><div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
@@ -1227,7 +1251,7 @@ function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var c
   else{cls="warn";label=s?String(s):"connecting…";}
   box.className="live"+(cls?" "+cls:"");tx.textContent=label;box.title="WhatsApp connection: "+(s||"unknown");}
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(c.lastText||"")+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -1238,8 +1262,10 @@ function applyStates(){
     b.classList.toggle("ext",on);
     b.classList.toggle("done",done&&!on);
     var sb=b.querySelector(".sb");
-    if(sb){if(on){sb.className="sb e";sb.textContent="Extracted";sb.style.display="";}
-      else if(done){sb.className="sb d";sb.textContent="✓ Processed";sb.style.display="";}
+    // The button already reads "Extracted ✓", so no badge in that state — showing both said
+    // "Extracted" twice on the same bubble. The badge is only for the persistent Processed state,
+    // where it also names who completed the order.
+    if(sb){if(done&&!on){var by=procBy[mid];sb.className="sb d";sb.textContent=by?("✓ Processed by "+by):"✓ Processed";sb.style.display="";}
       else{sb.style.display="none";sb.textContent="";}}
     var btn=b.querySelector(".xbtn");
     if(btn&&!busy){btn.disabled=false;btn.classList.toggle("on",on);btn.classList.toggle("done",done&&!on);
@@ -1333,18 +1359,39 @@ el("right").addEventListener("click",function(e){
 // Clear = discard the current extraction and reset the right panel (bubbles revert to Extract/Re-Extract).
 // Does NOT touch the database — nothing is un-processed; it just wipes the unsaved working order.
 function clearOrder(){active={};items=[];rebuildSources();renderRight();applyStates();}
+// Clipboard with a fallback: the async API is blocked in some browsers/policies, so fall back to a
+// hidden textarea + execCommand. Returns false only when BOTH fail, which the caller must respect.
+async function copyText(s){
+  try{ await navigator.clipboard.writeText(s); return true; }catch(e){}
+  try{
+    var ta=document.createElement("textarea");
+    ta.value=s;ta.setAttribute("readonly","");
+    ta.style.position="fixed";ta.style.top="-1000px";ta.style.opacity="0";
+    document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,ta.value.length);
+    var ok=document.execCommand("copy");
+    document.body.removeChild(ta);
+    return !!ok;
+  }catch(e){ return false; }
+}
 // Copy = complete the order: copy "qty,SKU", mark every extracted message Processed, then reset the panel.
 async function copyCsv(){
   var rows=items.filter(function(it){return it.chosen;});
   // Nothing resolved → don't copy an empty order and (crucially) don't mark messages processed.
   if(!rows.length){var cb=el("copybtn");if(cb){var o=cb.textContent;cb.textContent="Resolve a product first";setTimeout(function(){cb.textContent=o;},1600);}return;}
   var csv=rows.map(function(it){return (it.quantity||"1")+","+it.chosen.code;}).join("\\n");
-  try{await navigator.clipboard.writeText(csv);}catch(e){}
+  // The clipboard can refuse (permission, unfocused page, browser policy). If it does we must NOT
+  // mark the order Processed — otherwise staff paste nothing and the order silently looks done.
+  var copied=await copyText(csv);
+  if(!copied){
+    var eb=el("copybtn");
+    if(eb){eb.textContent="Copy failed — try again";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},2600);}
+    return;
+  }
   var mids=Object.keys(active),cnt=mids.length;
   if(!cnt)return;
   var saveItems=rows.map(function(it){return {qty:it.quantity||"1",code:it.chosen.code,description:it.chosen.description,phrase:it.phrase};});
   try{await fetch("/api/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,sources:sources,items:saveItems})});}catch(e){}
-  mids.forEach(function(m){proc[m]=true;});
+  mids.forEach(function(m){proc[m]=true;procBy[m]=meName;});   // show "Processed by <you>" straight away
   // Keep the panel exactly as-is — just flash the button. The copy + "mark Processed" still happen (above);
   // we only skip the reset so the extracted order stays visible after copying.
   var cb=el("copybtn");if(cb){cb.textContent="Copied ✓";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},1600);}
@@ -1518,7 +1565,7 @@ function aliasPage(): string {
   .modal p{margin:0 0 18px;color:var(--mut);font-size:14px;line-height:1.5;word-break:break-word}
   .modal .r{display:flex;justify-content:flex-end;gap:10px}
 </style></head><body>
-<header><h1>Product Alias Management</h1><span class="muted" id="stat"></span><div class="spacer"></div><a class="navlink" href="/match">Order Matching</a><a class="navlink" href="/" style="margin-left:14px">Dashboard</a></header>
+<header><h1>Product Alias Management</h1><span class="muted" id="stat"></span><div class="spacer"></div><a class="navlink" href="/">Order Matching</a></header>
 <div class="wrap">
   <div class="toolbar">
     <div class="search"><span class="ic">&#9906;</span><input id="q" placeholder="Search by SKU, product name, or alias…" autocomplete="off"></div>
@@ -1601,11 +1648,11 @@ function startEdit(i){
   inp.addEventListener('keydown',function(ev){if(ev.key==='Enter'){done(true);}else if(ev.key==='Escape'){done(false);}});
 }
 async function commitEdit(i,val){var a=curAliases[i],code=curCode;var text=val.trim();if(text===a.text){renderChips();return;}var d=await post('/api/aliases/edit',{code:code,oldNorm:a.norm,alias:text});if(d.ok){curAliases=d.aliases;renderChips();toast('Alias updated');}else{toast(d.error||'Edit failed','err');renderChips();}}
-function askDelete(i){var a=curAliases[i],code=curCode;el('mText').textContent='Delete alias “'+a.text+'”?';el('modal').classList.add('on');el('mOk').onclick=async function(){el('modal').classList.remove('on');var d=await post('/api/aliases/delete',{code:code,norm:a.norm});if(d.ok){curAliases=d.aliases;renderChips();toast('Alias deleted');}else{toast('Delete failed','err');}};}
+function askDelete(i){var a=curAliases[i],code=curCode;el('mText').textContent='Delete alias “'+a.text+'”?';el('modal').classList.add('on');el('mOk').onclick=async function(){el('modal').classList.remove('on');var d=await post('/api/aliases/delete',{code:code,norm:a.norm});if(d.ok){curAliases=d.aliases;renderChips();loadStat();toast('Alias deleted');}else{toast('Delete failed','err');}};}
 el('mCancel').addEventListener('click',function(){el('modal').classList.remove('on');});
 el('modal').addEventListener('click',function(e){if(e.target===el('modal'))el('modal').classList.remove('on');});
 
-async function addAlias(){if(!curDetail)return;var inp=curDetail.querySelector('.newAlias');var btn=curDetail.querySelector('.addBtn');var text=inp.value.trim();if(!text){toast('Alias cannot be empty','err');return;}btn.disabled=true;var d=await post('/api/aliases/add',{code:curCode,alias:text});btn.disabled=false;if(d.ok){curAliases=d.aliases;renderChips();inp.value='';inp.focus();toast('Alias added');}else{toast(d.error||'Add failed','err');}}
+async function addAlias(){if(!curDetail)return;var inp=curDetail.querySelector('.newAlias');var btn=curDetail.querySelector('.addBtn');var text=inp.value.trim();if(!text){toast('Alias cannot be empty','err');return;}btn.disabled=true;var d=await post('/api/aliases/add',{code:curCode,alias:text});btn.disabled=false;if(d.ok){curAliases=d.aliases;renderChips();inp.value='';inp.focus();loadStat();toast('Alias added');}else{toast(d.error||'Add failed','err');}}
 
 loadStat();loadList();
 </script></body></html>`;

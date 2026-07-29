@@ -302,6 +302,9 @@ export function extractItems(text: string): ExtractedItem[] {
       .replace(/^\s*(?:pieces?|pcs?|pc|each|ea|units?|sets?|qty|nos?|x)\b[\s.:)\-–—]*/i, '')
       .replace(/^[\s.)\-–—•]+/, '')
       .replace(/\s*\b(?:asap|please|pls|plz|thanks?|thankyou|thx|today|tomorrow|tonight|urgent|urgently)\b\s*$/i, '')
+      // Drop trailing sentence punctuation ("… toilet flange ?") — it adds nothing to matching and
+      // would otherwise be baked into any alias learned from this phrase.
+      .replace(/[\s?!.,;:]+$/, '')
       .replace(/\s+/g, ' ')
       .trim();
     const meaningful = phrase.toLowerCase().split(/\s+/).filter((w) => w && !NOISE.has(w));

@@ -57,6 +57,7 @@ db.exec(`
 for (const [table, col] of [
   ['processed', 'message_text TEXT'],
   ['processed', 'items TEXT'],
+  ['processed', 'processed_by TEXT'], // display name of the user who completed the order
   ['aliases', 'alias_text TEXT'],
   ['messages', 'reply_to TEXT'],
   ['messages', 'reply_text TEXT'],
@@ -82,7 +83,12 @@ const getAliasRowStmt = db.prepare('SELECT product_code AS code, product_desc AS
 const delAliasStmt = db.prepare('DELETE FROM aliases WHERE phrase_norm = ?');
 const updAliasTextStmt = db.prepare('UPDATE aliases SET alias_text = ? WHERE phrase_norm = ?');
 const insProcessed = db.prepare(
-  'INSERT OR REPLACE INTO processed (message_id, chat_id, processed_at, message_text, items) VALUES (?, ?, ?, ?, ?)',
+  'INSERT OR REPLACE INTO processed (message_id, chat_id, processed_at, message_text, items, processed_by) VALUES (?, ?, ?, ?, ?, ?)',
+);
+// Who completed each message in a chat, for the "Processed by …" badge in the thread.
+const chatProcessedStmt = db.prepare(
+  'SELECT p.message_id AS id, p.processed_by AS who FROM processed p ' +
+    'JOIN messages m ON m.msg_id = p.message_id WHERE m.chat_id = ?',
 );
 const isProcessedStmt = db.prepare('SELECT 1 FROM processed WHERE message_id = ?');
 const setChatNameStmt = db.prepare(
@@ -182,9 +188,15 @@ export function updateAliasText(norm: string, text: string): void {
 }
 
 /** Mark a message processed, recording its text and the final matched items (JSON) for traceability. */
-export function saveExtraction(messageId: string, chatId: string, messageText: string, itemsJson: string): void {
+export function saveExtraction(
+  messageId: string,
+  chatId: string,
+  messageText: string,
+  itemsJson: string,
+  processedBy?: string,
+): void {
   if (!messageId) return;
-  insProcessed.run(messageId, chatId, Date.now(), messageText || null, itemsJson || null);
+  insProcessed.run(messageId, chatId, Date.now(), messageText || null, itemsJson || null, processedBy || null);
 }
 export function isProcessed(messageId: string): boolean {
   return isProcessedStmt.get(messageId) !== undefined;
@@ -239,6 +251,8 @@ export interface MsgRow {
   /** Quoted-reply context, when this message replies to another. */
   replyText?: string;
   replySender?: string;
+  /** Display name of the user who marked this message processed (Copy), if any. */
+  processedBy?: string;
 }
 
 // --- @mention names ------------------------------------------------------------------
@@ -459,6 +473,10 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     if (arr) arr.push(rr.emoji);
     else reMap.set(rr.msg_id, [rr.emoji]);
   }
+  const byMap = new Map<string, string>();
+  for (const pr of chatProcessedStmt.all(chatId) as Array<{ id: string; who: string | null }>) {
+    if (pr.who) byMap.set(pr.id, pr.who);
+  }
   return rows.map((r) => ({
     messageId: r.msg_id,
     sender: r.sender ?? '',
@@ -471,6 +489,7 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     reactions: reMap.get(r.msg_id) ?? [],
     replyText: r.reply_text ?? undefined,
     replySender: r.reply_sender ?? undefined,
+    processedBy: byMap.get(r.msg_id),
   }));
 }
 
