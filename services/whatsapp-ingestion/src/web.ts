@@ -1,5 +1,30 @@
 import http from 'node:http';
 import QRCode from 'qrcode';
+import {
+  COOKIE,
+  activeAdminCount,
+  changePassword,
+  cleanupAuth,
+  clearCookie,
+  createSession,
+  createUser,
+  deleteUser,
+  destroySession,
+  ensureSeedAdmin,
+  getUser,
+  listUsers,
+  login as authLogin,
+  readCookie,
+  sessionCookie,
+  sessionUser,
+  updateUser,
+  userExists,
+  validatePassword,
+  validateUsername,
+  verifyPassword,
+  type Role,
+  type User,
+} from './auth';
 import type { ChatStore } from './chat-store';
 import { config } from './config';
 import { logger } from './logger';
@@ -14,7 +39,9 @@ import {
   aliasesForProduct,
   deleteAlias,
   getAliasRow,
+  chatParticipants,
   isProcessed,
+  mentionNames,
   saveExtraction,
   setChatName,
   updateAliasText,
@@ -24,6 +51,8 @@ let status = 'starting';
 let qrDataUrl: string | null = null;
 let ordersProvider: () => Order[] = () => [];
 let chatStoreRef: ChatStore | null = null;
+/** Injected by index.ts so the UI can send a message through the live WhatsApp connection. */
+let sendMessageFn: ((chatId: string, text: string, mentions?: string[]) => Promise<string>) | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -64,6 +93,172 @@ function html(res: http.ServerResponse, body: string): void {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(body);
 }
+/**
+ * Boot-time self-check: render each page and parse its inline <script> blocks. Catches the
+ * template-literal escaping trap (\s / \d / \n eaten before the browser sees them), which
+ * otherwise ships a page whose JavaScript never runs.
+ */
+function checkInlineScripts(): void {
+  const fake: User = {
+    id: 0,
+    username: 'selfcheck',
+    name: 'selfcheck',
+    role: 'admin',
+    active: true,
+    mustChange: false,
+    createdAt: 0,
+    lastLogin: null,
+  };
+  const pages: Array<[string, string]> = [
+    ['/match', matchPage(fake)],
+    ['/admin', adminPage(fake)],
+    ['/aliases', aliasPage()],
+    ['/board', dashboardPage()],
+    ['/login', loginPage()],
+    ['/change-password', changePasswordPage(fake)],
+  ];
+  for (const [name, body] of pages) {
+    const blocks = body.match(/<script>([\s\S]*?)<\/script>/g) ?? [];
+    blocks.forEach((block, i) => {
+      const src = block.replace(/^<script>/, '').replace(/<\/script>$/, '');
+      try {
+        new Function(src);
+      } catch (err) {
+        logger.error(
+          { page: name, block: i, err: (err as Error).message },
+          'INLINE SCRIPT IS BROKEN — the page will render but its JavaScript will not run',
+        );
+      }
+    });
+  }
+}
+
+/** Caller's IP — behind the Cloudflare tunnel the socket is always localhost, so prefer its header. */
+function clientIp(req: http.IncomingMessage): string {
+  const cf = req.headers['cf-connecting-ip'];
+  const cfIp = Array.isArray(cf) ? cf[0] : cf;
+  if (cfIp) return cfIp.trim();
+  const xff = req.headers['x-forwarded-for'];
+  const xffVal = Array.isArray(xff) ? xff[0] : xff;
+  if (xffVal) return xffVal.split(',')[0]?.trim() ?? '';
+  return req.socket.remoteAddress ?? '';
+}
+/** True when the browser reached us over HTTPS (directly, or through the Cloudflare tunnel). */
+function isSecureReq(req: http.IncomingMessage): boolean {
+  const proto = req.headers['x-forwarded-proto'];
+  const first = Array.isArray(proto) ? proto[0] : proto;
+  if (first) return first.split(',')[0]?.trim() === 'https';
+  return (req.socket as { encrypted?: boolean }).encrypted === true;
+}
+function redirect(res: http.ServerResponse, to: string): void {
+  res.writeHead(302, { location: to });
+  res.end();
+}
+/** Escape for safe interpolation into server-rendered HTML. */
+function esc(s: unknown): string {
+  return String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string,
+  );
+}
+
+/** Admin user-management APIs + page. Returns true when it handled the request. */
+async function handleAdmin(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  path: string,
+  me: User,
+): Promise<boolean> {
+  if (path === '/qr') {
+    html(res, qrPage());
+    return true;
+  }
+  if (path === '/admin') {
+    html(res, adminPage(me));
+    return true;
+  }
+  if (path === '/api/users' && req.method !== 'POST') {
+    json(res, 200, { users: listUsers(), meId: me.id });
+    return true;
+  }
+  if (path === '/api/users/add' && req.method === 'POST') {
+    const body = await readBody(req);
+    const u = validateUsername(body['username']);
+    if (!u.ok) {
+      json(res, 200, { ok: false, error: u.error });
+      return true;
+    }
+    const p = validatePassword(body['password']);
+    if (!p.ok) {
+      json(res, 200, { ok: false, error: p.error });
+      return true;
+    }
+    if (userExists(u.value)) {
+      json(res, 200, { ok: false, error: 'That username is already taken.' });
+      return true;
+    }
+    const role: Role = body['role'] === 'admin' ? 'admin' : 'user';
+    createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true);
+    json(res, 200, { ok: true, users: listUsers() });
+    return true;
+  }
+  if (path === '/api/users/edit' && req.method === 'POST') {
+    const body = await readBody(req);
+    const id = Number(body['id']);
+    const target = getUser(id);
+    if (!target) {
+      json(res, 200, { ok: false, error: 'User not found.' });
+      return true;
+    }
+    const patch: { name?: string; role?: Role; active?: boolean; password?: string } = {};
+    if (body['name'] !== undefined) patch.name = String(body['name']).trim().slice(0, 80);
+    if (body['role'] !== undefined) patch.role = body['role'] === 'admin' ? 'admin' : 'user';
+    if (body['active'] !== undefined) patch.active = !!body['active'];
+    if (body['password']) {
+      const p = validatePassword(body['password']);
+      if (!p.ok) {
+        json(res, 200, { ok: false, error: p.error });
+        return true;
+      }
+      patch.password = p.value;
+    }
+    // Never let the last active admin be demoted or disabled — that would lock everyone out.
+    const losingAdmin =
+      (patch.role === 'user' && target.role === 'admin') || (patch.active === false && target.role === 'admin');
+    if (losingAdmin && activeAdminCount() <= 1) {
+      json(res, 200, { ok: false, error: 'This is the only administrator — promote another admin first.' });
+      return true;
+    }
+    if (target.id === me.id && patch.active === false) {
+      json(res, 200, { ok: false, error: 'You cannot disable your own account.' });
+      return true;
+    }
+    updateUser(id, patch);
+    json(res, 200, { ok: true, users: listUsers() });
+    return true;
+  }
+  if (path === '/api/users/delete' && req.method === 'POST') {
+    const body = await readBody(req);
+    const id = Number(body['id']);
+    const target = getUser(id);
+    if (!target) {
+      json(res, 200, { ok: false, error: 'User not found.' });
+      return true;
+    }
+    if (target.id === me.id) {
+      json(res, 200, { ok: false, error: 'You cannot delete your own account.' });
+      return true;
+    }
+    if (target.role === 'admin' && activeAdminCount() <= 1) {
+      json(res, 200, { ok: false, error: 'This is the only administrator — promote another admin first.' });
+      return true;
+    }
+    deleteUser(id);
+    json(res, 200, { ok: true, users: listUsers() });
+    return true;
+  }
+  return false;
+}
 function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     let data = '';
@@ -82,9 +277,19 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
-export function startWebServer(getOrders: () => Order[], chatStore: ChatStore): http.Server {
+export function startWebServer(
+  getOrders: () => Order[],
+  chatStore: ChatStore,
+  send?: (chatId: string, text: string, mentions?: string[]) => Promise<string>,
+): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
+  sendMessageFn = send ?? null;
+  ensureSeedAdmin(); // first run: create the admin account and write its one-time password
+  cleanupAuth(); // drop expired sessions / stale lockout rows
+  // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
+  // let an unauthenticated flood fill the disk that also holds chats/orders.
+  setInterval(cleanupAuth, 10 * 60 * 1000).unref();
 
   const server = http.createServer((req, res) => {
     void handle(req, res).catch((err) => {
@@ -96,6 +301,11 @@ export function startWebServer(getOrders: () => Order[], chatStore: ChatStore): 
       }
     });
   });
+
+  // Every page is a TS template literal, so a single-backslash regex (\s, \d, \n) silently becomes
+  // broken JS and the page renders with a dead script — no server error, no console error we'd see.
+  // Parse the inline scripts once at boot so that failure is loud instead of invisible.
+  checkInlineScripts();
 
   server.listen(config.webPort, config.webHost, () => {
     logger.info(
@@ -115,6 +325,138 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     res.end('ok');
     return;
   }
+
+  // --- auth gate -----------------------------------------------------------
+  // Everything except /login and /healthz requires a session. The site can send WhatsApp
+  // messages as the business, so an unauthenticated request must never reach a page or API.
+  const token = readCookie(req.headers.cookie, COOKIE);
+  const me = sessionUser(token);
+
+  // CSRF defence-in-depth: state-changing calls must come from our own origin. SameSite=Lax
+  // already blocks cross-site cookie POSTs; this rejects anything with a foreign Origin too.
+  if (req.method === 'POST') {
+    const origin = req.headers.origin;
+    if (origin) {
+      const host = req.headers.host ?? '';
+      let originHost = '';
+      try {
+        originHost = new URL(origin).host;
+      } catch {
+        originHost = ' '; // unparseable Origin never matches
+      }
+      if (originHost !== host) {
+        json(res, 403, { error: 'cross-origin request rejected' });
+        return;
+      }
+    }
+  }
+
+  if (path === '/login') {
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      const r = await authLogin(body['username'], body['password'], clientIp(req));
+      if (!r.ok) {
+        logger.warn({ username: String(body['username'] ?? '').slice(0, 40) }, 'failed login');
+        json(res, 401, { ok: false, error: r.error });
+        return;
+      }
+      const t = createSession(r.user.id);
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'set-cookie': sessionCookie(t, isSecureReq(req)),
+      });
+      res.end(JSON.stringify({ ok: true, mustChange: r.user.mustChange }));
+      logger.info({ user: r.user.username }, 'login ok');
+      return;
+    }
+    if (me) {
+      redirect(res, '/');
+      return;
+    }
+    html(res, loginPage());
+    return;
+  }
+  // POST-only: a GET logout can be triggered by any third-party page (<img src=".../logout">).
+  if (path === '/logout') {
+    if (req.method !== 'POST') {
+      redirect(res, me ? '/' : '/login');
+      return;
+    }
+    destroySession(token);
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'set-cookie': clearCookie(isSecureReq(req)),
+    });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (!me) {
+    if (path.startsWith('/api/')) {
+      json(res, 401, { error: 'not signed in' });
+      return;
+    }
+    redirect(res, '/login');
+    return;
+  }
+
+  // Forced password change (first login / admin reset) — nothing else is reachable until done.
+  if (me.mustChange && path !== '/change-password') {
+    if (path.startsWith('/api/')) {
+      json(res, 403, { error: 'password change required' });
+      return;
+    }
+    redirect(res, '/change-password');
+    return;
+  }
+  if (path === '/change-password') {
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      const v = validatePassword(body['password']);
+      if (!v.ok) {
+        json(res, 400, { ok: false, error: v.error });
+        return;
+      }
+      if (String(body['password']) !== String(body['confirm'] ?? '')) {
+        json(res, 400, { ok: false, error: 'Passwords do not match.' });
+        return;
+      }
+      // Outside the forced first-change, prove ownership: otherwise a single borrowed session
+      // (unattended browser, XSS issuing a same-origin POST) becomes a permanent account takeover,
+      // since changePassword signs every OTHER session out and keeps the caller's.
+      if (!me.mustChange && !(await verifyPassword(me.id, String(body['current'] ?? '')))) {
+        json(res, 400, { ok: false, error: 'Current password is incorrect.' });
+        return;
+      }
+      changePassword(me.id, v.value, token ?? undefined);
+      json(res, 200, { ok: true });
+      return;
+    }
+    html(res, changePasswordPage(me));
+    return;
+  }
+
+  // --- admin-only surface ---------------------------------------------------
+  // /qr shows the WhatsApp device-linking QR: scanning it links a phone to the business account
+  // with full read+send, outside this app and unaffected by disabling the OMS user. Admins only.
+  if (path === '/admin' || path === '/qr' || path.startsWith('/api/users')) {
+    if (me.role !== 'admin') {
+      if (path.startsWith('/api/')) {
+        json(res, 403, { error: 'admin only' });
+        return;
+      }
+      redirect(res, '/');
+      return;
+    }
+    const handled = await handleAdmin(req, res, path, me);
+    if (handled) return;
+  }
+
+  if (path === '/api/me') {
+    json(res, 200, { user: { id: me.id, username: me.username, name: me.name, role: me.role } });
+    return;
+  }
+
   if (path === '/api/orders') {
     json(res, 200, { status, ts: Math.floor(Date.now() / 1000), orders: ordersProvider() });
     return;
@@ -188,8 +530,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const list = chatStoreRef ? chatStoreRef.chats() : [];
     json(res, 200, {
       source: 'persisted',
+      status, // live-connection state for the header pill (this endpoint is already polled every 6s)
       chats: list.map((c) => ({ id: c.id, title: c.title, lastText: c.lastText, lastTs: c.lastTs, unread: c.unread, isGroup: c.isGroup })),
     });
+    return;
+  }
+  // People who can be @-mentioned in this chat (fetched once when a chat is opened).
+  const pm = path.match(/^\/api\/chats\/(.+)\/participants$/);
+  if (pm) {
+    json(res, 200, { participants: chatParticipants(decodeURIComponent(pm[1] ?? '')) });
     return;
   }
   const mm = path.match(/^\/api\/chats\/(.+)\/messages$/);
@@ -197,8 +546,56 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = decodeURIComponent(mm[1] ?? '');
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     json(res, 200, {
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m) })),
+      mentions: mentionNames(), // '@<id>' in a body -> display name
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender })),
     });
+    return;
+  }
+  // Send a message to a chat. Human-initiated only: one message per explicit click, always
+  // attributed to the signed-in user in the log. No bulk/automated sending anywhere in this app.
+  if (path === '/api/send' && req.method === 'POST') {
+    if (!sendMessageFn) {
+      json(res, 503, { ok: false, error: 'Sending is not available.' });
+      return;
+    }
+    if (status !== 'connected') {
+      json(res, 409, { ok: false, error: 'WhatsApp is not connected — reconnect before sending.' });
+      return;
+    }
+    const body = await readBody(req);
+    const chatId = typeof body['chatId'] === 'string' ? (body['chatId'] as string).trim() : '';
+    const text = typeof body['text'] === 'string' ? (body['text'] as string) : '';
+    if (!chatId || !/@(g\.us|c\.us|lid)$/.test(chatId)) {
+      json(res, 400, { ok: false, error: 'Pick a chat first.' });
+      return;
+    }
+    const trimmed = text.trim();
+    if (!trimmed) {
+      json(res, 400, { ok: false, error: 'Message is empty.' });
+      return;
+    }
+    if (trimmed.length > 4000) {
+      json(res, 400, { ok: false, error: 'Message is too long (max 4000 characters).' });
+      return;
+    }
+    // A real WhatsApp mention needs BOTH the id in the text ('@8355…') and the full JID here,
+    // otherwise it renders as plain text and the person is never notified.
+    const mentions = Array.isArray(body['mentions'])
+      ? (body['mentions'] as unknown[])
+          .filter((x): x is string => typeof x === 'string' && /^\d{5,}@(lid|c\.us)$/.test(x))
+          .slice(0, 32)
+      : [];
+    try {
+      const messageId = await sendMessageFn(chatId, trimmed, mentions);
+      logger.info(
+        { user: me.username, chatId, chars: trimmed.length, mentions: mentions.length, messageId },
+        'user sent message',
+      );
+      json(res, 200, { ok: true, messageId });
+    } catch (err) {
+      logger.error({ err, user: me.username, chatId }, 'send failed');
+      json(res, 500, { ok: false, error: 'WhatsApp rejected the message. Try again.' });
+    }
     return;
   }
   if (path === '/api/products/count') {
@@ -313,19 +710,105 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     html(res, aliasPage());
     return;
   }
-  if (path === '/qr') {
-    html(res, qrPage());
-    return;
-  }
   if (path === '/match') {
-    html(res, matchPage());
+    html(res, matchPage(me));
     return;
   }
-  html(res, dashboardPage());
+  // Home (/) and any unmatched path serve the Order Matching page directly (no redirect).
+  // The Kanban dashboard is retired from the public face; keep it reachable at /board only.
+  if (path === '/board') {
+    html(res, dashboardPage());
+    return;
+  }
+  html(res, matchPage(me));
 }
 
 export function closeWebServer(server: http.Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
+}
+
+// --- auth pages (login / forced password change / admin) ---
+/** Shared chrome for the small centred auth cards. */
+function authShell(title: string, inner: string, script: string): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>
+<style>
+  :root{color-scheme:light;--bg:#f0f2f5;--panel:#fff;--line:#e5e7eb;--tx:#111b21;--mut:#667781;--em:#10b981;--em2:#059669;--red:#dc2626}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+    font-family:'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
+  .card{width:100%;max-width:390px;background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:30px 28px;box-shadow:0 4px 22px #00000014}
+  .brand{display:flex;align-items:center;gap:9px;margin-bottom:6px}
+  .logo{width:32px;height:32px;border-radius:9px;background:var(--em);display:flex;align-items:center;justify-content:center;font-size:17px}
+  h1{font-size:17px;margin:0;font-weight:700}
+  .sub{color:var(--mut);font-size:13px;margin:0 0 20px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:14px 0 5px}
+  input{width:100%;padding:10px 12px;font-size:14px;border:1px solid var(--line);border-radius:9px;
+    background:#fff;color:var(--tx);outline:none;transition:border-color .15s}
+  input:focus{border-color:var(--em2)}
+  button{width:100%;margin-top:20px;padding:11px;font-size:14px;font-weight:600;color:#fff;background:var(--em);
+    border:0;border-radius:9px;cursor:pointer;transition:filter .15s}
+  button:hover{filter:brightness(1.07)}button:disabled{opacity:.6;cursor:default}
+  .err{display:none;margin-top:14px;padding:9px 11px;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;
+    border-radius:8px;font-size:13px}
+  .err.on{display:block}
+  .hint{margin-top:16px;font-size:12px;color:var(--mut);line-height:1.5}
+</style></head><body><div class="card">${inner}</div>
+<script>${script}</script></body></html>`;
+}
+
+function loginPage(): string {
+  return authShell(
+    'Sign in · WhatsApp OMS',
+    `<div class="brand"><div class="logo">💬</div><h1>WhatsApp OMS</h1></div>
+     <p class="sub">Sign in to continue</p>
+     <form id="f" autocomplete="on">
+       <label for="u">Username</label>
+       <input id="u" name="username" autocomplete="username" autofocus required>
+       <label for="p">Password</label>
+       <input id="p" name="password" type="password" autocomplete="current-password" required>
+       <button id="b" type="submit">Sign in</button>
+     </form>
+     <div class="err" id="e"></div>`,
+    `var f=document.getElementById("f"),b=document.getElementById("b"),e=document.getElementById("e");
+     f.addEventListener("submit",async function(ev){ev.preventDefault();e.className="err";b.disabled=true;b.textContent="Signing in…";
+       try{
+         var r=await fetch("/login",{method:"POST",headers:{"content-type":"application/json"},
+           body:JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})});
+         var d=await r.json();
+         if(d.ok){location.href=d.mustChange?"/change-password":"/";return;}
+         e.textContent=d.error||"Sign in failed.";e.className="err on";
+       }catch(err){e.textContent="Network error — please try again.";e.className="err on";}
+       b.disabled=false;b.textContent="Sign in";});`,
+  );
+}
+
+function changePasswordPage(me: User): string {
+  return authShell(
+    'Set a new password · WhatsApp OMS',
+    `<div class="brand"><div class="logo">🔑</div><h1>Set a new password</h1></div>
+     <p class="sub">Signed in as <b>${esc(me.username)}</b> — choose a password to continue.</p>
+     <form id="f">
+       ${me.mustChange ? '' : '<label for="cur">Current password</label><input id="cur" type="password" autocomplete="current-password" required>'}
+       <label for="p">New password</label>
+       <input id="p" type="password" autocomplete="new-password" autofocus required>
+       <label for="c">Confirm password</label>
+       <input id="c" type="password" autocomplete="new-password" required>
+       <button id="b" type="submit">Save password</button>
+     </form>
+     <div class="err" id="e"></div>
+     <p class="hint">At least 8 characters. Other devices signed in as you will be signed out.</p>`,
+    `var f=document.getElementById("f"),b=document.getElementById("b"),e=document.getElementById("e");
+     f.addEventListener("submit",async function(ev){ev.preventDefault();e.className="err";b.disabled=true;b.textContent="Saving…";
+       try{
+         var r=await fetch("/change-password",{method:"POST",headers:{"content-type":"application/json"},
+           body:JSON.stringify({current:(document.getElementById("cur")||{}).value||"",password:document.getElementById("p").value,confirm:document.getElementById("c").value})});
+         var d=await r.json();
+         if(d.ok){location.href="/";return;}
+         e.textContent=d.error||"Could not save.";e.className="err on";
+       }catch(err){e.textContent="Network error — please try again.";e.className="err on";}
+       b.disabled=false;b.textContent="Save password";});`,
+  );
 }
 
 // --- QR linking page (at /qr) ---
@@ -336,6 +819,158 @@ function qrPage(): string {
       ? `<p class="ok">Connected — <a href="/">dashboard</a> · <a href="/match">order matching</a>.</p>`
       : `<p class="muted">Preparing QR… this page refreshes automatically.</p>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="5"><title>Link WhatsApp</title><style>body{font-family:system-ui,sans-serif;max-width:420px;margin:48px auto;text-align:center;color:#111;padding:0 16px}img{border:1px solid #eee;border-radius:12px;padding:12px}.ok{color:#0a7d33;font-size:18px}.muted{color:#666}.s{margin-top:16px;color:#666;font-size:14px}</style></head><body><h2>Link WhatsApp (read-only)</h2>${body}<p class="s">On the phone: WhatsApp → Linked devices → Link a device</p></body></html>`;
+}
+
+// --- User administration (at /admin, admins only) ---
+function adminPage(me: User): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>User Management · WhatsApp OMS</title>
+<style>
+  :root{color-scheme:light;--bg:#f0f2f5;--panel:#fff;--line:#e5e7eb;--tx:#111b21;--mut:#667781;
+    --em:#10b981;--em2:#059669;--blue:#2563eb;--red:#dc2626;--amber:#d97706}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
+  header{display:flex;align-items:center;gap:12px;padding:13px 20px;background:var(--panel);
+    border-bottom:1px solid var(--line);box-shadow:0 1px 3px #0000001a;position:sticky;top:0;z-index:5}
+  header h1{font-size:15px;margin:0;font-weight:700}
+  .spacer{flex:1}
+  .navlink{color:var(--blue);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  .navlink:hover{text-decoration:underline}
+  .who{font-size:12px;color:var(--mut)}
+  .wrap{max-width:960px;margin:0 auto;padding:22px 18px 60px}
+  .bar{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+  .bar h2{font-size:14px;margin:0;font-weight:700}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px #0000000f;overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);font-weight:700;background:#fafbfc}
+  tr:last-child td{border-bottom:0}
+  .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px}
+  .pill.admin{background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe}
+  .pill.user{background:#f1f5f9;color:#475569;border:1px solid #e2e8f0}
+  .pill.on{background:#eafaf0;color:var(--em2);border:1px solid #a7f3d0}
+  .pill.off{background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
+  .btn{border:0;border-radius:8px;padding:7px 13px;font-size:12.5px;font-weight:600;cursor:pointer;
+    transition:filter .15s;color:#fff;background:var(--em)}
+  .btn:hover{filter:brightness(1.07)}
+  .btn.ghost{background:#0000;border:1px solid var(--line);color:var(--mut)}
+  .btn.ghost:hover{border-color:var(--blue);color:var(--blue);filter:none}
+  .btn.danger{background:#0000;border:1px solid #fecaca;color:var(--red)}
+  .btn.danger:hover{background:#fef2f2;filter:none}
+  .btn:disabled{opacity:.45;cursor:default;filter:none}
+  .acts{display:flex;gap:6px;justify-content:flex-end}
+  .muted{color:var(--mut);font-size:12px}
+  .modal{position:fixed;inset:0;background:#0006;display:none;align-items:center;justify-content:center;padding:20px;z-index:20}
+  .modal.on{display:flex}
+  .sheet{background:#fff;border-radius:14px;padding:24px;width:100%;max-width:420px;box-shadow:0 12px 40px #00000026}
+  .sheet h3{margin:0 0 4px;font-size:16px}
+  .sheet .sub{color:var(--mut);font-size:12.5px;margin:0 0 14px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:12px 0 5px}
+  input,select{width:100%;padding:9px 11px;font-size:13.5px;border:1px solid var(--line);border-radius:8px;
+    background:#fff;color:var(--tx);outline:none}
+  input:focus,select:focus{border-color:var(--em2)}
+  .row2{display:flex;gap:10px}.row2>div{flex:1}
+  .sheetacts{display:flex;gap:8px;justify-content:flex-end;margin-top:20px}
+  .err{display:none;margin-top:12px;padding:9px 11px;background:#fef2f2;border:1px solid #fecaca;
+    color:#b91c1c;border-radius:8px;font-size:12.5px}
+  .err.on{display:block}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(70px);background:#111b21;
+    color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:30}
+  .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.err{background:var(--red)}
+</style></head><body>
+<header><h1>User Management</h1><span class="who">signed in as <b>${esc(me.username)}</b></span>
+  <div class="spacer"></div>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<div class="wrap">
+  <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
+    <button class="btn" id="addbtn">+ Add user</button></div>
+  <div class="card"><table><thead><tr>
+    <th>Username</th><th>Name</th><th style="width:96px">Role</th><th style="width:96px">Status</th>
+    <th style="width:150px">Last sign-in</th><th style="width:210px"></th>
+  </tr></thead><tbody id="tb"></tbody></table></div>
+  <p class="muted" style="margin-top:14px">New users must set their own password at first sign-in. Disabling a user
+    immediately signs them out everywhere.</p>
+</div>
+
+<div class="modal" id="modal"><div class="sheet">
+  <h3 id="mTitle">Add user</h3><p class="sub" id="mSub">They will set a new password at first sign-in.</p>
+  <div id="mFields">
+    <div id="wrapUser"><label for="fUser">Username</label><input id="fUser" autocomplete="off" placeholder="e.g. dhaval"></div>
+    <label for="fName">Full name</label><input id="fName" autocomplete="off" placeholder="e.g. Dhaval Patel">
+    <div class="row2">
+      <div><label for="fRole">Role</label><select id="fRole"><option value="user">User</option><option value="admin">Admin</option></select></div>
+      <div id="wrapActive"><label for="fActive">Status</label><select id="fActive"><option value="1">Active</option><option value="0">Disabled</option></select></div>
+    </div>
+    <label for="fPass" id="lPass">Password</label><input id="fPass" type="password" autocomplete="new-password" placeholder="at least 8 characters">
+  </div>
+  <div class="err" id="mErr"></div>
+  <div class="sheetacts"><button class="btn ghost" id="mCancel">Cancel</button><button class="btn" id="mSave">Save</button></div>
+</div></div>
+<div class="toast" id="toast"></div>
+<script>
+var users=[],meId=${me.id},editId=null;
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+function el(id){return document.getElementById(id);}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" err":"");setTimeout(function(){t.className="toast"+(bad?" err":"");},2600);}
+function when(ts){if(!ts)return '<span class="muted">never</span>';var d=new Date(ts);return d.toLocaleDateString([],{month:"short",day:"numeric"})+" "+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});}
+async function post(url,body){var r=await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});return r.json();}
+async function load(){var d=await(await fetch("/api/users")).json();users=d.users||[];meId=d.meId;render();}
+function render(){
+  el("count").textContent=users.length+" user"+(users.length===1?"":"s");
+  el("tb").innerHTML=users.map(function(u){
+    var self=u.id===meId;
+    return '<tr><td><b>'+esc(u.username)+'</b>'+(self?' <span class="muted">(you)</span>':'')+'</td>'+
+      '<td>'+esc(u.name||"—")+'</td>'+
+      '<td><span class="pill '+(u.role==="admin"?"admin":"user")+'">'+(u.role==="admin"?"Admin":"User")+'</span></td>'+
+      '<td><span class="pill '+(u.active?"on":"off")+'">'+(u.active?"Active":"Disabled")+'</span></td>'+
+      '<td class="muted">'+when(u.lastLogin)+'</td>'+
+      '<td><div class="acts">'+
+        '<button class="btn ghost" data-edit="'+u.id+'">Edit</button>'+
+        '<button class="btn danger" data-del="'+u.id+'"'+(self?" disabled":"")+'>Delete</button>'+
+      '</div></td></tr>';
+  }).join("");
+}
+function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
+  el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
+  el("fUser").value="";el("fName").value="";el("fRole").value="user";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
+function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
+  el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
+  el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
+  el("fName").value=u.name||"";el("fRole").value=u.role;el("fActive").value=u.active?"1":"0";
+  el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
+  el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
+function closeModal(){el("modal").className="modal";}
+async function save(){
+  var err=el("mErr"),btn=el("mSave");err.className="err";btn.disabled=true;btn.textContent="Saving…";
+  var d;
+  if(editId===null){
+    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,role:el("fRole").value,password:el("fPass").value});
+  }else{
+    var body={id:editId,name:el("fName").value,role:el("fRole").value,active:el("fActive").value==="1"};
+    if(el("fPass").value)body.password=el("fPass").value;
+    d=await post("/api/users/edit",body);
+  }
+  btn.disabled=false;btn.textContent="Save";
+  if(d.ok){users=d.users||users;render();closeModal();toast(editId===null?"User added":"User updated");}
+  else{err.textContent=d.error||"Could not save.";err.className="err on";}
+}
+async function del(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;
+  if(!window.confirm("Delete user \\""+u.username+"\\"? This cannot be undone."))return;
+  var d=await post("/api/users/delete",{id:id});
+  if(d.ok){users=d.users||[];render();toast("User deleted");}else{toast(d.error||"Delete failed",true);}}
+el("addbtn").addEventListener("click",openAdd);
+el("mCancel").addEventListener("click",closeModal);
+el("mSave").addEventListener("click",save);
+el("modal").addEventListener("click",function(e){if(e.target===el("modal"))closeModal();});
+document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
+el("tb").addEventListener("click",function(e){
+  var ed=e.target.closest("[data-edit]");if(ed){openEdit(+ed.dataset.edit);return;}
+  var dl=e.target.closest("[data-del]");if(dl&&!dl.disabled){del(+dl.dataset.del);return;}});
+el("mFields").addEventListener("keydown",function(e){if(e.key==="Enter")save();});
+load();
+</script></body></html>`;
 }
 
 // --- Kanban dashboard (at /) ---
@@ -378,7 +1013,7 @@ tick();setInterval(tick,4000);
 }
 
 // --- Order Matching page (at /match) ---
-function matchPage(): string {
+function matchPage(me: User): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp Order Matching</title>
 <style>
   :root{color-scheme:light;
@@ -392,6 +1027,15 @@ function matchPage(): string {
   header h1{font-size:15px;margin:0;font-weight:700;letter-spacing:.2px}
   .spacer{flex:1}.navlink{color:var(--blue);text-decoration:none;font-size:13px;font-weight:600}.navlink:hover{text-decoration:underline}
   .muted{color:var(--mut);font-size:12px}
+  /* Live-connection pill: green pulse when WhatsApp is linked, red when it needs a QR re-scan. */
+  .live{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:4px 11px;border-radius:20px;background:#eafaf0;color:var(--em2);border:1px solid #a7f3d0;white-space:nowrap}
+  .live .ldot{width:7px;height:7px;border-radius:50%;background:var(--em);box-shadow:0 0 0 3px rgba(16,185,129,.18);animation:pulse 2s ease-in-out infinite}
+  .live.off{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
+  .live.off .ldot{background:var(--red);box-shadow:0 0 0 3px rgba(220,38,38,.15);animation:none}
+  .live.warn{background:#fffbeb;color:#b45309;border-color:#fde68a}
+  .live.warn .ldot{background:var(--amber);box-shadow:0 0 0 3px rgba(217,119,6,.15)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .user{font-size:12px;font-weight:600;color:var(--mut);padding-left:4px}
   .wrap{flex:1;display:flex;min-height:0}
   .left{width:40%;border-right:1px solid var(--line);display:flex;min-height:0}
   .chatcol{width:262px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
@@ -403,36 +1047,86 @@ function matchPage(): string {
   .chatrow:hover{background:#f5f6f6}.chatrow.active{background:#f0f2f5;box-shadow:inset 0 0 0 1px #d1d7db}
   .chatrow .t{font-weight:600;font-size:13px;display:flex;justify-content:space-between;gap:6px}
   .chatrow .p{font-size:12px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
-  .badge{background:var(--em);color:#04210f;border-radius:10px;font-size:10px;padding:0 6px;font-weight:700}
+  /* WhatsApp-Web unread badge: white count on WhatsApp green, circular until it needs to widen. */
+  .badge{background:#25d366;color:#fff;border-radius:10px;min-width:19px;height:19px;padding:0 5px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;line-height:1;flex-shrink:0}
+  .chatrow.un .t{font-weight:700}
+  .chatrow.un .p{color:var(--tx);font-weight:500}
   .learned{background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:6px}
-  .thread{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg)}
-  .threadhead{padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
-  .threadhead .tt{font-weight:700;font-size:14px}
+  .thread{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg)}
+  .threadhead{padding:9px 16px;background:#f0f2f5;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+  .threadhead .tt{font-weight:600;font-size:15px;color:var(--tx)}
   .btn{background:var(--blue);color:#fff;border:0;border-radius:9px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s,transform .05s,border-color .15s,color .15s;display:inline-flex;align-items:center;gap:6px}
   .btn:hover{filter:brightness(1.08)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.5;cursor:default;filter:none}
   .btn.green{background:var(--em)}
   .btn.ghost{background:#0000;border:1px solid var(--line);color:var(--mut)}.btn.ghost:hover{border-color:var(--blue);color:var(--blue);filter:none}
   .iconbtn{width:34px;height:34px;padding:0;justify-content:center;font-size:13px}
-  .msgs{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px;background:var(--chatbg)}
-  .bubble{max-width:76%;padding:9px 12px;border-radius:12px;font-size:13px;line-height:1.4;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px #0000001f;border:1px solid transparent;border-left:3px solid transparent;transition:box-shadow .2s,background .2s,border-color .2s}
-  .in{align-self:flex-start;background:var(--card)}
-  .out{align-self:flex-end;background:var(--wa)}
-  .xable{cursor:pointer}.xable:hover{box-shadow:0 0 0 1px #2563eb40,0 2px 7px #0000001f}
-  .bubble .who{font-size:11px;color:var(--em2);margin-bottom:3px;font-weight:700}
-  .bubble .bt{display:block;font-size:10px;color:var(--mut);margin-top:4px;text-align:right}
-  .bubble.ext{border-left-color:var(--em);background:#eaf7ee}
-  .bubble.done{border-left-color:var(--em);background:#e9f2ec}
-  .sb{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;border-radius:8px;padding:1px 7px;margin-left:6px;vertical-align:middle}
+  .msgs{flex:1;overflow-y:auto;padding:12px 6% 22px;display:flex;flex-direction:column;gap:0;background:var(--chatbg)}
+  .daysep{align-self:center;margin:14px 0 8px}
+  .daysep span{background:#fff;color:#54656f;font-size:12.5px;font-weight:500;padding:5px 12px;border-radius:8px;box-shadow:0 1px .5px rgba(11,20,26,.13)}
+  .bubble{position:relative;max-width:65%;min-width:96px;padding:6px 9px 8px;border-radius:7.5px;font-size:14.2px;line-height:19px;box-shadow:0 1px .5px rgba(11,20,26,.13);margin-top:8px}
+  .bubble.grp{margin-top:2px}
+  .in{align-self:flex-start;background:#fff;border-top-left-radius:0}
+  .out{align-self:flex-end;background:var(--wa);border-top-right-radius:0}
+  .bubble.grp.in{border-top-left-radius:7.5px}.bubble.grp.out{border-top-right-radius:7.5px}
+  .in:not(.grp)::before{content:"";position:absolute;top:0;left:-8px;border-top:8px solid #fff;border-left:8px solid transparent}
+  .out:not(.grp)::before{content:"";position:absolute;top:0;right:-8px;border-top:8px solid var(--wa);border-right:8px solid transparent}
+  .who{font-size:12.8px;font-weight:600;margin-bottom:2px;line-height:1.2}
+  .tx{white-space:pre-wrap;word-break:break-word}
+  /* @mention: WhatsApp renders these as non-clickable coloured text (read-only here by design). */
+  .mn{color:#027eb5;font-weight:500}
+  /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
+  .q{display:flex;background:rgba(0,0,0,.055);border-radius:6px;overflow:hidden;margin-bottom:4px}
+  .out .q{background:rgba(0,0,0,.05)}
+  .q .qbar{width:4px;background:#06cf9c;flex-shrink:0}
+  .q .qin{padding:5px 9px;min-width:0;flex:1}
+  .qn{font-size:12.5px;font-weight:600;color:#06cf9c;margin-bottom:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .qt{font-size:13px;line-height:18px;color:rgba(11,20,26,.6);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+  .qm{font-style:italic;opacity:.85}
+  /* Composer — the only write surface in the app; one message per explicit send. */
+  .composer{display:flex;align-items:flex-end;gap:9px;padding:9px 14px;background:#f0f2f5;border-top:1px solid var(--line)}
+  .composer textarea{flex:1;resize:none;max-height:120px;padding:9px 13px;font:inherit;font-size:14px;line-height:20px;
+    border:1px solid var(--line);border-radius:9px;background:#fff;color:var(--tx);outline:none;transition:border-color .15s}
+  .composer textarea:focus{border-color:var(--em2)}
+  .composer textarea:disabled{background:#f6f7f8;color:var(--mut)}
+  .sendbtn{width:40px;height:40px;flex-shrink:0;border:0;border-radius:50%;background:var(--em);color:#fff;
+    font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:filter .15s,opacity .15s}
+  .sendbtn:hover:not(:disabled){filter:brightness(1.08)}
+  .sendbtn:disabled{opacity:.4;cursor:default}
+  .sendwarn{padding:6px 14px;background:#fffbeb;border-top:1px solid #fde68a;color:#b45309;font-size:12px;display:none}
+  .sendwarn.on{display:block}
+  /* @mention autocomplete — sits above the composer like WhatsApp's participant picker. */
+  .mentionbox{display:none;max-height:210px;overflow-y:auto;background:#fff;border-top:1px solid var(--line);
+    box-shadow:0 -4px 14px #0000000f}
+  .mentionbox.on{display:block}
+  .mrow{display:flex;align-items:center;gap:10px;padding:9px 14px;cursor:pointer;font-size:14px}
+  .mrow:hover,.mrow.sel{background:#f0f2f5}
+  .mav{width:30px;height:30px;border-radius:50%;background:var(--em);color:#fff;display:flex;
+    align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0;text-transform:uppercase}
+  .mnm{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .mhint{padding:8px 14px;color:var(--mut);font-size:12px}
+  .metarow{display:flex;align-items:center;gap:6px;justify-content:flex-end;margin-top:1px}
+  .meta{font-size:11px;color:rgba(11,20,26,.45);white-space:nowrap;user-select:none;line-height:1}
+  .ck{margin-left:3px;color:#53bdeb}
+  .react{position:absolute;bottom:-13px;background:#fff;border-radius:12px;padding:2px 6px;font-size:13px;box-shadow:0 1px 1.5px rgba(11,20,26,.16);display:inline-flex;align-items:center;line-height:1;white-space:nowrap}
+  .in .react{left:10px}.out .react{right:10px}
+  .rc{font-size:11px;color:#54656f;margin-left:2px;font-weight:500}
+  .bubble.hasreact{margin-bottom:15px}
+  .xable{cursor:pointer}
+  .xable:hover{box-shadow:0 1px .5px rgba(11,20,26,.13),0 0 0 2px #2563eb55}
+  .bubble.ext{box-shadow:0 0 0 2px var(--em),0 2px 9px rgba(16,185,129,.3)}
+  .bubble.done{box-shadow:0 0 0 1.5px #8ce3b5}
+  .sb{margin-right:auto;display:inline-block;font-size:10px;font-weight:700;border-radius:7px;padding:1px 6px;vertical-align:middle}
   .sb.e{background:var(--em);color:#04210f}.sb.d{background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0}
-  .xrow{margin-top:6px}
-  .xbtn{background:#eafaf0;border:1px solid #a7f3d0;color:var(--em2);font-size:11px;font-weight:600;border-radius:8px;padding:4px 12px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background .15s,border-color .15s,color .15s}
+  .xrow{margin-top:5px;display:none}
+  .xable:hover .xrow,.bubble.ext .xrow,.bubble.busy .xrow{display:block}
+  .xbtn{background:#eafaf0;border:1px solid #a7f3d0;color:var(--em2);font-size:11px;font-weight:600;border-radius:8px;padding:3px 11px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background .15s,border-color .15s,color .15s}
   .xbtn:hover{background:#d1fae5;border-color:var(--em)}
   .xbtn.on{background:var(--em);border-color:var(--em);color:#04210f}
   .xbtn.done{background:#0000;border-color:var(--line);color:var(--mut)}.xbtn.done:hover{border-color:var(--em);color:var(--em2)}
   .xbtn:disabled{cursor:default;opacity:.85}
   .spin{width:11px;height:11px;border:2px solid #04210f44;border-top-color:#04210f;border-radius:50%;display:inline-block;animation:spin .6s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
-  @keyframes flash{0%,100%{box-shadow:0 1px 1px #0000001f}30%{box-shadow:0 0 0 3px var(--em2),0 0 16px var(--em)}}
+  @keyframes flash{0%,100%{box-shadow:0 1px .5px rgba(11,20,26,.13)}30%{box-shadow:0 0 0 3px var(--em2),0 0 16px var(--em)}}
   .flash{animation:flash 1s ease}
   .right{width:60%;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:16px;background:var(--bg)}
   .sect h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 10px}
@@ -471,19 +1165,26 @@ function matchPage(): string {
   .rmfinal:hover{background:#fee2e2;color:#dc2626}
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
-<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><a class="navlink" href="/aliases">Aliases</a><a class="navlink" href="/">← Dashboard</a></header>
+<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="wrap">
   <div class="left">
     <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off"><div class="chatlist" id="chatlist"></div></div>
     <div class="thread">
       <div class="threadhead"><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
       <div class="msgs" id="msgs"><div class="placeholder">Pick a conversation on the left.</div></div>
+      <div class="mentionbox" id="mbox"></div>
+      <div class="composer" id="composer">
+        <textarea id="cinput" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter for a new line)" disabled></textarea>
+        <button class="sendbtn" id="sendbtn" disabled title="Send">➤</button>
+      </div>
     </div>
   </div>
   <div class="right" id="right"><div class="placeholder">Click <b>Extract</b> on any customer message to add its products here.</div></div>
 </div>
 <script>
-var chats=[],curChat=null,items=[],active={},sources=[],proc={},openIdx=null;
+var chats=[],curChat=null,items=[],active={},sources=[],proc={},openIdx=null,lastSig="",mentionMap={};
+// Sign-out is a POST so a third-party page can't force it with an <img>/<a> to /logout.
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
@@ -491,11 +1192,42 @@ function cssq(s){return window.CSS&&CSS.escape?CSS.escape(s):s;}
 function fmt(p){var d=p.description||"";if(d.length>62)d=d.slice(0,62)+"…";return '<span class="code">'+esc(p.code)+'</span><span class="sep">—</span>'+esc(d);}
 function isOut(m){return m.outgoing!=null?!!m.outgoing:(m.fromMe||/warehouse/i.test(m.pushName||""));}
 function isBareUrl(s){s=String(s||"").trim().toLowerCase();return (s.indexOf("http://")===0||s.indexOf("https://")===0)&&s.indexOf(" ")<0&&s.indexOf("\\n")<0;}
+// WhatsApp-Web thread rendering: date separators, group sender-name colors, reaction chips, read-only.
+function nameColor(k){k=String(k||"");var h=0;for(var i=0;i<k.length;i++)h=(h*31+k.charCodeAt(i))>>>0;return ["#e5679c","#00a884","#c98a00","#3aa0d1","#a45cff","#e5637a","#1fa855","#ff7a4d","#6a5cff","#0087d3","#b7791f","#d1457a"][h%12];}
+function fmtTime(ts){return ts?new Date(ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}):"";}
+function dayKeyOf(ts){var d=new Date(ts*1000);return d.getFullYear()+"-"+d.getMonth()+"-"+d.getDate();}
+function dayLabel(ts){var d=new Date(ts*1000),n=new Date();var a=new Date(n.getFullYear(),n.getMonth(),n.getDate()),b=new Date(d.getFullYear(),d.getMonth(),d.getDate());var diff=Math.round((a-b)/86400000);if(diff<=0)return"Today";if(diff===1)return"Yesterday";return d.toLocaleDateString([],{weekday:"short",month:"long",day:"numeric",year:"numeric"});}
+function reactSummary(arr){var u=[];for(var i=0;i<arr.length;i++)if(u.indexOf(arr[i])<0)u.push(arr[i]);return esc(u.slice(0,4).join(""))+(arr.length>1?'<span class="rc">'+arr.length+'</span>':"");}
+// SAFETY: escape the raw body FIRST, then swap '@<id>' for a highlighted name. Escaped text holds
+// no live markup, and the inserted name is escaped too, so a crafted message can't inject HTML.
+// (No entity produced by esc() contains '@', so this replace can never split one.)
+function fmtBody(s){return esc(s).replace(/@(\\d{5,})/g,function(m,id){var n=mentionMap[id];return n?'<span class="mn">@'+esc(n)+'</span>':m;});}
+function jidName(j){if(!j)return"";var id=String(j).split("@")[0].split(":")[0];return mentionMap[id]||"";}
+// WhatsApp-style quoted reply block shown above the message text, inside the same bubble.
+function quoteHtml(m){
+  if(!m.replyText&&!m.replySender)return"";
+  var who=jidName(m.replySender)||"Message";
+  var body=m.replyText?fmtBody(m.replyText):'<span class="qm">Media</span>';
+  return '<div class="q"><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
+}
+function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed)proc[m.messageId]=true;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div><div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+// Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
+function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
-async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];renderChats();}catch(e){}}
-function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(c.lastText||"")+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];el("msgs").innerHTML=ms.length?ms.map(function(m){var out=isOut(m);var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var tm=m.ts?new Date(m.ts*1000).toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"";var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed)proc[m.messageId]=true;var mid=esc(m.messageId);var inner=(out?"":'<div class="who">'+esc(m.pushName||"customer")+'</div>')+esc(body)+'<span class="bt">'+tm+'<span class="sb" style="display:none"></span></span>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"");return '<div class="bubble '+(out?"out":"in")+(xable?" xable":"")+'" data-mid="'+mid+'">'+inner+'</div>';}).join(""):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];setLive(d.status);renderChats();}catch(e){setLive("offline");}}
+// Header pill: green "Live chat" only when WhatsApp is actually linked; red/amber otherwise.
+function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var cls="",label="";
+  if(s==="connected"){cls="";label="Live chat";}
+  else if(s==="waiting for scan"){cls="off";label="Disconnected — scan QR";}
+  else if(s==="auth failure"){cls="off";label="Disconnected — re-link";}
+  else if(s==="disconnected"){cls="off";label="Disconnected — reconnecting…";}
+  else if(s==="offline"){cls="off";label="Server unreachable";}
+  else{cls="warn";label=s?String(s):"connecting…";}
+  box.className="live"+(cls?" "+cls:"");tx.textContent=label;box.title="WhatsApp connection: "+(s||"unknown");}
+function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(c.lastText||"")+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -618,7 +1350,98 @@ async function copyCsv(){
   var cb=el("copybtn");if(cb){cb.textContent="Copied ✓";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},1600);}
 }
 
-loadCat();loadChats();setInterval(loadChats,6000);
+// --- @mention autocomplete -------------------------------------------------------------
+// The textarea shows readable "@Name" while typing; on send each one is rewritten to the raw
+// "@<id>" WhatsApp expects and its JID is passed in the mentions array (both are required for a
+// real mention that highlights and notifies).
+var participants=[],mSel=0,mMatches=[],mStart=-1,drafted=[];
+async function loadParticipants(id){participants=[];try{var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/participants")).json();if(curChat===id)participants=d.participants||[];}catch(e){}}
+function hideMentions(){el("mbox").className="mentionbox";mMatches=[];mStart=-1;}
+function initials(n){var p=String(n||"?").trim().split(/\\s+/);return ((p[0]||"?")[0]+((p[1]||"")[0]||"")).trim();}
+// Find an '@word' immediately before the caret that isn't part of a longer token.
+function activeToken(){
+  var t=el("cinput"),pos=t.selectionStart,v=t.value;
+  var i=v.lastIndexOf("@",pos-1);
+  if(i<0)return null;
+  // NOTE: backslashes are doubled — this file is a TS template literal, so a single \\s or \\n
+  // would be eaten before the browser ever sees it (a raw newline inside a regex = syntax error).
+  if(i>0&&!/[\\s(]/.test(v[i-1]))return null;         // '@' must start a word
+  var frag=v.slice(i+1,pos);
+  if(/[\\s]/.test(frag))return null;                  // stop once they've typed past the name
+  return {start:i,text:frag};
+}
+function renderMentions(){
+  var box=el("mbox");
+  if(!mMatches.length){hideMentions();return;}
+  box.innerHTML=mMatches.map(function(p,i){
+    return '<div class="mrow'+(i===mSel?" sel":"")+'" data-i="'+i+'"><div class="mav">'+esc(initials(p.name))+'</div><div class="mnm">'+esc(p.name)+'</div></div>';
+  }).join("");
+  box.className="mentionbox on";
+  var sel=box.querySelector(".mrow.sel");if(sel)sel.scrollIntoView({block:"nearest"});
+}
+function updateMentions(){
+  var tok=activeToken();
+  if(!tok||!participants.length){hideMentions();return;}
+  var q=tok.text.toLowerCase();
+  mMatches=participants.filter(function(p){return !q||String(p.name).toLowerCase().indexOf(q)>=0;}).slice(0,8);
+  mStart=tok.start;mSel=0;renderMentions();
+}
+function pickMention(i){
+  var p=mMatches[i];if(!p)return;
+  var t=el("cinput"),v=t.value,pos=t.selectionStart;
+  var display="@"+p.name;
+  t.value=v.slice(0,mStart)+display+" "+v.slice(pos);
+  var caret=mStart+display.length+1;
+  t.focus();t.setSelectionRange(caret,caret);
+  drafted.push({display:display,id:p.id,jid:p.jid});
+  hideMentions();autoGrow();syncComposer();
+}
+// Swap each "@Name" the user picked back to "@<id>" and collect the JIDs WhatsApp needs.
+function resolveDraft(text){
+  var mentions=[],out=text;
+  drafted.forEach(function(d){
+    if(out.indexOf(d.display)<0)return;               // they edited it away — drop the mention
+    out=out.split(d.display).join("@"+d.id);
+    if(mentions.indexOf(d.jid)<0)mentions.push(d.jid);
+  });
+  return {text:out,mentions:mentions};
+}
+
+// --- composer: send a message into the open chat (human-initiated, one at a time) ---
+var sending=false;
+function autoGrow(){var t=el("cinput");t.style.height="auto";t.style.height=Math.min(t.scrollHeight,120)+"px";}
+function syncComposer(){var on=!!curChat&&!sending;el("cinput").disabled=!on;el("sendbtn").disabled=!on||!el("cinput").value.trim();}
+async function sendMsg(){
+  var t=el("cinput"),txt=t.value.trim();
+  if(!curChat||!txt||sending)return;
+  sending=true;syncComposer();el("sendbtn").textContent="…";
+  var res=resolveDraft(txt);
+  try{
+    var r=await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,text:res.text,mentions:res.mentions})});
+    var d=await r.json();
+    if(d.ok){t.value="";drafted=[];autoGrow();lastSig="";refreshThread();}   // clear + pull the sent message in
+    else{alert(d.error||"Could not send the message.");}
+  }catch(e){alert("Network error — the message was not sent.");}
+  sending=false;el("sendbtn").textContent="➤";syncComposer();t.focus();
+}
+el("sendbtn").addEventListener("click",sendMsg);
+el("cinput").addEventListener("input",function(){autoGrow();syncComposer();updateMentions();});
+el("cinput").addEventListener("blur",function(){setTimeout(hideMentions,150);}); // let a click land first
+el("cinput").addEventListener("keydown",function(e){
+  // While the picker is open the arrow/enter keys drive it instead of the composer.
+  if(mMatches.length){
+    if(e.key==="ArrowDown"){e.preventDefault();mSel=(mSel+1)%mMatches.length;renderMentions();return;}
+    if(e.key==="ArrowUp"){e.preventDefault();mSel=(mSel-1+mMatches.length)%mMatches.length;renderMentions();return;}
+    if(e.key==="Enter"||e.key==="Tab"){e.preventDefault();pickMention(mSel);return;}
+    if(e.key==="Escape"){e.preventDefault();hideMentions();return;}
+  }
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMsg();}   // Enter sends, Shift+Enter newlines
+});
+el("mbox").addEventListener("mousedown",function(e){   // mousedown: fires before the textarea blurs
+  var r=e.target.closest(".mrow");if(r){e.preventDefault();pickMention(+r.dataset.i);}
+});
+
+loadCat();loadChats();setInterval(loadChats,6000);setInterval(refreshThread,4000);
 </script></body></html>`;
 }
 

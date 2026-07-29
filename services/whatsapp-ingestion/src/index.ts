@@ -8,7 +8,7 @@ import { OrderStore } from './order-store';
 import { runProductImportWithReport } from './product-import';
 import * as products from './products';
 import { scheduleDailyTimes } from './scheduler';
-import { saveMessage, upsertCatalog } from './store';
+import { bumpUnread, clearUnread, saveMessage, upsertCatalog } from './store';
 import { startWaClient } from './wa-client';
 import { closeWebServer, setQr, setStatus, startWebServer } from './web';
 
@@ -56,6 +56,7 @@ function main(): void {
       const event = await toMessageEvent(msg);
       if (!event) return;
       chats.record(event);
+      bumpUnread(event.groupId, event.ts); // badge appears now, not at the next 2-min catalog sync
       logger.info({ event }, 'wa-event');
 
       let extraction: Extraction | null = null;
@@ -86,12 +87,16 @@ function main(): void {
       // The account's own outgoing messages: record them so warehouse replies show in history
       // and chats where our side spoke also appear. No order extraction on our own messages.
       const event = await toMessageEvent(msg);
-      if (event) chats.record(event);
+      if (event) {
+        chats.record(event);
+        clearUnread(event.groupId); // replying from the account marks the chat read in WhatsApp
+      }
     },
     onReaction: async (reaction) => {
       const event = toReactionEvent(reaction);
       if (!event) return;
       logger.info({ event }, 'wa-event');
+      chats.recordReaction(event); // persist so it renders on the message in /match
       const order = orders.ingestReaction(event);
       if (order) {
         logger.info(
@@ -110,7 +115,9 @@ function main(): void {
     onHistory: (rows) => rows.forEach(saveMessage),
   });
 
-  const server = startWebServer(() => orders.all(), chats);
+  const server = startWebServer(() => orders.all(), chats, (chatId, text, mentions) =>
+    client.send(chatId, text, mentions),
+  );
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 

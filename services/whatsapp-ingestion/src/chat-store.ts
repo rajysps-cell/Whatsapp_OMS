@@ -22,10 +22,20 @@ export class ChatStore {
       fromMe: e.fromMe,
       isGroup: e.isGroup,
       ts: e.ts,
+      // Reply context was previously computed in normalize.ts and then thrown away here.
+      replyTo: e.replyTo?.messageId,
+      replyText: e.replyTo?.text,
+      replySender: e.replyTo?.participant,
     });
     // Direct chat: the sender's WhatsApp display name IS the contact's real name → use it as the title.
     // (Group subjects aren't in the message payload, so groups keep an id-based title. ponytail: no getChat() eval.)
     if (!e.isGroup && !e.fromMe && e.pushName) store.setChatName(e.groupId, e.pushName);
+  }
+
+  /** Persist an emoji reaction so it shows on the message in /match (empty emoji = removed). */
+  recordReaction(e: WaEvent): void {
+    if (e.type !== 'reaction' || !e.reaction) return;
+    store.saveReaction(e.reaction.targetMessageId, e.sender, e.reaction.emoji, e.ts);
   }
 
   chats(): ChatSummary[] {

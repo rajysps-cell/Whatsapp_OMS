@@ -10,6 +10,8 @@ import { logger } from './logger';
 
 export interface WaClient {
   stop: () => Promise<void>;
+  /** Send a text message to a chat. Human-initiated only — never used for automated/bulk sending. */
+  send: (chatId: string, text: string, mentions?: string[]) => Promise<string>;
 }
 
 /** One chat from WhatsApp Web's own IndexedDB (the broken Store APIs bypassed). */
@@ -85,7 +87,9 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
       };
       sync();
       if (catalogTimer) clearInterval(catalogTimer); // 'ready' re-fires after reconnects
-      catalogTimer = setInterval(sync, 10 * 60 * 1000);
+      // 2 min: unread is bumped live on each message, so this only needs to catch up on reads
+      // done elsewhere (phone/WhatsApp Web) and correct any drift. ponytail: lower if it ever lags.
+      catalogTimer = setInterval(sync, 2 * 60 * 1000);
     }
     if (handlers.onHistory) {
       historyBackfill(client, handlers.onHistory).catch((err) =>
@@ -252,6 +256,13 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
   }
 
   return {
+    send: async (chatId: string, text: string, mentions?: string[]): Promise<string> => {
+      const opts = mentions && mentions.length ? { mentions } : undefined;
+      const sent = await client.sendMessage(chatId, text, opts);
+      const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
+      logger.info({ chatId, chars: text.length, messageId: id }, 'message sent');
+      return id;
+    },
     stop: async () => {
       if (catalogTimer) clearInterval(catalogTimer);
       try {

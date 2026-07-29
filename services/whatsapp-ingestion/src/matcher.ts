@@ -239,6 +239,15 @@ export interface ExtractedItem {
   phrase: string;
   quantity: string;
 }
+
+// Spelled-out counts customers write before a dash ("two – copper couplings"). Words are never
+// sizes, so they're unambiguous quantities (unlike a bare digit, which might be a size).
+const NUMWORDS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+  eighteen: 18, nineteen: 19, twenty: 20,
+};
+
 export function extractItems(text: string): ExtractedItem[] {
   const segments = String(text)
     .split(/[\n,;•]+|\band\b/gi)
@@ -252,16 +261,35 @@ export function extractItems(text: string): ExtractedItem[] {
     let quantity = '';
     let phrase = seg;
 
-    // "5 pumps" / "5x pumps" — but NOT when the leading number is a size (2' , 3/4, 6”), which must stay in the phrase.
-    let m = seg.match(/^\s*(\d+)(?![\/'"”“′″])\s*x?\b\s*(.+)$/i);
-    if (m) {
+    // "Two – copper couplings" / "Six half inch copper 90" — a leading count WORD is a quantity.
+    // Guard: "two inch pipe" is a SIZE, so a bare count word followed by a unit stays in the phrase;
+    // an explicit dash/x separator ("two – inch…") always means quantity.
+    let m = seg.match(/^\s*([a-z]+)\b\s*([-–—]\s*|x\s+)?(.+)$/i);
+    if (
+      m &&
+      NUMWORDS[m[1]!.toLowerCase()] !== undefined &&
+      (m[2] ||
+        !/^(?:inch|inches|in|foot|feet|ft|mm|cm|half|halves|quarter|quarters|third|thirds|eighth|eighths|sixteenth|sixteenths|"|”|'|′)\b/i.test(
+          m[3]!,
+        ))
+    ) {
+      quantity = String(NUMWORDS[m[1]!.toLowerCase()]);
+      phrase = m[3]!;
+    } else if ((m = seg.match(/^\s*(\d+)(?![\/'"”“′″])\s*(?:x\b|[-–—])?\s*(.+)$/i))) {
+      // "5 pumps" / "5x pumps" / "2 -Copper Street 90s" — but NOT when the leading number is a
+      // size (2' , 3/4, 6”), which must stay in the phrase.
       quantity = m[1]!;
       phrase = m[2]!;
     } else if ((m = seg.match(/^(.+?)\s*x\s*(\d+)\s*$/i))) {
       // "pumps x5"
       phrase = m[1]!;
       quantity = m[2]!;
-    } else if ((m = seg.match(/^(.+?)\s+(\d+)\s*$/)) && m[1]!.trim().length >= 2) {
+    } else if (
+      (m = seg.match(/^(.+?)\s+(\d+)\s*$/)) &&
+      m[1]!.trim().length >= 2 &&
+      // "1/2 inch 90" / "copper 45" — a trailing elbow ANGLE is part of the product, not a count.
+      !['90', '45', '22', '11', '60'].includes(m[2]!)
+    ) {
       // "pumps 5"
       phrase = m[1]!;
       quantity = m[2]!;

@@ -12,6 +12,9 @@ dist/
 .claude/settings.local.json
 
 # --- Secrets & state that must NEVER be committed ---
+# One-time admin credential handed over at first run (see auth.ts ensureSeedAdmin)
+*FIRST-LOGIN.txt
+first-login.txt
 # WhatsApp linked-device session (whoever holds this controls the WhatsApp session)
 services/whatsapp-ingestion/auth/
 services/whatsapp-ingestion/.wwebjs_auth/

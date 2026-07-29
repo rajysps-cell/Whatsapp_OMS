@@ -11,6 +11,7 @@
     "demo:orders": "tsx src/demo-orders.ts",
     "demo:match": "tsx src/demo-match.ts",
     "import:products": "tsx src/product-import.ts",
+    "set-password": "node scripts/set-password.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
