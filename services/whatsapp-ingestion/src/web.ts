@@ -175,6 +175,15 @@ const MIME_EXT: Record<string, string> = {
   'video/mp4': 'mp4', 'video/3gpp': '3gp',
   'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav',
   'application/pdf': 'pdf',
+  // Documents customers actually send. Without these they cached as ".bin" and would not open on
+  // a double-click, which reads as "the attachment is broken".
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/msword': 'doc',
+  'text/csv': 'csv',
+  'text/plain': 'txt',
+  'application/zip': 'zip',
 };
 function extFromMime(m: string): string {
   return MIME_EXT[String(m).split(';')[0]!.trim()] ?? 'bin';
@@ -183,6 +192,36 @@ function mimeFromExt(file: string): string {
   const ext = file.split('.').pop() ?? '';
   for (const [mime, e] of Object.entries(MIME_EXT)) if (e === ext) return mime;
   return 'application/octet-stream';
+}
+/** Cache-file basename for a message's media. Shared so the eager cacher and the request handler
+ *  never disagree about where a file lives. */
+export function mediaCacheKey(messageId: string): string {
+  return messageId.replace(/[^A-Za-z0-9_.@-]/g, '_').slice(0, 120);
+}
+export function mediaCacheDir(): string {
+  return nodePath.join(config.storeDir, 'media');
+}
+/**
+ * Write a downloaded media blob into the cache.
+ *
+ * The original filename goes in a sibling ".name" file rather than a database column: it is only
+ * needed to set Content-Disposition on the way back out, and a sidecar keeps this callable from
+ * the ingest path without a schema migration.
+ */
+export function writeMediaCache(messageId: string, data: string, mimetype: string, filename?: string): number {
+  const dir = mediaCacheDir();
+  const safe = mediaCacheKey(messageId);
+  const buf = Buffer.from(data, 'base64');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(nodePath.join(dir, `${safe}.${extFromMime(mimetype)}`), buf);
+  if (filename) {
+    try {
+      fs.writeFileSync(nodePath.join(dir, `${safe}.name`), filename.slice(0, 200), 'utf8');
+    } catch {
+      /* the file still serves, just under its generated name */
+    }
+  }
+  return buf.length;
 }
 /** decodeURIComponent that answers null instead of throwing on a malformed escape like "%" or "%zz". */
 function safeDecode(s: string): string | null {
@@ -405,9 +444,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       try {
         originHost = new URL(origin).host;
       } catch {
-        originHost = ' '; // unparseable Origin never matches
+        // Unparseable Origin: leave it empty and let the !originHost test below reject it.
+        // This used to be a sentinel character, which worked but put a raw NUL byte in the
+        // source — enough to make grep and diff treat this whole file as binary.
       }
-      if (originHost !== host) {
+      if (!originHost || originHost !== host) {
         json(res, 403, { error: 'cross-origin request rejected' });
         return;
       }
@@ -611,16 +652,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { error: 'missing id' });
       return;
     }
-    const safe = id.replace(/[^A-Za-z0-9_.@-]/g, '_').slice(0, 120);
-    const dir = nodePath.join(config.storeDir, 'media');
+    const safe = mediaCacheKey(id);
+    const dir = mediaCacheDir();
+    // Content-Disposition so a document saves under the name the customer sent it with, instead of
+    // "false_1203...@g.us_3EB0....pdf". inline keeps images and audio rendering in the page.
+    const disposition = (name?: string): Record<string, string> =>
+      name ? { 'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(name)}` } : {};
     try {
-      const hit = fs.readdirSync(dir).find((f) => f.startsWith(safe + '.'));
+      const hit = fs.readdirSync(dir).find((f) => f.startsWith(safe + '.') && !f.endsWith('.name'));
       if (hit) {
         const buf = fs.readFileSync(nodePath.join(dir, hit));
+        let name: string | undefined;
+        try {
+          name = fs.readFileSync(nodePath.join(dir, `${safe}.name`), 'utf8');
+        } catch {
+          /* no original filename recorded */
+        }
         res.writeHead(200, {
           'content-type': mimeFromExt(hit),
           'cache-control': 'private, max-age=86400',
           'content-length': buf.length,
+          ...disposition(name),
         });
         res.end(buf);
         return;
@@ -637,19 +689,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 404, { error: 'media could not be downloaded' });
       return;
     }
-    const buf = Buffer.from(got.data, 'base64');
+    let bytes: number;
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(nodePath.join(dir, `${safe}.${extFromMime(got.mimetype)}`), buf);
+      bytes = writeMediaCache(id, got.data, got.mimetype, got.filename);
     } catch (err) {
       logger.warn({ err }, 'could not cache media'); // serving still works
+      bytes = Buffer.byteLength(got.data, 'base64');
     }
     res.writeHead(200, {
       'content-type': got.mimetype,
       'cache-control': 'private, max-age=86400',
-      'content-length': buf.length,
+      'content-length': bytes,
+      ...disposition(got.filename),
     });
-    res.end(buf);
+    res.end(Buffer.from(got.data, 'base64'));
     return;
   }
   // People who can be @-mentioned in this chat (fetched once when a chat is opened).
@@ -1282,6 +1335,7 @@ function matchPage(me: User): string {
     border-radius:7px;color:var(--tx);text-decoration:none;font-size:13px}
   .mediadoc:hover{background:rgba(0,0,0,.08)}
   .medianote{font-size:12px;color:var(--mut);font-style:italic;padding:3px 0}
+  .tx.del{color:var(--mut);font-style:italic}
   /* @mention: WhatsApp renders these as non-clickable coloured text (read-only here by design). */
   .mn{color:#027eb5;font-weight:500}
   /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
@@ -1403,9 +1457,12 @@ function matchPage(me: User): string {
   .row .top:hover{background:#f9fbfd}
   .qty{width:44px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:4px 3px;font-size:13px;font-weight:600;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
-  .pinfo{flex:1;min-width:0}
-  .pmain{font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .cust{font-size:10.5px;color:var(--mut);margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
+  /* One physical line per order line: product and the customer's wording sit side by side rather
+     than stacked. Both children need min-width:0 or flex refuses to shrink them; .cust shrinks
+     first (flex:1 1 auto against .pmain's flex:0 1 auto) so the SKU is the last thing to be cut. */
+  .pinfo{flex:1;min-width:0;display:flex;align-items:baseline;gap:7px}
+  .pmain{flex:0 1 auto;min-width:0;font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cust{flex:1 1 auto;min-width:0;font-size:10.5px;color:var(--mut);margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
@@ -1507,10 +1564,14 @@ function mediaBlock(m){
   var k=m.kind||"", src="/api/media/"+encodeURIComponent(m.messageId);
   if(k==="image"||k==="sticker")
     return '<a class="mediaimg" href="'+src+'" target="_blank" rel="noopener"><img loading="lazy" src="'+src+'" alt="'+esc(k)+'" onerror="this.closest(\\'.mediaimg\\').outerHTML=\\'<div class=&quot;medianote&quot;>Image unavailable</div>\\'"></a>';
+  // Every branch needs an onerror. Without one a voice note whose download failed renders an
+  // <audio> element that just sits there doing nothing when clicked — which is exactly what
+  // "we don't see voice notes" looked like from the outside.
+  var fail=function(msg){return ' onerror="this.outerHTML=\\'<div class=&quot;medianote&quot;>'+msg+'</div>\\'"';};
   if(k==="voice"||k==="ptt"||k==="audio")
-    return '<audio class="mediaaud" controls preload="none" src="'+src+'"></audio>';
+    return '<audio class="mediaaud" controls preload="none" src="'+src+'"'+fail("Voice note unavailable")+'></audio>';
   if(k==="video"||k==="ptv")
-    return '<video class="mediavid" controls preload="none" src="'+src+'"></video>';
+    return '<video class="mediavid" controls preload="none" src="'+src+'"'+fail("Video unavailable")+'></video>';
   if(k==="document")
     return '<a class="mediadoc" href="'+src+'" target="_blank" rel="noopener">&#128206; Open document</a>';
   return "";
@@ -1560,8 +1621,9 @@ function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){
 // (No backticks in this comment: the page is a TS template literal and they would end the string.)
 var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 var mediaHtml=mediaBlock(m);
-var body=sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]")));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
-var inner=nm+quoteHtml(m)+mediaHtml+(body?'<div class="tx">'+fmtBody(body)+'</div>':'')+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
+var inner=nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+fmtBody(body)+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
@@ -1669,7 +1731,9 @@ function rowHtml(i){
   var it=items[i],ch=it.chosen;
   var cls=ch?(it.matched?(it.guess&&!it.learned?"matched guessed":"matched"):"resolved"):"unmatched";
   var head=ch
-    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust">&#8627; <b>Customer wrote:</b> '+esc(it.phrase)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
+    // Inline, the "Customer wrote:" label costs more room than it earns — the arrow says it, and
+    // the full wording stays available on hover for anything the ellipsis cuts.
+    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust" title="Customer wrote: '+esc(it.phrase)+'">&#8627; '+esc(it.phrase)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
     : '<div class="pinfo"><div class="pmain">'+esc(it.phrase)+'</div></div>';
   var top='<div class="top" data-idx="'+i+'"><input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<span class="exp">&#9656;</span></div>';
   var body='<div class="expand"><div class="inner"><input class="psearch" data-idx="'+i+'" placeholder="search products…" autocomplete="off"><div class="results" data-res="'+i+'"></div></div></div>';
@@ -1686,7 +1750,10 @@ function renderRight(){
   // Colour carries the state instead: green = matched, orange = still needs a product.
   var done=items.filter(function(it){return it.chosen;}).length;
   var h=panelHeadHtml();
-  h+='<div class="sect"><h2>Order lines &nbsp;<span class="cnt">'+done+' of '+items.length+' matched</span></h2>';
+  // Say how many messages fed this order. Customers routinely send one order as three messages and
+  // staff had no idea they could stack them — the client only discovered it by accident on a call.
+  var src=sources.length>1?' &nbsp;<span class="cnt">from '+sources.length+' messages</span>':'';
+  h+='<div class="sect"><h2>Order lines &nbsp;<span class="cnt">'+done+' of '+items.length+' matched</span>'+src+'</h2>';
   h+=items.map(function(_,i){return rowHtml(i);}).join("");
   h+='</div>';
   h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table></div>';

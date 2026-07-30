@@ -218,14 +218,23 @@ def build():
     s += steps([
         "Click a chat on the left. Chats with new messages appear at the top with a green badge.",
         "Find the customer's order message and click it. The system reads the products out of it.",
-        "The right panel fills with <b>Matched</b> items (a product was recognised) and "
-        "<b>Unmatched</b> items (it needs your help).",
-        "For each unmatched line, click it and search for the correct product. Your choice is "
+        "The right panel fills with the order lines, in the same order the customer wrote them. "
+        "A <b>green</b> line was recognised. An <b>orange</b> line needs your help.",
+        "For each orange line, click it and search for the correct product. Your choice is "
         "remembered — next time that wording matches automatically.",
         "Adjust quantities in the small box on the left of each row if needed.",
         "Click <b>Copy</b>. The order is copied to your clipboard as quantity and SKU, ready to "
         "paste into your ordering system.",
     ])
+
+    s += [Spacer(1, 4),
+          callout("One order spread over several messages",
+                  "Customers often send an order in pieces — \"send me this\", then \"and also "
+                  "this\". You do not have to do them one at a time. Click <b>Extract</b> on each "
+                  "message in turn and their products stack up into a single order in the right "
+                  "panel. The header tells you how many messages you have pulled in. Clicking an "
+                  "extracted message again removes just that message's lines, and <b>Copy</b> "
+                  "finishes the whole order and marks every one of those messages processed.")]
 
     s += [Spacer(1, 4),
           callout("The system learns from your corrections",
@@ -497,12 +506,19 @@ def build_user():
     s += [para("Processing an order", H2)]
     s += steps([
         "Click a chat on the left.",
-        "Click the customer's order message. Products appear on the right.",
-        "<b>Matched</b> items were recognised. <b>Unmatched</b> items need you: click one, "
-        "search for the right product, and pick it.",
+        "Click the customer's order message. Products appear on the right, in the order the "
+        "customer wrote them.",
+        "<b>Green</b> lines were recognised. <b>Orange</b> lines need you: click one, search for "
+        "the right product, and pick it.",
         "Check the quantities in the small boxes.",
         "Click <b>Copy</b> — the order is on your clipboard, ready to paste.",
     ])
+
+    s += [Spacer(1, 3),
+          callout("One order sent as several messages",
+                  "If a customer sends an order in pieces, click <b>Extract</b> on each message in "
+                  "turn — the products stack up into one order. Click an extracted message again "
+                  "to remove just its lines. <b>Copy</b> finishes them all together.")]
 
     s += [Spacer(1, 3),
           callout("It learns from you",

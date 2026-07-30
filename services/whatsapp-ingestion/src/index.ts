@@ -10,7 +10,15 @@ import * as products from './products';
 import { scheduleDailyTimes } from './scheduler';
 import { bumpUnread, clearUnread, recordSentBy, saveMessage, upsertCatalog } from './store';
 import { startWaClient } from './wa-client';
-import { closeWebServer, setQr, setStatus, startWebServer } from './web';
+import {
+  closeWebServer,
+  mediaCacheDir,
+  mediaCacheKey,
+  setQr,
+  setStatus,
+  startWebServer,
+  writeMediaCache,
+} from './web';
 
 /** Hours since products.csv was last written (Infinity if it's missing). */
 function catalogAgeHours(): number {
@@ -52,6 +60,40 @@ function main(): void {
   const chats = new ChatStore();
 
   /**
+   * Pull a message's media down the moment it arrives, instead of waiting for someone to open the
+   * thread.
+   *
+   * The download can only reach messages still in WhatsApp Web's in-memory collection, so anything
+   * fetched on demand hours later is simply gone — the request 404s forever. Voice notes took the
+   * blame for this because a failed <audio> element renders as a player that silently does nothing:
+   * "we don't see voice notes". Fetching on arrival is the only window where the data is reliably
+   * there.
+   */
+  const cacheMediaNow = async (
+    fetchMedia: (id: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>,
+    messageId: string,
+    kind: string | undefined, // reaction-only events carry no kind; it is just log context
+  ): Promise<void> => {
+    try {
+      const dir = mediaCacheDir();
+      const safe = mediaCacheKey(messageId);
+      // Already cached (a re-delivered message, or someone opened the thread first).
+      if (fs.existsSync(dir) && fs.readdirSync(dir).some((f) => f.startsWith(safe + '.') && !f.endsWith('.name'))) {
+        return;
+      }
+      const got = await fetchMedia(messageId);
+      if (!got) {
+        logger.warn({ messageId, kind }, 'media not downloadable on arrival — it will 404 later');
+        return;
+      }
+      const bytes = writeMediaCache(messageId, got.data, got.mimetype, got.filename);
+      logger.info({ messageId, kind, bytes, mimetype: got.mimetype }, 'media cached on arrival');
+    } catch (err) {
+      logger.warn({ err, messageId, kind }, 'eager media cache failed'); // on-demand fetch still tries later
+    }
+  };
+
+  /**
    * Who sent the next outgoing message in each chat, queued per chat.
    *
    * We cannot use the id returned by sendMessage: on @lid chats whatsapp-web.js gives back a
@@ -84,6 +126,10 @@ function main(): void {
       bumpUnread(event.groupId, event.ts); // badge appears now, not at the next 2-min catalog sync
       logger.info({ event }, 'wa-event');
 
+      // Grab the bytes while WhatsApp still has them (see cacheMediaNow). Deliberately not awaited:
+      // order extraction must not wait on a download.
+      if (event.media) void cacheMediaNow(client.media, event.messageId, event.kind);
+
       let extraction: Extraction | null = null;
       const text = event.text ?? event.media?.transcript;
       if (config.anthropicKey && text) {
@@ -114,6 +160,7 @@ function main(): void {
       const event = await toMessageEvent(msg);
       if (event) {
         chats.record(event);
+        if (event.media) void cacheMediaNow(client.media, event.messageId, event.kind);
         clearUnread(event.groupId); // replying from the account marks the chat read in WhatsApp
         // If this chat has a queued send from the app, this is that message — attribute it.
         const who = claimSend(event.groupId);

@@ -142,10 +142,27 @@ const upsertCatalogStmt = db.prepare(
     'unread = excluded.unread, alt_id = excluded.alt_id',
 );
 const catalogAllStmt = db.prepare('SELECT chat_id, name, is_group, last_ts, unread, alt_id FROM catalog_chats');
+// WhatsApp's own protocol traffic (encryption notices, group-membership events, call logs) is
+// stored but has neither text nor media, so it rendered as a blank bubble AND ate a slot in the
+// LIMIT window below, pushing real messages out of the thread. Drop the content-free ones only:
+// anything with a body, and every media kind, still shows.
+const SYSTEM_KINDS = [
+  'unknown',
+  'e2e_notification',
+  'gp2',
+  'notification_template',
+  'call_log',
+  'message_history_notice',
+  'biz_content_placeholder',
+  'interactive',
+];
 const chatMsgsStmt = db.prepare(`
   SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender FROM (
     SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender
-    FROM messages WHERE chat_id = ? ORDER BY ts DESC, msg_id DESC LIMIT ?
+    FROM messages
+    WHERE chat_id = ?
+      AND NOT (COALESCE(body, '') = '' AND kind IN (${SYSTEM_KINDS.map((k) => `'${k}'`).join(',')}))
+    ORDER BY ts DESC, msg_id DESC LIMIT ?
   ) ORDER BY ts ASC, msg_id ASC
 `);
 // Emoji reactions, keyed by (target message, reactor). Upsert on react, delete on un-react (empty emoji).

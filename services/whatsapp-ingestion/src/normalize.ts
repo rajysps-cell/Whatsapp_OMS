@@ -1,28 +1,16 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Message, Reaction } from 'whatsapp-web.js';
 import { config } from './config';
-import { logger } from './logger';
 import type { WaEvent, WaMediaRef, WaMessageKind, WaReplyContext } from './types';
 
 const KIND: Record<string, WaMessageKind> = {
   chat: 'text',
   image: 'image',
   video: 'video',
+  ptv: 'video', // round video note — without this a live one fell through to 'other' and rendered nothing
   audio: 'audio',
   ptt: 'voice', // push-to-talk = voice note
   document: 'document',
   sticker: 'sticker',
-};
-
-const EXT: Record<string, string> = {
-  image: 'jpg',
-  video: 'mp4',
-  audio: 'ogg',
-  voice: 'ogg',
-  document: 'bin',
-  sticker: 'webp',
-  other: 'bin',
 };
 
 function allowed(chatId: string): boolean {
@@ -62,7 +50,7 @@ export async function toMessageEvent(msg: Message): Promise<WaEvent | null> {
 
   let media: WaMediaRef | undefined;
   if (msg.hasMedia && kind !== 'text') {
-    media = await saveMedia(msg, kind);
+    media = describeMedia(msg, kind);
   }
 
   // Read the quoted reference straight from _data. msg.getQuotedMessage() does a
@@ -118,37 +106,20 @@ export function toReactionEvent(r: Reaction): WaEvent | null {
   };
 }
 
-async function saveMedia(msg: Message, kind: WaMessageKind): Promise<WaMediaRef> {
-  try {
-    const m = await msg.downloadMedia();
-    if (!m?.data) return { kind };
-    fs.mkdirSync(config.storeDir, { recursive: true });
-    const buf = Buffer.from(m.data, 'base64');
-    const file = path.join(config.storeDir, `${msg.id.id}.${EXT[kind] ?? 'bin'}`);
-    fs.writeFileSync(file, buf);
-
-    const ref: WaMediaRef = {
-      kind,
-      path: file,
-      mimetype: m.mimetype,
-      bytes: buf.length,
-      durationSec: Number((msg as { duration?: string }).duration) || undefined,
-    };
-    if (kind === 'voice' || kind === 'audio') {
-      const transcript = await transcribeVoice(file, m.mimetype);
-      if (transcript) ref.transcript = transcript;
-    }
-    return ref;
-  } catch (err) {
-    logger.error({ err, messageId: msg.id?.id }, 'media download failed');
-    return { kind };
-  }
-}
-
 /**
- * Voice-note transcription seam. STT engine not chosen yet (Whisper vs hosted API).
- * Only call site — swapping providers touches one function.
+ * Describe a message's media without downloading it.
+ *
+ * This used to call msg.downloadMedia(). That is the whatsapp-web.js path documented as broken on
+ * @lid chats (see wa-client.ts) — it failed on every single message, wrote no files, and the
+ * caller discarded the result anyway. The bytes are now fetched by the working page-level path in
+ * wa-client, cached on arrival by index.ts, and served from /api/media. All that is needed here is
+ * the metadata, which comes off the message for free.
  */
-async function transcribeVoice(_filePath: string, _mimetype?: string): Promise<string | undefined> {
-  return undefined; // TODO(stt)
+function describeMedia(msg: Message, kind: WaMessageKind): WaMediaRef {
+  return {
+    kind,
+    mimetype: (msg as { _data?: { mimetype?: string } })._data?.mimetype,
+    bytes: Number((msg as { _data?: { size?: number } })._data?.size) || undefined,
+    durationSec: Number((msg as { duration?: string }).duration) || undefined,
+  };
 }
