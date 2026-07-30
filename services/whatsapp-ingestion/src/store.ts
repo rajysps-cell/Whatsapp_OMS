@@ -34,6 +34,14 @@ db.exec(`
     ts        INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);
+  -- Messages this app sent, and who sent them. Authoritative attribution: recorded at send time
+  -- rather than parsed out of the message text, so the outgoing message can stay clean and
+  -- nobody can fake it by typing a signature.
+  CREATE TABLE IF NOT EXISTS sent_by (
+    msg_id   TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    ts       INTEGER NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS reactions (
     msg_id TEXT NOT NULL,
     sender TEXT NOT NULL,
@@ -85,6 +93,18 @@ const updAliasTextStmt = db.prepare('UPDATE aliases SET alias_text = ? WHERE phr
 const insProcessed = db.prepare(
   'INSERT OR REPLACE INTO processed (message_id, chat_id, processed_at, message_text, items, processed_by) VALUES (?, ?, ?, ?, ?, ?)',
 );
+const insSentBy = db.prepare('INSERT OR REPLACE INTO sent_by (msg_id, username, ts) VALUES (?, ?, ?)');
+const chatSentByStmt = db.prepare(
+  'SELECT s.msg_id AS id, s.username AS who FROM sent_by s ' +
+    'JOIN messages m ON m.msg_id = s.msg_id WHERE m.chat_id = ?',
+);
+
+/** Record that this app sent a message, and which user sent it. */
+export function recordSentBy(msgId: string, username: string): void {
+  if (!msgId || !username) return;
+  insSentBy.run(msgId, username, Date.now());
+}
+
 // Who completed each message in a chat, for the "Processed by …" badge in the thread.
 const chatProcessedStmt = db.prepare(
   'SELECT p.message_id AS id, p.processed_by AS who FROM processed p ' +
@@ -253,6 +273,8 @@ export interface MsgRow {
   replySender?: string;
   /** Display name of the user who marked this message processed (Copy), if any. */
   processedBy?: string;
+  /** Username who sent this message from the app (recorded at send time). */
+  sentBy?: string;
 }
 
 // --- @mention names ------------------------------------------------------------------
@@ -477,6 +499,10 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
   for (const pr of chatProcessedStmt.all(chatId) as Array<{ id: string; who: string | null }>) {
     if (pr.who) byMap.set(pr.id, pr.who);
   }
+  const sentMap = new Map<string, string>();
+  for (const sr of chatSentByStmt.all(chatId) as Array<{ id: string; who: string | null }>) {
+    if (sr.who) sentMap.set(sr.id, sr.who);
+  }
   return rows.map((r) => ({
     messageId: r.msg_id,
     sender: r.sender ?? '',
@@ -490,6 +516,7 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     replyText: r.reply_text ?? undefined,
     replySender: r.reply_sender ?? undefined,
     processedBy: byMap.get(r.msg_id),
+    sentBy: sentMap.get(r.msg_id),
   }));
 }
 

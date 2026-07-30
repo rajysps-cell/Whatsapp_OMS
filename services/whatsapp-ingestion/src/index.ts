@@ -8,7 +8,7 @@ import { OrderStore } from './order-store';
 import { runProductImportWithReport } from './product-import';
 import * as products from './products';
 import { scheduleDailyTimes } from './scheduler';
-import { bumpUnread, clearUnread, saveMessage, upsertCatalog } from './store';
+import { bumpUnread, clearUnread, recordSentBy, saveMessage, upsertCatalog } from './store';
 import { startWaClient } from './wa-client';
 import { closeWebServer, setQr, setStatus, startWebServer } from './web';
 
@@ -51,6 +51,31 @@ function main(): void {
   const orders = new OrderStore();
   const chats = new ChatStore();
 
+  /**
+   * Who sent the next outgoing message in each chat, queued per chat.
+   *
+   * We cannot use the id returned by sendMessage: on @lid chats whatsapp-web.js gives back a
+   * message whose id is unusable (empty), so the attribution record was silently skipped. The
+   * 'message_create' event, by contrast, carries the same id we persist in `messages` — so the
+   * username is queued just before sending and claimed when that event arrives.
+   */
+  const pendingSends = new Map<string, Array<{ who: string; at: number }>>();
+  const PENDING_TTL_MS = 60_000; // a stale entry must never attribute a phone-typed message
+  const queueSend = (chatId: string, who: string): void => {
+    const q = pendingSends.get(chatId) ?? [];
+    q.push({ who, at: Date.now() });
+    pendingSends.set(chatId, q);
+  };
+  const claimSend = (chatId: string): string | null => {
+    const q = pendingSends.get(chatId);
+    if (!q?.length) return null;
+    const fresh = q.filter((e) => Date.now() - e.at < PENDING_TTL_MS);
+    const next = fresh.shift() ?? null;
+    if (fresh.length) pendingSends.set(chatId, fresh);
+    else pendingSends.delete(chatId);
+    return next ? next.who : null;
+  };
+
   const client = startWaClient({
     onMessage: async (msg) => {
       const event = await toMessageEvent(msg);
@@ -90,6 +115,12 @@ function main(): void {
       if (event) {
         chats.record(event);
         clearUnread(event.groupId); // replying from the account marks the chat read in WhatsApp
+        // If this chat has a queued send from the app, this is that message — attribute it.
+        const who = claimSend(event.groupId);
+        if (who) {
+          recordSentBy(event.messageId, who);
+          logger.info({ chatId: event.groupId, user: who, messageId: event.messageId }, 'attributed sent message');
+        }
       }
     },
     onReaction: async (reaction) => {
@@ -115,9 +146,15 @@ function main(): void {
     onHistory: (rows) => rows.forEach(saveMessage),
   });
 
-  const server = startWebServer(() => orders.all(), chats, (chatId, text, mentions) =>
-    client.send(chatId, text, mentions),
-  );
+  const server = startWebServer(() => orders.all(), chats, async (chatId, text, mentions, sentBy) => {
+    if (sentBy) queueSend(chatId, sentBy); // queue BEFORE sending so message_create can claim it
+    try {
+      return await client.send(chatId, text, mentions);
+    } catch (err) {
+      claimSend(chatId); // send failed — drop the queued entry so it can't mis-attribute later
+      throw err;
+    }
+  });
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 

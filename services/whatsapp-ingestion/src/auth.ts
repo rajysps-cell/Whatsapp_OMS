@@ -117,12 +117,23 @@ export function validatePassword(pw: unknown): { ok: true; value: string } | { o
   if (s.length > 200) return { ok: false, error: 'Password is too long.' };
   return { ok: true, value: s };
 }
+/**
+ * Letters and numbers only — no spaces, no punctuation. Messages sent from the app are signed
+ * "-- <username>", and that line is parsed back out to attribute the message, so anything that
+ * could contain a space or look like punctuation would make the signature ambiguous.
+ */
 export function validateUsername(u: unknown): { ok: true; value: string } | { ok: false; error: string } {
   const s = String(u ?? '').trim();
-  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(s)) {
-    return { ok: false, error: 'Username: 3-32 chars, letters/numbers/._- only.' };
+  if (!s) return { ok: false, error: 'Username is required.' };
+  if (!/^[a-zA-Z0-9]{3,32}$/.test(s)) {
+    return { ok: false, error: 'Username must be 3-32 letters or numbers — no spaces or symbols.' };
   }
   return { ok: true, value: s };
+}
+
+/** Every account name, used to recognise the "-- <username>" signature on outgoing messages. */
+export function allUsernames(): string[] {
+  return (db.prepare('SELECT username FROM users').all() as Array<{ username: string }>).map((r) => r.username);
 }
 
 // --- users ---

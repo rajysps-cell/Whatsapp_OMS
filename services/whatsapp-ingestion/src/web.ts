@@ -18,6 +18,7 @@ import {
   sessionCookie,
   sessionUser,
   updateUser,
+  allUsernames,
   userExists,
   validatePassword,
   validateUsername,
@@ -42,6 +43,7 @@ import {
   chatParticipants,
   isProcessed,
   mentionNames,
+  recordSentBy,
   saveExtraction,
   setChatName,
   updateAliasText,
@@ -52,7 +54,9 @@ let qrDataUrl: string | null = null;
 let ordersProvider: () => Order[] = () => [];
 let chatStoreRef: ChatStore | null = null;
 /** Injected by index.ts so the UI can send a message through the live WhatsApp connection. */
-let sendMessageFn: ((chatId: string, text: string, mentions?: string[]) => Promise<string>) | null = null;
+let sendMessageFn:
+  | ((chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>)
+  | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -280,7 +284,7 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
 export function startWebServer(
   getOrders: () => Order[],
   chatStore: ChatStore,
-  send?: (chatId: string, text: string, mentions?: string[]) => Promise<string>,
+  send?: (chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
@@ -549,7 +553,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy })),
+      appUsers: allUsernames(), // names recognised in the "-- <username>" signature
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy })),
     });
     return;
   }
@@ -580,6 +585,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { ok: false, error: 'Message is too long (max 4000 characters).' });
       return;
     }
+    // Sign the message so WhatsApp readers can see who sent it: two blank lines, then a
+    // writing-hand emoji and the username in WhatsApp's bold markup. (Escaped rather than a
+    // literal emoji so the source stays plain ASCII.)
+    // Uppercase is display-only — the parser matches the name case-insensitively against accounts.
+    const signed = `${trimmed}\n\n✍🏼 BY *${me.username.toUpperCase()}*`;
     // A real WhatsApp mention needs BOTH the id in the text ('@8355…') and the full JID here,
     // otherwise it renders as plain text and the person is never notified.
     const mentions = Array.isArray(body['mentions'])
@@ -588,7 +598,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           .slice(0, 32)
       : [];
     try {
-      const messageId = await sendMessageFn(chatId, trimmed, mentions);
+      const messageId = await sendMessageFn(chatId, signed, mentions, me.username);
+      if (messageId) recordSentBy(messageId, me.username); // best-effort; index.ts also claims it
       logger.info(
         { user: me.username, chatId, chars: trimmed.length, mentions: mentions.length, messageId },
         'user sent message',
@@ -1038,6 +1049,22 @@ function matchPage(me: User): string {
   .live.warn .ldot{background:var(--amber);box-shadow:0 0 0 3px rgba(217,119,6,.15)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
   .user{font-size:12px;font-weight:600;color:var(--mut);padding-left:4px}
+  /* Offline curtain: blurs and blocks the app whenever WhatsApp is not connected, so nobody
+     types a reply into a dead connection or trusts a stale thread. */
+  .offline{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;
+    padding:24px;background:rgba(240,242,245,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+  .offline.on{display:flex}
+  .offbox{background:#fff;border:1px solid var(--line);border-radius:16px;padding:30px 34px;max-width:430px;
+    text-align:center;box-shadow:0 18px 50px #00000026}
+  .officon{font-size:38px;line-height:1;margin-bottom:12px}
+  .offbox h2{margin:0 0 8px;font-size:18px;font-weight:700}
+  .offbox p{margin:0;font-size:14px;line-height:1.6;color:var(--mut)}
+  .offnote{margin-top:14px;font-size:12.5px;color:var(--mut);background:var(--bg);border:1px solid var(--line);
+    border-radius:9px;padding:9px 12px;line-height:1.55;display:none}
+  .offnote.on{display:block}
+  .offbox.bad{border-color:#fecaca}
+  @keyframes tick{0%,100%{transform:rotate(0)}50%{transform:rotate(12deg)}}
+  .officon.wait{animation:tick 1.6s ease-in-out infinite}
   /* Columns: chat list fixed, order panel bounded, and the THREAD takes whatever is left.
      (Previously .left was 40% while containing a fixed 262px list, so the thread — the main
      content — collapsed to ~190px and messages wrapped at about 12 characters.) */
@@ -1087,6 +1114,11 @@ function matchPage(me: User): string {
   .qn{font-size:12.5px;font-weight:600;color:#06cf9c;margin-bottom:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .qt{font-size:13px;line-height:18px;color:rgba(11,20,26,.6);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
   .qm{font-style:italic;opacity:.85}
+  /* "Sent by <user>" — marks a message as sent from this app rather than typed in WhatsApp. */
+  .sentby{display:inline-block;margin-top:6px;font-size:11px;letter-spacing:.2px;
+    color:#3f6b57;background:#eafaf0;border:1px solid #a7f3d0;border-radius:20px;
+    padding:3px 11px;line-height:1.45}
+  .sentby b{color:var(--em2);font-weight:700}
   /* Composer — the only write surface in the app; one message per explicit send. */
   .composer{display:flex;align-items:flex-end;gap:9px;padding:9px 14px;background:#f0f2f5;border-top:1px solid var(--line)}
   .composer textarea{flex:1;resize:none;max-height:120px;padding:9px 13px;font:inherit;font-size:14px;line-height:20px;
@@ -1189,6 +1221,14 @@ function matchPage(me: User): string {
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
 <header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<div class="offline" id="offline">
+  <div class="offbox">
+    <div class="officon" id="officon">⏳</div>
+    <h2 id="offtitle">Connecting to WhatsApp…</h2>
+    <p id="offmsg">Waiting for the WhatsApp connection. This usually takes a few seconds.</p>
+    <div class="offnote" id="offnote"></div>
+  </div>
+</div>
 <div class="wrap">
   <div class="left">
     <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off"><div class="chatlist" id="chatlist"></div></div>
@@ -1206,7 +1246,7 @@ function matchPage(me: User): string {
 </div>
 <script>
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
-var meName=${JSON.stringify(me.name || me.username)};
+var meName=${JSON.stringify(me.name || me.username)},appUsers=[];
 // Sign-out is a POST so a third-party page can't force it with an <img>/<a> to /logout.
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
@@ -1227,6 +1267,36 @@ function reactSummary(arr){var u=[];for(var i=0;i<arr.length;i++)if(u.indexOf(ar
 // (No entity produced by esc() contains '@', so this replace can never split one.)
 function fmtBody(s){return esc(s).replace(/@(\\d{5,})/g,function(m,id){var n=mentionMap[id];return n?'<span class="mn">@'+esc(n)+'</span>':m;});}
 function jidName(j){if(!j)return"";var id=String(j).split("@")[0].split(":")[0];return mentionMap[id]||"";}
+// Chat-list preview: drop a trailing signature line so the sidebar shows the message, not "hi -- admin".
+function stripSig(t){return String(t||"").replace(/\\s*(?:\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?|sent by\\s*-\\s*|--\\s+)\\*?[A-Za-z0-9]{3,32}\\*?\\s*$/i,"").trim();}
+// Messages sent from this app end with a final line of "-- username". Split that off so the bubble
+// shows clean text plus a "Sent by" badge. Only OUTGOING messages are checked and the name must be
+// a real account, so a customer typing the same thing can never fake it.
+// (No backslash-n in this comment on purpose: the page is a TS template literal and it would
+//  become a real newline, breaking the comment across two lines and killing the whole script.)
+function splitSignature(text,out){
+  if(!out)return{body:text,by:null};
+  var s=String(text||"");
+  var nl=s.lastIndexOf("\\n");
+  if(nl<0)return{body:s,by:null};
+  var last=s.slice(nl+1).trim();
+  // Current form: "<writing-hand emoji> *name*". The older "sent by - *name*" and "-- name"
+  // forms are still recognised so messages already sent keep their attribution.
+  var EMO=String.fromCodePoint(0x270D);   // matches the emoji with or without a skin-tone modifier
+  var m=null;
+  if(last.indexOf(EMO)===0){
+    var rest=last.slice(1).replace(String.fromCodePoint(0x1F3FB),"").replace(String.fromCodePoint(0x1F3FC),"")
+                 .replace(String.fromCodePoint(0x1F3FD),"").replace(String.fromCodePoint(0x1F3FE),"")
+                 .replace(String.fromCodePoint(0x1F3FF),"").replace(String.fromCodePoint(0xFE0F),"").trim();
+    m=/^(?:by\\s+)?\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(rest);
+  }
+  if(!m)m=/^sent by\\s*-\\s*\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(last)||/^--\\s+\\*?([A-Za-z0-9]{3,32})\\*?$/.exec(last);
+  if(!m)return{body:s,by:null};
+  var typed=m[1],known=null;
+  for(var i=0;i<appUsers.length;i++){if(String(appUsers[i]).toLowerCase()===typed.toLowerCase())known=appUsers[i];}
+  if(!known)return{body:s,by:null};                            // not one of our accounts = not ours
+  return{body:s.slice(0,nl).replace(/\\s+$/,""),by:known};
+}
 // WhatsApp-style quoted reply block shown above the message text, inside the same bubble.
 function quoteHtml(m){
   if(!m.replyText&&!m.replySender)return"";
@@ -1234,10 +1304,14 @@ function quoteHtml(m){
   var body=m.replyText?fmtBody(m.replyText):'<span class="qm">Media</span>';
   return '<div class="q"><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
 }
-function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;var body=m.text||(m.hasMedia?("["+(m.kind||"media")+"]"):("["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div><div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;// Attribution: the server's sent_by record is authoritative; the text signature is only a
+// fallback for messages sent before attribution moved into the database.
+var sig=splitSignature(m.text||"",out);var sentBy=m.sentBy||sig.by;
+var body=sig.body||(m.hasMedia?("["+(m.kind||"media")+"]"):(m.text?"":"["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
+var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div>'+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
-async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
 async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];setLive(d.status);renderChats();}catch(e){setLive("offline");}}
@@ -1249,9 +1323,42 @@ function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var c
   else if(s==="disconnected"){cls="off";label="Disconnected — reconnecting…";}
   else if(s==="offline"){cls="off";label="Server unreachable";}
   else{cls="warn";label=s?String(s):"connecting…";}
-  box.className="live"+(cls?" "+cls:"");tx.textContent=label;box.title="WhatsApp connection: "+(s||"unknown");}
-function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(c.lastText||"")+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+  box.className="live"+(cls?" "+cls:"");tx.textContent=label;box.title="WhatsApp connection: "+(s||"unknown");
+  showOffline(s);}
+// Curtain over the whole app while WhatsApp is not connected. Sending and extracting against a
+// dead connection would silently do nothing, so the app is blocked rather than left half-working.
+function showOffline(s){
+  var box=el("offline");if(!box)return;
+  if(s==="connected"){box.className="offline";return;}
+  var icon="⏳",title="Connecting to WhatsApp…",
+      msg="Waiting for the WhatsApp connection. This usually takes a few seconds.",
+      note="",bad=false,wait=true;
+  if(s==="waiting for scan"||s==="auth failure"){
+    icon="🔌";bad=true;wait=false;
+    title="WhatsApp needs to be re-linked";
+    msg="The linked device was signed out, so messages cannot be sent or received right now.";
+    note="An administrator must open the server and scan the QR code at localhost:3009/qr — WhatsApp → Linked devices → Link a device.";
+  }else if(s==="disconnected"){
+    icon="🔄";bad=true;
+    title="WhatsApp disconnected";
+    msg="The connection dropped and is being re-established automatically.";
+    note="If this does not clear within a few minutes, tell an administrator.";
+  }else if(s==="offline"){
+    icon="⚠️";bad=true;wait=false;
+    title="Cannot reach the server";
+    msg="Your browser cannot reach the OMS. Check your internet connection.";
+    note="This page will recover on its own once the connection returns.";
+  }
+  el("officon").textContent=icon;
+  el("officon").className="officon"+(wait?" wait":"");
+  el("offtitle").textContent=title;
+  el("offmsg").textContent=msg;
+  var n=el("offnote");n.textContent=note;n.className="offnote"+(note?" on":"");
+  box.querySelector(".offbox").className="offbox"+(bad?" bad":"");
+  box.className="offline on";
+}
+function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.

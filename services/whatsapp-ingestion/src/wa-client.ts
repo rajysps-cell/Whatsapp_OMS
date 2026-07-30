@@ -10,7 +10,10 @@ import { logger } from './logger';
 
 export interface WaClient {
   stop: () => Promise<void>;
-  /** Send a text message to a chat. Human-initiated only — never used for automated/bulk sending. */
+  /**
+   * Send a text message to a chat. Human-initiated only — never used for automated/bulk sending.
+   * Attribution is recorded from the message_create event (see index.ts), not from the return value.
+   */
   send: (chatId: string, text: string, mentions?: string[]) => Promise<string>;
 }
 
@@ -74,7 +77,12 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     handlers.onStatus?.('waiting for scan');
   });
   let catalogTimer: NodeJS.Timeout | null = null;
+  // Watchdog state: a start that never reaches 'ready' (seen once when the service was restarted
+  // mid-handshake) used to sit there until someone noticed. Now it self-recovers.
+  let ready = false;
+  let initAt = Date.now();
   client.on('ready', () => {
+    ready = true;
     logger.info('connection open — listening for group events (read-only)');
     handlers.onStatus?.('connected');
     if (handlers.onCatalog) {
@@ -102,10 +110,28 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     handlers.onStatus?.('auth failure');
   });
   client.on('disconnected', (reason) => {
+    ready = false;
+    initAt = Date.now();
     logger.warn({ reason }, 'disconnected — reinitializing');
     handlers.onStatus?.('disconnected');
     client.initialize().catch((err) => logger.error({ err }, 'reconnect failed'));
   });
+
+  // Watchdog: if we never reach 'ready' within STUCK_MS, tear the browser down and start over.
+  // A normal cold start takes ~5s; the one stuck start observed took an operator to notice and
+  // restart the service by hand. This makes that self-healing.
+  const STUCK_MS = 6 * 60 * 1000;
+  const watchdog = setInterval(() => {
+    if (ready || Date.now() - initAt < STUCK_MS) return;
+    logger.warn({ stuckForMs: Date.now() - initAt }, 'WhatsApp never became ready — restarting the client');
+    initAt = Date.now(); // reset first so a slow restart cannot trigger a second one
+    client
+      .destroy()
+      .catch(() => undefined)
+      .then(() => client.initialize())
+      .catch((err) => logger.error({ err }, 'watchdog reinitialize failed'));
+  }, 60 * 1000);
+  watchdog.unref();
 
   // 'message' fires for inbound messages only (not our own) — exactly the read-only surface we want.
   client.on('message', (msg) => {
@@ -259,12 +285,15 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     send: async (chatId: string, text: string, mentions?: string[]): Promise<string> => {
       const opts = mentions && mentions.length ? { mentions } : undefined;
       const sent = await client.sendMessage(chatId, text, opts);
+      // On @lid chats whatsapp-web.js returns an unusable id, so this is best-effort only —
+      // attribution is claimed from the 'message_create' event in index.ts, not from here.
       const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
       logger.info({ chatId, chars: text.length, messageId: id }, 'message sent');
       return id;
     },
     stop: async () => {
       if (catalogTimer) clearInterval(catalogTimer);
+      clearInterval(watchdog);
       try {
         await client.destroy();
       } catch {
