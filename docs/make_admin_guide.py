@@ -443,15 +443,15 @@ def build():
     print(f"written: {OUT}  ({OUT.stat().st_size/1024:.0f} KB)")
 
 
-USER_OUT = Path(__file__).with_name("WhatsApp-OMS-User-Guide.pdf")
+USER_OUT = Path(__file__).with_name("WhatsApp-OMS-Guide.pdf")
 
 
 def build_user():
-    """Short guide for everyday staff — no administrator content."""
+    """Short guide for everyone who signs into the website, staff and administrators."""
     doc = BaseDocTemplate(str(USER_OUT), pagesize=A4,
                           leftMargin=20 * mm, rightMargin=20 * mm,
                           topMargin=18 * mm, bottomMargin=18 * mm,
-                          title="WhatsApp OMS — User Guide", author="YS Plumbing")
+                          title="WhatsApp OMS — Guide", author="YS Plumbing")
     frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="f")
     from reportlab.platypus import PageTemplate
 
@@ -461,7 +461,7 @@ def build_user():
         canvas.rect(0, A4[1] - 5 * mm, A4[0], 5 * mm, stroke=0, fill=1)
         canvas.setFillColor(MUTE)
         canvas.setFont("Helvetica", 8)
-        canvas.drawString(20 * mm, 10 * mm, "WhatsApp OMS — User Guide")
+        canvas.drawString(20 * mm, 10 * mm, "WhatsApp OMS — Guide")
         canvas.drawRightString(A4[0] - 20 * mm, 10 * mm, f"Page {canvas.getPageNumber()}")
         canvas.restoreState()
 
@@ -470,12 +470,22 @@ def build_user():
     s = []
     s += [para("WhatsApp OMS", st("t", fontName="Helvetica-Bold", fontSize=20, leading=24,
                                   textColor=GREEN_DK, spaceAfter=2)),
-          para("How to process orders and reply to customers", LEAD)]
+          para("Guide for everyone who uses the website", LEAD)]
 
-    s += [table([
-        ["Website", "<font face='Courier-Bold' color='#065f46'>https://oms.ysps.shop</font>"],
-        ["Your login", "Ask your manager. You will choose your own password the first time."],
-    ], [30 * mm, 135 * mm], header=False)]
+    s += [para("Signing in", H2),
+          table([
+            ["Website", "<font face='Courier-Bold' color='#065f46'>https://oms.ysps.shop</font>"],
+            ["Administrator", "Username <font face='Courier-Bold'>admin</font> &nbsp;·&nbsp; "
+                              "Password <font face='Courier-Bold'>Ysps@123</font>"],
+            ["Everyone else", "Your own username and a temporary password from the administrator. "
+                              "You choose your own password the first time you sign in."],
+          ], [30 * mm, 135 * mm], header=False)]
+
+    s += [Spacer(1, 5),
+          callout("Everyone should have their own login",
+                  "Replies are stamped with the username of whoever sent them, so shared logins "
+                  "make that record meaningless. The administrator account can also add and remove "
+                  "users — keep its password with the administrator only.", "warn")]
 
     s += [para("The screen", H2),
           table([
@@ -534,9 +544,30 @@ def build_user():
             ["<b>Esc</b>", "Close the tag list"],
           ], [40 * mm, 125 * mm], header=False)]
 
+    s += [para("For administrators only", H2),
+          para("The <b>Users</b> link appears in the header only for administrators. Everyone else "
+               "will not see it, and cannot open those pages.", BODY)]
+
+    s += [table([
+        ["Add someone", "<b>Users</b> → <b>+ Add user</b>. Usernames are letters and numbers only — "
+                        "no spaces or symbols. Give them the temporary password; they must change "
+                        "it at first sign-in."],
+        ["Suspend someone", "<b>Edit</b> → set to <b>Disabled</b>. They are signed out everywhere "
+                            "at once and their history is kept."],
+        ["Reset a password", "<b>Edit</b> the user and set a new one. They will be asked to change "
+                             "it when they next sign in."],
+        ["Re-link WhatsApp", "Only from the server itself, and only when the screen says WhatsApp "
+                             "needs re-linking. See the Administrator Guide."],
+    ], [34 * mm, 131 * mm], header=False)]
+
+    s += [Spacer(1, 5),
+          para("Product prices and stock update themselves twice a day from the DDI export email — "
+               "nobody needs to upload anything. Full details, server commands and troubleshooting "
+               "are in the separate <b>Administrator Guide</b>.", BODY)]
+
     s += [Spacer(1, 8),
-          para(f"WhatsApp OMS User Guide · {date.today().strftime('%d %B %Y')} · internal use only",
-               SMALL)]
+          para(f"WhatsApp OMS · {date.today().strftime('%d %B %Y')} · internal use only — "
+               "contains login details, do not share outside the company", SMALL)]
 
     doc.build(s)
     print(f"written: {USER_OUT}  ({USER_OUT.stat().st_size/1024:.0f} KB)")
