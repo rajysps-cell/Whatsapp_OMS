@@ -82,4 +82,13 @@ export const config = {
       smtpPass: process.env.PRODUCT_SMTP_PASSWORD ?? process.env.PRODUCT_IMAP_PASSWORD ?? '',
     },
   },
+  /** Shared outgoing mail (two-step verification codes). Defaults reuse the product-import Gmail
+   *  app password so 2FA works with zero new secrets; set MAIL_SMTP_* to move to its own sender. */
+  mail: {
+    from: process.env.MAIL_FROM ?? '',
+    smtpHost: process.env.MAIL_SMTP_HOST ?? process.env.PRODUCT_SMTP_HOST ?? 'smtp.gmail.com',
+    smtpPort: Number(process.env.MAIL_SMTP_PORT ?? process.env.PRODUCT_SMTP_PORT ?? 587),
+    smtpUser: process.env.MAIL_SMTP_USER ?? process.env.PRODUCT_SMTP_USER ?? process.env.PRODUCT_IMAP_USER ?? 'ysddiexport@gmail.com',
+    smtpPass: process.env.MAIL_SMTP_PASSWORD ?? process.env.PRODUCT_SMTP_PASSWORD ?? process.env.PRODUCT_IMAP_PASSWORD ?? '',
+  },
 } as const;

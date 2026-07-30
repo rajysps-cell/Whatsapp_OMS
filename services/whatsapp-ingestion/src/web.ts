@@ -4,30 +4,43 @@ import nodePath from 'node:path';
 import QRCode from 'qrcode';
 import {
   COOKIE,
+  DEVICE_COOKIE,
+  PENDING_COOKIE,
   activeAdminCount,
   changePassword,
   cleanupAuth,
   clearCookie,
+  clearPendingCookie,
+  createPendingLogin,
   createSession,
   createUser,
   deleteUser,
   destroySession,
+  deviceCookie,
+  deviceTrusted,
   ensureSeedAdmin,
   getUser,
   listUsers,
   login as authLogin,
+  pendingCookie,
   readCookie,
+  resendOtp,
+  revokeDevices,
   sessionCookie,
   sessionUser,
+  trustDevice,
   updateUser,
   allUsernames,
   userExists,
+  validateEmail,
   validatePassword,
   validateUsername,
+  verifyOtp,
   verifyPassword,
   type Role,
   type User,
 } from './auth';
+import { sendMail } from './mailer';
 import type { ChatStore } from './chat-store';
 import { config } from './config';
 import { logger } from './logger';
@@ -122,6 +135,7 @@ function checkInlineScripts(): void {
     id: 0,
     username: 'selfcheck',
     name: 'selfcheck',
+    email: '',
     role: 'admin',
     active: true,
     mustChange: false,
@@ -223,6 +237,11 @@ export function writeMediaCache(messageId: string, data: string, mimetype: strin
   }
   return buf.length;
 }
+/** "jj***@gmail.com" — enough for "check that inbox", nothing for an attacker who guessed a password. */
+function maskEmail(e: string): string {
+  const [user = '', domain = ''] = e.split('@');
+  return `${user.slice(0, 2)}***@${domain}`;
+}
 /** decodeURIComponent that answers null instead of throwing on a malformed escape like "%" or "%zz". */
 function safeDecode(s: string): string | null {
   try {
@@ -279,7 +298,12 @@ async function handleAdmin(
       return true;
     }
     const role: Role = body['role'] === 'admin' ? 'admin' : 'user';
-    createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true);
+    const em = validateEmail(body['email']);
+    if (!em.ok) {
+      json(res, 200, { ok: false, error: em.error });
+      return true;
+    }
+    createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value);
     json(res, 200, { ok: true, users: listUsers() });
     return true;
   }
@@ -291,10 +315,18 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: 'User not found.' });
       return true;
     }
-    const patch: { name?: string; role?: Role; active?: boolean; password?: string } = {};
+    const patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string } = {};
     if (body['name'] !== undefined) patch.name = String(body['name']).trim().slice(0, 80);
     if (body['role'] !== undefined) patch.role = body['role'] === 'admin' ? 'admin' : 'user';
     if (body['active'] !== undefined) patch.active = !!body['active'];
+    if (body['email'] !== undefined) {
+      const em = validateEmail(body['email']);
+      if (!em.ok) {
+        json(res, 200, { ok: false, error: em.error });
+        return true;
+      }
+      patch.email = em.value;
+    }
     if (body['password']) {
       const p = validatePassword(body['password']);
       if (!p.ok) {
@@ -336,6 +368,19 @@ async function handleAdmin(
     }
     deleteUser(id);
     json(res, 200, { ok: true, users: listUsers() });
+    return true;
+  }
+  // Forget every browser this user has verified: their next sign-in anywhere asks for a code
+  // again. The admin's answer to "someone's laptop was stolen".
+  if (path === '/api/users/reset-devices' && req.method === 'POST') {
+    const body = await readBody(req);
+    const target = getUser(Number(body['id']));
+    if (!target) {
+      json(res, 200, { ok: false, error: 'User not found.' });
+      return true;
+    }
+    const n = revokeDevices(target.id);
+    json(res, 200, { ok: true, devices: n, users: listUsers() });
     return true;
   }
   return false;
@@ -464,6 +509,36 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         json(res, 401, { ok: false, error: r.error });
         return;
       }
+      // Two-step verification (meeting 31-07): a browser that has never passed a code gets one by
+      // email before any session exists. Device-cookie based, NOT network based — behind the
+      // Cloudflare Tunnel every request reaches this process from 127.0.0.1, so "inside the
+      // network" is not a signal this server can actually see. A user with no email on file can't
+      // receive a code; they sign in as before and the Users page shows the gap to the admin.
+      const devTok = readCookie(req.headers.cookie, DEVICE_COOKIE);
+      if (r.user.email && !deviceTrusted(r.user.id, devTok)) {
+        const pend = createPendingLogin(r.user.id);
+        try {
+          await sendMail(
+            r.user.email,
+            `${pend.code} is your WhatsApp OMS sign-in code`,
+            `Hi ${r.user.name || r.user.username},\n\n` +
+              `Your sign-in code is: ${pend.code}\n\n` +
+              `It expires in 10 minutes. You are asked because this browser has not been used for\n` +
+              `WhatsApp OMS before. If this sign-in was not you, change your password.\n`,
+          );
+        } catch (err) {
+          // Escape hatch: mail down must not lock the whole team out of a live order system. The
+          // code lands in the server log, where an operator on the box can read it out.
+          logger.warn({ err, user: r.user.username, code: pend.code }, 'OTP email failed — code in this log line is the fallback');
+        }
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'set-cookie': pendingCookie(pend.token, isSecureReq(req)),
+        });
+        res.end(JSON.stringify({ ok: true, otp: true, hint: maskEmail(r.user.email) }));
+        logger.info({ user: r.user.username }, 'login ok — verification code sent');
+        return;
+      }
       const t = createSession(r.user.id);
       res.writeHead(200, {
         'content-type': 'application/json; charset=utf-8',
@@ -478,6 +553,40 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     html(res, loginPage());
+    return;
+  }
+  // Step two of a sign-in: the emailed code. Mints the session and remembers the browser.
+  if (path === '/login/verify' && req.method === 'POST') {
+    const body = await readBody(req);
+    const pendTok = readCookie(req.headers.cookie, PENDING_COOKIE);
+    const v = verifyOtp(pendTok, body['code']);
+    if (!v.ok) {
+      json(res, v.gone ? 410 : 401, { ok: false, error: v.error, gone: !!v.gone });
+      return;
+    }
+    const secure = isSecureReq(req);
+    const dev = trustDevice(v.user.id, readCookie(req.headers.cookie, DEVICE_COOKIE), String(req.headers['user-agent'] ?? ''));
+    const t = createSession(v.user.id);
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'set-cookie': [sessionCookie(t, secure), deviceCookie(dev, secure), clearPendingCookie(secure)],
+    });
+    res.end(JSON.stringify({ ok: true, mustChange: v.user.mustChange }));
+    logger.info({ user: v.user.username }, 'two-step verification passed — device remembered');
+    return;
+  }
+  if (path === '/login/resend' && req.method === 'POST') {
+    const rs = resendOtp(readCookie(req.headers.cookie, PENDING_COOKIE));
+    if (!rs.ok) {
+      json(res, 429, { ok: false, error: rs.error });
+      return;
+    }
+    try {
+      await sendMail(rs.user.email, `${rs.code} is your WhatsApp OMS sign-in code`, `Your new sign-in code is: ${rs.code}\n\nIt expires in 10 minutes.\n`);
+    } catch (err) {
+      logger.warn({ err, user: rs.user.username, code: rs.code }, 'OTP email failed — code in this log line is the fallback');
+    }
+    json(res, 200, { ok: true });
     return;
   }
   // POST-only: a GET logout can be triggered by any third-party page (<img src=".../logout">).
@@ -989,6 +1098,8 @@ function authShell(title: string, inner: string, script: string): string {
   button{width:100%;margin-top:20px;padding:11px;font-size:14px;font-weight:600;color:#fff;background:var(--em);
     border:0;border-radius:9px;cursor:pointer;transition:filter .15s}
   button:hover{filter:brightness(1.07)}button:disabled{opacity:.6;cursor:default}
+  .linkbtn{background:none;color:var(--em2);font-weight:600;border:0;margin-top:10px;padding:4px;cursor:pointer}
+  .linkbtn:hover{text-decoration:underline;filter:none}
   .err{display:none;margin-top:14px;padding:9px 11px;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;
     border-radius:8px;font-size:13px}
   .err.on{display:block}
@@ -1009,17 +1120,45 @@ function loginPage(): string {
        <input id="p" name="password" type="password" autocomplete="current-password" required>
        <button id="b" type="submit">Sign in</button>
      </form>
+     <form id="f2" style="display:none">
+       <p class="sub" id="otpmsg">We emailed you a 6-digit code.</p>
+       <label for="c">Verification code</label>
+       <input id="c" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*" required>
+       <button id="b2" type="submit">Verify</button>
+       <button id="rs" type="button" class="linkbtn">Send a new code</button>
+     </form>
      <div class="err" id="e"></div>`,
-    `var f=document.getElementById("f"),b=document.getElementById("b"),e=document.getElementById("e");
+    `var f=document.getElementById("f"),f2=document.getElementById("f2"),b=document.getElementById("b"),b2=document.getElementById("b2"),e=document.getElementById("e");
      f.addEventListener("submit",async function(ev){ev.preventDefault();e.className="err";b.disabled=true;b.textContent="Signing in…";
        try{
          var r=await fetch("/login",{method:"POST",headers:{"content-type":"application/json"},
            body:JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})});
          var d=await r.json();
+         if(d.ok&&d.otp){
+           // Password accepted; this browser is new, so a code went to their email.
+           f.style.display="none";f2.style.display="block";
+           document.getElementById("otpmsg").textContent="This browser is new, so we emailed a 6-digit code to "+(d.hint||"your email")+".";
+           document.getElementById("c").focus();b.disabled=false;b.textContent="Sign in";return;
+         }
          if(d.ok){location.href=d.mustChange?"/change-password":"/";return;}
          e.textContent=d.error||"Sign in failed.";e.className="err on";
        }catch(err){e.textContent="Network error — please try again.";e.className="err on";}
-       b.disabled=false;b.textContent="Sign in";});`,
+       b.disabled=false;b.textContent="Sign in";});
+     f2.addEventListener("submit",async function(ev){ev.preventDefault();e.className="err";b2.disabled=true;b2.textContent="Checking…";
+       try{
+         var r=await fetch("/login/verify",{method:"POST",headers:{"content-type":"application/json"},
+           body:JSON.stringify({code:document.getElementById("c").value})});
+         var d=await r.json();
+         if(d.ok){location.href=d.mustChange?"/change-password":"/";return;}
+         e.textContent=d.error||"That code did not work.";e.className="err on";
+         if(d.gone){f2.style.display="none";f.style.display="block";}
+       }catch(err){e.textContent="Network error — please try again.";e.className="err on";}
+       b2.disabled=false;b2.textContent="Verify";});
+     document.getElementById("rs").addEventListener("click",async function(){e.className="err";
+       try{var r=await fetch("/login/resend",{method:"POST"});var d=await r.json();
+         e.textContent=d.ok?"A new code is on its way.":(d.error||"Could not resend.");e.className="err on";
+         if(d.ok)e.style.color="var(--em2, #059669)";else e.style.color="";
+       }catch(err){e.textContent="Network error — please try again.";e.className="err on";}});`,
   );
 }
 
@@ -1125,11 +1264,13 @@ function adminPage(me: User): string {
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
   <div class="card"><table><thead><tr>
-    <th>Username</th><th>Name</th><th style="width:96px">Role</th><th style="width:96px">Status</th>
-    <th style="width:150px">Last sign-in</th><th style="width:210px"></th>
+    <th>Username</th><th>Name</th><th>Email</th><th style="width:96px">Role</th><th style="width:96px">Status</th>
+    <th style="width:150px">Last sign-in</th><th style="width:270px"></th>
   </tr></thead><tbody id="tb"></tbody></table></div>
   <p class="muted" style="margin-top:14px">New users must set their own password at first sign-in. Disabling a user
-    immediately signs them out everywhere.</p>
+    immediately signs them out everywhere. Signing in from a new browser emails the user a 6-digit code —
+    a user without an email address skips that check, so fill emails in. <b>Reset&nbsp;2FA</b> makes every
+    browser ask for a code again (use it when a device is lost).</p>
 </div>
 
 <div class="modal" id="modal"><div class="sheet">
@@ -1137,6 +1278,8 @@ function adminPage(me: User): string {
   <div id="mFields">
     <div id="wrapUser"><label for="fUser">Username</label><input id="fUser" autocomplete="off" placeholder="e.g. dhaval"></div>
     <label for="fName">Full name</label><input id="fName" autocomplete="off" placeholder="e.g. Dhaval Patel">
+    <label for="fEmail">Email <span style="font-weight:400">(for sign-in verification codes)</span></label>
+    <input id="fEmail" type="email" autocomplete="off" placeholder="e.g. dhaval@company.com">
     <div class="row2">
       <div><label for="fRole">Role</label><select id="fRole"><option value="user">User</option><option value="admin">Admin</option></select></div>
       <div id="wrapActive"><label for="fActive">Status</label><select id="fActive"><option value="1">Active</option><option value="0">Disabled</option></select></div>
@@ -1162,23 +1305,25 @@ function render(){
     var self=u.id===meId;
     return '<tr><td><b>'+esc(u.username)+'</b>'+(self?' <span class="muted">(you)</span>':'')+'</td>'+
       '<td>'+esc(u.name||"—")+'</td>'+
+      '<td>'+(u.email?esc(u.email):'<span class="pill off" title="No email — this user signs in WITHOUT a verification code. Add one.">no 2FA</span>')+'</td>'+
       '<td><span class="pill '+(u.role==="admin"?"admin":"user")+'">'+(u.role==="admin"?"Admin":"User")+'</span></td>'+
       '<td><span class="pill '+(u.active?"on":"off")+'">'+(u.active?"Active":"Disabled")+'</span></td>'+
       '<td class="muted">'+when(u.lastLogin)+'</td>'+
       '<td><div class="acts">'+
         '<button class="btn ghost" data-edit="'+u.id+'">Edit</button>'+
+        '<button class="btn ghost" data-reset="'+u.id+'" title="Every browser must enter an emailed code at next sign-in">Reset 2FA</button>'+
         '<button class="btn danger" data-del="'+u.id+'"'+(self?" disabled":"")+'>Delete</button>'+
       '</div></td></tr>';
   }).join("");
 }
 function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
   el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
-  el("fUser").value="";el("fName").value="";el("fRole").value="user";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
   el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
 function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
   el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
   el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
-  el("fName").value=u.name||"";el("fRole").value=u.role;el("fActive").value=u.active?"1":"0";
+  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fActive").value=u.active?"1":"0";
   el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
   el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
 function closeModal(){el("modal").className="modal";}
@@ -1186,9 +1331,9 @@ async function save(){
   var err=el("mErr"),btn=el("mSave");err.className="err";btn.disabled=true;btn.textContent="Saving…";
   var d;
   if(editId===null){
-    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,role:el("fRole").value,password:el("fPass").value});
+    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,password:el("fPass").value});
   }else{
-    var body={id:editId,name:el("fName").value,role:el("fRole").value,active:el("fActive").value==="1"};
+    var body={id:editId,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,active:el("fActive").value==="1"};
     if(el("fPass").value)body.password=el("fPass").value;
     d=await post("/api/users/edit",body);
   }
@@ -1205,8 +1350,13 @@ el("mCancel").addEventListener("click",closeModal);
 el("mSave").addEventListener("click",save);
 el("modal").addEventListener("click",function(e){if(e.target===el("modal"))closeModal();});
 document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
+async function resetDevices(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;
+  if(!window.confirm("Reset 2FA for \\""+u.username+"\\"? Every browser they use will ask for an emailed code at the next sign-in."))return;
+  var d=await post("/api/users/reset-devices",{id:id});
+  if(d.ok){users=d.users||users;render();toast("2FA reset — "+(d.devices||0)+" device(s) forgotten");}else{toast(d.error||"Reset failed",true);}}
 el("tb").addEventListener("click",function(e){
   var ed=e.target.closest("[data-edit]");if(ed){openEdit(+ed.dataset.edit);return;}
+  var rs=e.target.closest("[data-reset]");if(rs){resetDevices(+rs.dataset.reset);return;}
   var dl=e.target.closest("[data-del]");if(dl&&!dl.disabled){del(+dl.dataset.del);return;}});
 el("mFields").addEventListener("keydown",function(e){if(e.key==="Enter")save();});
 load();

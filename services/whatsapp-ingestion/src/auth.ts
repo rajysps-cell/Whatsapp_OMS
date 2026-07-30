@@ -42,11 +42,43 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_attempts ON login_attempts(username, ts);
 `);
 
+// --- two-step verification (meeting 31-07) ---
+// One-time codes go to the user's EMAIL (the client rejected authenticator apps: first-time
+// registration is friction his staff will not do). A device that has passed a code once carries a
+// long-lived cookie and is not asked again — "every time someone logs in from a new device, the
+// first time, I need two-step verification". That first-time rule also covers the
+// outside-the-network case: behind the Cloudflare Tunnel every request reaches this process from
+// 127.0.0.1, so the ONLY trustworthy signal is the device cookie, not the network address.
+try {
+  db.exec("ALTER TABLE users ADD COLUMN email TEXT NOT NULL DEFAULT ''");
+} catch {
+  /* column already exists */
+}
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_logins (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    code_hash  TEXT NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS trusted_devices (
+    user_id     INTEGER NOT NULL,
+    device_hash TEXT NOT NULL,
+    user_agent  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    last_seen   INTEGER NOT NULL,
+    PRIMARY KEY (user_id, device_hash)
+  );
+`);
+
 export type Role = 'admin' | 'user';
 export interface User {
   id: number;
   username: string;
   name: string;
+  email: string;
   role: Role;
   active: boolean;
   mustChange: boolean;
@@ -58,6 +90,7 @@ interface UserRow {
   id: number;
   username: string;
   name: string;
+  email: string;
   pass_hash: string;
   salt: string;
   role: string;
@@ -76,6 +109,7 @@ function toUser(r: UserRow): User {
     id: r.id,
     username: r.username,
     name: r.name,
+    email: r.email ?? '',
     role: r.role === 'admin' ? 'admin' : 'user',
     active: !!r.active,
     mustChange: !!r.must_change,
@@ -131,6 +165,16 @@ export function validateUsername(u: unknown): { ok: true; value: string } | { ok
   return { ok: true, value: s };
 }
 
+/** Empty is allowed (2FA simply stays off for that user until an admin fills it in). */
+export function validateEmail(e: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  const s = String(e ?? '').trim();
+  if (!s) return { ok: true, value: '' };
+  if (s.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(s)) {
+    return { ok: false, error: 'That does not look like an email address.' };
+  }
+  return { ok: true, value: s };
+}
+
 /** Every account name, used to recognise the "-- <username>" signature on outgoing messages. */
 export function allUsernames(): string[] {
   return (db.prepare('SELECT username FROM users').all() as Array<{ username: string }>).map((r) => r.username);
@@ -168,10 +212,12 @@ export function createUser(
   name: string,
   role: Role,
   mustChange = false,
+  email = '',
 ): User {
   const salt = randomBytes(16).toString('hex');
   const now = Date.now();
   insUser.run(username, name || username, hashSync(password, salt), salt, role, 1, mustChange ? 1 : 0, now);
+  if (email) db.prepare('UPDATE users SET email=? WHERE username=?').run(email, username);
   const r = getByName.get(username) as unknown as UserRow;
   logger.info({ username, role }, 'user created');
   return toUser(r);
@@ -180,21 +226,23 @@ export function createUser(
 /** Partial update. Only provided fields change; password is re-hashed with a fresh salt. */
 export function updateUser(
   id: number,
-  patch: { name?: string; role?: Role; active?: boolean; password?: string },
+  patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string },
 ): void {
   const cur = getById.get(id) as UserRow | undefined;
   if (!cur) return;
   const name = patch.name !== undefined ? patch.name : cur.name;
   const role = patch.role !== undefined ? patch.role : cur.role;
   const active = patch.active !== undefined ? (patch.active ? 1 : 0) : cur.active;
+  const email = patch.email !== undefined ? patch.email : (cur.email ?? '');
   if (patch.password) {
     const salt = randomBytes(16).toString('hex');
     // must_change=1: an admin-set password is known to the admin, so the user must replace it at
     // next sign-in. (The user's own self-service change clears the flag.)
-    db.prepare('UPDATE users SET name=?, role=?, active=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
       name,
       role,
       active,
+      email,
       hashSync(patch.password, salt),
       salt,
       id,
@@ -202,7 +250,7 @@ export function updateUser(
     // A password change invalidates that user's other sessions.
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   } else {
-    db.prepare('UPDATE users SET name=?, role=?, active=? WHERE id=?').run(name, role, active, id);
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=? WHERE id=?').run(name, role, active, email, id);
   }
   if (patch.active === false) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   logger.info({ id, role, active: !!active, passwordChanged: !!patch.password }, 'user updated');
@@ -210,6 +258,8 @@ export function updateUser(
 
 export function deleteUser(id: number): void {
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM pending_logins WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM trusted_devices WHERE user_id = ?').run(id);
   delUserStmt.run(id);
   logger.info({ id }, 'user deleted');
 }
@@ -375,8 +425,143 @@ export function ensureSeedAdmin(): void {
   }
 }
 
+// --- two-step verification: one-time codes, pending logins, trusted devices ---
+const OTP_TTL_MS = 10 * 60 * 1000;
+const OTP_MAX_ATTEMPTS = 5;
+const DEVICE_DAYS = 365;
+
+/**
+ * Password accepted but a code is still owed: park the login in pending_logins and hand back a
+ * short-lived token. No session exists yet — the session is only minted by verifyOtp, so a stolen
+ * pending cookie without the emailed code is worthless.
+ */
+export function createPendingLogin(userId: number): { token: string; code: string } {
+  const token = randomBytes(32).toString('hex');
+  // 6 digits from a CSPRNG. randomInt-style rejection is overkill at this size: 2^32 % 900000
+  // bias is ~0.005%, irrelevant against a 5-attempt cap.
+  const code = String(100000 + (randomBytes(4).readUInt32BE(0) % 900000));
+  const now = Date.now();
+  db.prepare('DELETE FROM pending_logins WHERE user_id = ?').run(userId); // one pending login per user
+  db.prepare(
+    'INSERT INTO pending_logins (token_hash, user_id, code_hash, attempts, created_at, expires_at) VALUES (?, ?, ?, 0, ?, ?)',
+  ).run(tokenHash(token), userId, tokenHash(code), now, now + OTP_TTL_MS);
+  return { token, code };
+}
+
+export interface PendingInfo {
+  userId: number;
+  createdAt: number;
+}
+export function pendingLogin(token: string | null): PendingInfo | null {
+  if (!token) return null;
+  const r = db.prepare('SELECT user_id, created_at, expires_at FROM pending_logins WHERE token_hash = ?').get(tokenHash(token)) as
+    | { user_id: number; created_at: number; expires_at: number }
+    | undefined;
+  if (!r) return null;
+  if (r.expires_at < Date.now()) {
+    db.prepare('DELETE FROM pending_logins WHERE token_hash = ?').run(tokenHash(token));
+    return null;
+  }
+  return { userId: r.user_id, createdAt: r.created_at };
+}
+
+export type OtpResult = { ok: true; user: User } | { ok: false; error: string; gone?: boolean };
+
+/** Check the emailed code. Consumes the pending login on success OR when attempts run out. */
+export function verifyOtp(token: string | null, code: unknown): OtpResult {
+  const bad = { ok: false as const, error: 'That code is not right. Check the newest email.' };
+  if (!token) return { ok: false, error: 'This sign-in expired — start again.', gone: true };
+  const th = tokenHash(token);
+  const r = db.prepare('SELECT user_id, code_hash, attempts, expires_at FROM pending_logins WHERE token_hash = ?').get(th) as
+    | { user_id: number; code_hash: string; attempts: number; expires_at: number }
+    | undefined;
+  if (!r || r.expires_at < Date.now()) {
+    db.prepare('DELETE FROM pending_logins WHERE token_hash = ?').run(th);
+    return { ok: false, error: 'This sign-in expired — start again.', gone: true };
+  }
+  if (r.attempts >= OTP_MAX_ATTEMPTS) {
+    db.prepare('DELETE FROM pending_logins WHERE token_hash = ?').run(th);
+    return { ok: false, error: 'Too many wrong codes — start again.', gone: true };
+  }
+  const given = String(code ?? '').replace(/\D/g, '');
+  const a = Buffer.from(tokenHash(given), 'hex');
+  const b = Buffer.from(r.code_hash, 'hex');
+  if (!given || a.length !== b.length || !timingSafeEqual(a, b)) {
+    db.prepare('UPDATE pending_logins SET attempts = attempts + 1 WHERE token_hash = ?').run(th);
+    return bad;
+  }
+  db.prepare('DELETE FROM pending_logins WHERE token_hash = ?').run(th);
+  const u = getUser(r.user_id);
+  if (!u || !u.active) return { ok: false, error: 'This account is disabled.', gone: true };
+  touchLogin.run(Date.now(), u.id);
+  return { ok: true, user: u };
+}
+
+/** Replace the code on an existing pending login (the "resend" button). ~30s throttle. */
+export function resendOtp(token: string | null): { ok: true; code: string; user: User } | { ok: false; error: string } {
+  const p = pendingLogin(token);
+  if (!p) return { ok: false, error: 'This sign-in expired — start again.' };
+  const last = db.prepare('SELECT created_at FROM pending_logins WHERE token_hash = ?').get(tokenHash(token!)) as
+    | { created_at: number }
+    | undefined;
+  if (last && Date.now() - last.created_at < 30_000) return { ok: false, error: 'Just sent — give it a few seconds.' };
+  const u = getUser(p.userId);
+  if (!u || !u.active) return { ok: false, error: 'This account is disabled.' };
+  const code = String(100000 + (randomBytes(4).readUInt32BE(0) % 900000));
+  db.prepare('UPDATE pending_logins SET code_hash = ?, attempts = 0, created_at = ? WHERE token_hash = ?').run(
+    tokenHash(code),
+    Date.now(),
+    tokenHash(token!),
+  );
+  return { ok: true, code, user: u };
+}
+
+/** Is this browser already trusted for this user? (Refreshes last_seen when yes.) */
+export function deviceTrusted(userId: number, deviceToken: string | null): boolean {
+  if (!deviceToken) return false;
+  const dh = tokenHash(deviceToken);
+  const r = db.prepare('SELECT last_seen FROM trusted_devices WHERE user_id = ? AND device_hash = ?').get(userId, dh) as
+    | { last_seen: number }
+    | undefined;
+  if (!r) return false;
+  db.prepare('UPDATE trusted_devices SET last_seen = ? WHERE user_id = ? AND device_hash = ?').run(Date.now(), userId, dh);
+  return true;
+}
+
+/** Remember this browser after a passed code. Returns the token to set as the device cookie. */
+export function trustDevice(userId: number, existingToken: string | null, userAgent: string): string {
+  const token = existingToken || randomBytes(32).toString('hex');
+  const now = Date.now();
+  db.prepare(
+    'INSERT INTO trusted_devices (user_id, device_hash, user_agent, created_at, last_seen) VALUES (?, ?, ?, ?, ?) ' +
+      'ON CONFLICT(user_id, device_hash) DO UPDATE SET last_seen = excluded.last_seen',
+  ).run(userId, tokenHash(token), userAgent.slice(0, 200), now, now);
+  return token;
+}
+
+/** Admin reset: the user's next sign-in on every browser asks for a code again. */
+export function revokeDevices(userId: number): number {
+  const n = db.prepare('DELETE FROM trusted_devices WHERE user_id = ?').run(userId).changes;
+  logger.info({ userId, devices: n }, 'trusted devices revoked');
+  return Number(n);
+}
+
 // --- cookies ---
 export const COOKIE = 'oms_session';
+export const PENDING_COOKIE = 'oms_pending';
+export const DEVICE_COOKIE = 'oms_device';
+
+export function pendingCookie(token: string, secure: boolean): string {
+  return `${PENDING_COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax;${secure ? ' Secure;' : ''} Max-Age=${Math.floor(OTP_TTL_MS / 1000)}`;
+}
+export function clearPendingCookie(secure: boolean): string {
+  return `${PENDING_COOKIE}=; HttpOnly; Path=/; SameSite=Lax;${secure ? ' Secure;' : ''} Max-Age=0`;
+}
+/** Long-lived on purpose, and NOT cleared on logout: it says "this browser passed a code once",
+ *  which stays true across sessions — clearing it would re-ask a code on every sign-out. */
+export function deviceCookie(token: string, secure: boolean): string {
+  return `${DEVICE_COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax;${secure ? ' Secure;' : ''} Max-Age=${DEVICE_DAYS * 86400}`;
+}
 
 export function readCookie(header: string | undefined, name: string): string | null {
   if (!header) return null;
