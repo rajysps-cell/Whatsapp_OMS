@@ -327,6 +327,32 @@ def build():
           para("Roles: <b>Admin</b> can manage users and re-link WhatsApp. <b>User</b> can read "
                "chats, process orders and reply — nothing else.", BODY)]
 
+    s += [para("The product catalogue", H2),
+          para("Product data refreshes itself from the DDI export email. Nobody needs to upload "
+               "anything — the system checks the mailbox twice a day, shortly after each export "
+               "arrives, and loads the new catalogue without interrupting anyone using the site.", BODY)]
+
+    s += [table([
+        ["Runs at", "23:30 and 11:30 every day"],
+        ["Reads from", "<font face='Courier'>ysddiexport@gmail.com</font> — emails with "
+                       "<b>ZTMPEXP</b> in the subject"],
+        ["Report sent to", "<font face='Courier'>ruturajysps@gmail.com</font> after every run"],
+        ["Run it manually", "<font face='Courier'>npm run import:products</font>"],
+    ], [38 * mm, 127 * mm], header=False)]
+
+    s += [Spacer(1, 5),
+          callout("Watch the report email",
+                  "A report arrives after every run, whether it succeeded or failed. If one says "
+                  "failed — or they stop arriving altogether — the catalogue has stopped updating "
+                  "and prices or stock may be going stale.")]
+
+    s += [Spacer(1, 4),
+          para("Two safeguards are built in. The mailbox is opened <b>read-only</b>, so nothing is "
+               "marked as read, moved or deleted and the existing customer-portal import is "
+               "unaffected. And an export with fewer than 1,000 rows is <b>rejected</b> rather than "
+               "loaded, so a truncated file cannot wipe the catalogue. Every download is kept in "
+               "the <font face='Courier'>imports</font> folder as a record.", BODY)]
+
     s += [PageBreak()]
 
     # ---------------- troubleshooting ----------------
