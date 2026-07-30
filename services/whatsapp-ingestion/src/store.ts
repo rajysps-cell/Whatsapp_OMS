@@ -4,7 +4,11 @@ import { logger } from './logger';
 
 // Zero-dependency persistence via Node's built-in SQLite (Node 22.5+/24).
 // Exported so auth.ts shares this one connection (avoids a second writer on the same file).
-export const db = new DatabaseSync(config.dbPath);
+export const db = new DatabaseSync(config.dbPath, { timeout: 5000 });
+// WAL + a busy timeout so a reader (backup, monitoring, an operator opening the file) cannot make
+// the next write throw. Without these an incoming WhatsApp message is caught, logged and lost.
+db.exec('PRAGMA journal_mode=WAL');
+db.exec('PRAGMA busy_timeout=5000');
 db.exec(`
   CREATE TABLE IF NOT EXISTS aliases (
     phrase_norm  TEXT PRIMARY KEY,

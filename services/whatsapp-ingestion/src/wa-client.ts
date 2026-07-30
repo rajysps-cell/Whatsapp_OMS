@@ -4,7 +4,7 @@ import qrcode from 'qrcode-terminal';
 
 // whatsapp-web.js is CommonJS; Node's ESM loader can't destructure its named
 // exports directly, so take the default (module.exports) and pull them off it.
-const { Client, LocalAuth } = pkg;
+const { Client, LocalAuth, MessageMedia } = pkg;
 import { config } from './config';
 import { logger } from './logger';
 
@@ -15,6 +15,16 @@ export interface WaClient {
    * Attribution is recorded from the message_create event (see index.ts), not from the return value.
    */
   send: (chatId: string, text: string, mentions?: string[]) => Promise<string>;
+  /** Fetch one message's media as base64, or null if WhatsApp can no longer provide it. */
+  media: (messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>;
+  /** Send a file (image / document / etc.) with an optional caption. Human-initiated only. */
+  sendMedia: (
+    chatId: string,
+    file: { data: string; mimetype: string; filename: string },
+    caption?: string,
+    mentions?: string[],
+    sentBy?: string,
+  ) => Promise<string>;
 }
 
 /** One chat from WhatsApp Web's own IndexedDB (the broken Store APIs bypassed). */
@@ -234,6 +244,60 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     logger.info({ chats: chatIds.length, messages: total }, 'history backfill complete');
   }
 
+  /**
+   * Download one message's media (image / voice / video / document) as base64.
+   *
+   * whatsapp-web.js's own Message.downloadMedia() passes `this.id._serialized` into the page, and
+   * that field is undefined on @lid chats — which is nearly all of ours. The page then does
+   * Msg.get(undefined) and throws the opaque Error "r" that has failed every media download here.
+   * This does the same work but finds the message model the way historyBackfill already does:
+   * by matching either the serialized id or the rebuilt {fromMe}_{remote}_{id} form.
+   */
+  async function fetchMedia(
+    c: InstanceType<typeof Client>,
+    messageId: string,
+  ): Promise<{ data: string; mimetype: string; filename?: string } | null> {
+    const page = c.pupPage;
+    if (!page) throw new Error('browser page not available');
+    const res = (await page.evaluate(`(async () => {
+      const ID = ${JSON.stringify(messageId)};
+      const coll = window.require('WAWebCollections');
+      const rebuilt = (m) => {
+        if (!m.id) return '';
+        if (m.id._serialized) return m.id._serialized;
+        const rem = m.id.remote ? (m.id.remote._serialized || String(m.id.remote)) : '';
+        return String(!!m.id.fromMe) + '_' + rem + '_' + m.id.id;
+      };
+      const msg = coll.Msg.getModelsArray().find((m) => rebuilt(m) === ID);
+      if (!msg) return { err: 'message not in memory' };
+      if (!msg.mediaData) return { err: 'no media on this message' };
+      if (msg.mediaData.mediaStage === 'REUPLOADING') return { err: 'media expired on WhatsApp' };
+      if (msg.mediaData.mediaStage !== 'RESOLVED') {
+        try { await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 }); }
+        catch (e) { return { err: 'resolve failed: ' + String(e && e.message || e) }; }
+      }
+      const stage = String(msg.mediaData.mediaStage || '');
+      if (stage.includes('ERROR') || stage === 'FETCHING') return { err: 'stage ' + stage };
+      const qpl = { addAnnotations() { return this; }, addPoint() { return this; } };
+      try {
+        const buf = await window.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt({
+          directPath: msg.directPath, encFilehash: msg.encFilehash, filehash: msg.filehash,
+          mediaKey: msg.mediaKey, mediaKeyTimestamp: msg.mediaKeyTimestamp, type: msg.type,
+          signal: new AbortController().signal, downloadQpl: qpl,
+        });
+        const data = await window.WWebJS.arrayBufferToBase64Async(buf);
+        return { data, mimetype: msg.mimetype || 'application/octet-stream', filename: msg.filename };
+      } catch (e) {
+        return { err: 'download failed: ' + String(e && e.message || e) };
+      }
+    })()`)) as { data?: string; mimetype?: string; filename?: string; err?: string };
+    if (!res || res.err || !res.data) {
+      logger.warn({ messageId, reason: res?.err ?? 'empty' }, 'media fetch failed');
+      return null;
+    }
+    return { data: res.data, mimetype: res.mimetype ?? 'application/octet-stream', filename: res.filename };
+  }
+
   // Read the full chat list + real names from WhatsApp Web's IndexedDB ('model-storage').
   // whatsapp-web.js's Store-injection APIs (getChats etc.) are broken against current WhatsApp Web,
   // but the page's own persisted data is directly readable. Message BODIES are encrypted at rest
@@ -289,6 +353,17 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
       // attribution is claimed from the 'message_create' event in index.ts, not from here.
       const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
       logger.info({ chatId, chars: text.length, messageId: id }, 'message sent');
+      return id;
+    },
+    media: (messageId: string) => fetchMedia(client, messageId),
+    sendMedia: async (chatId, file, caption, mentions): Promise<string> => {
+      const media = new MessageMedia(file.mimetype, file.data, file.filename);
+      const sent = await client.sendMessage(chatId, media, {
+        ...(caption ? { caption } : {}),
+        ...(mentions && mentions.length ? { mentions } : {}),
+      });
+      const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
+      logger.info({ chatId, filename: file.filename, mimetype: file.mimetype, messageId: id }, 'media sent');
       return id;
     },
     stop: async () => {

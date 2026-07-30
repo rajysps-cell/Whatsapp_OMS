@@ -154,6 +154,18 @@ function main(): void {
       claimSend(chatId); // send failed — drop the queued entry so it can't mis-attribute later
       throw err;
     }
+  },
+  (messageId) => client.media(messageId),
+  async (chatId, file, caption, mentions, sentBy) => {
+    // Same attribution path as a text send: the id that comes back is unusable on @lid chats,
+    // so queue the sender and let the message_create event claim it.
+    if (sentBy) queueSend(chatId, sentBy);
+    try {
+      return await client.sendMedia(chatId, file, caption, mentions);
+    } catch (err) {
+      claimSend(chatId);
+      throw err;
+    }
   });
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)

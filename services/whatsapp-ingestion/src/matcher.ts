@@ -10,6 +10,8 @@ export interface MatchedItem {
   quantity: string;
   matched: Product | null;
   suggestions: Product[];
+  /** True when `matched` came from fuzzy similarity rather than an exact code/alias — worth a look. */
+  guess?: boolean;
 }
 
 // --- fuzzy scoring (trigram Dice + token overlap + code/UPC boost) ---
@@ -61,12 +63,69 @@ export function search(q: string, limit = 5): Scored[] {
         ? qTokens.filter((t) => p.norm.includes(t)).length / qTokens.length
         : 0;
       const sub = qn.length >= 3 && p.norm.includes(qn) ? 0.15 : 0;
-      s = 0.55 * d + 0.35 * overlap + sub;
+      // Cap below 1: the weights sum to 1.05, so a strong fuzzy hit could otherwise cross the
+      // "score >= 0.999 means exact" test in matchItem and skip the size/confidence checks —
+      // which is how "2x2-1/2 black nipple" was auto-accepted as '1/2X2-1/2 BLACK NIPPLE'.
+      s = Math.min(0.98, 0.55 * d + 0.35 * overlap + sub);
     }
     if (s > 0.06) scored.push({ product: p, score: s });
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
+}
+
+/**
+ * Every size mentioned in a piece of text, as numbers ("1/2" and "½" -> 0.5, "1-1/2" -> 1.5).
+ *
+ * Size is what separates a right fuzzy match from a wrong one here. Word similarity alone rates
+ * "1/2 copper press tee" against '4" Copper Press Tee' at 0.99 — the words are near-identical and
+ * only the size differs, which is exactly the part that must not be guessed.
+ */
+function sizes(s: string): Set<number> {
+  const out = new Set<number>();
+  const t = String(s)
+    .replace(/½/g, ' 1/2 ')
+    .replace(/¼/g, ' 1/4 ')
+    .replace(/¾/g, ' 3/4 ')
+    .replace(/⅜/g, ' 3/8 ')
+    .replace(/⅝/g, ' 5/8 ')
+    .replace(/[xX×]/g, ' ');
+  const re = /(\d+)\s*[- ]\s*(\d+)\s*\/\s*(\d+)|(\d+)\s*\/\s*(\d+)|(\d+(?:\.\d+)?)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) !== null) {
+    if (m[1]) out.add(Number(m[1]) + Number(m[2]) / Number(m[3]));
+    else if (m[4]) out.add(Number(m[4]) / Number(m[5]));
+    else out.add(Number(m[6]));
+  }
+  return out;
+}
+
+/** Word-similarity floor for a fuzzy auto-match. Sizes still have to agree on top of this. */
+const FUZZY_MIN = 0.45;
+/** Higher bar when the request names no size but the product is size-specific — that is a guess. */
+const FUZZY_MIN_NO_SIZE = 0.72;
+
+/**
+ * Should this fuzzy hit be accepted without asking a human?
+ *
+ * Word similarity alone is not enough: measured over real order messages the top hit was often the
+ * right product in the wrong size ('1/2 copper press tee' scored 0.99 against '4" Copper Press
+ * Tee'). So sizes must not contradict, and a one-word request like "Primer" must never be resolved
+ * to a size-specific part ('1/2" Primer Tap') on word overlap alone.
+ */
+function confident(phrase: string, p: Product, score: number): boolean {
+  if (score < FUZZY_MIN) return false;
+  const want = sizes(phrase);
+  const have = sizes(p.description);
+  for (const n of want) if (!have.has(n)) return false; // a stated size must be present
+  // Need at least two real words, so single-word requests stay with a human.
+  const words = normalize(phrase)
+    .split(' ')
+    .filter((t) => t.length >= 2 && /[a-z]/.test(t) && !NOISE.has(t));
+  if (words.length < 2) return false;
+  // No size asked for, but the product only exists in sizes -> only accept a very strong match.
+  if (!want.size && have.size) return score >= FUZZY_MIN_NO_SIZE;
+  return true;
 }
 
 // Only surface genuinely relevant suggestions — never pad the list with weak fuzzy noise.
@@ -76,8 +135,14 @@ function genuine(scored: Scored[]): Product[] {
   return scored.filter((s) => s.score >= SUGG_MIN).slice(0, 5).map((s) => s.product);
 }
 
-export function matchItem(phrase: string): { matched: Product | null; suggestions: Product[] } {
+export function matchItem(phrase: string): { matched: Product | null; suggestions: Product[]; guess?: boolean } {
   const qn = normalize(phrase);
+  // 0. Exact SKU as typed. The catalog ships case-duplicate codes (BMCap07 vs BMCAP07 with
+  //    different stock); normalize() lowercases, so both score 1.0 and the fuzzy tie-break picks
+  //    whichever came first in the CSV. An exact code must win over a case-folded twin.
+  const direct = byCode(phrase.trim());
+  if (direct) return { matched: direct, suggestions: [] };
+
   const top = search(phrase, 8);
   const best = top[0];
 
@@ -101,8 +166,16 @@ export function matchItem(phrase: string): { matched: Product | null; suggestion
     return { matched: product, suggestions: genuine(top) };
   }
 
-  // 3. Fuzzy — not confident enough to auto-accept; surface only genuine suggestions.
-  //    (4. AI similarity is a future seam; 5. else stays unmatched.)
+  // 3. Confident fuzzy: strong word similarity AND no size contradiction. Score alone is not
+  //    enough — measured against real messages, the highest-scoring hits were routinely the right
+  //    product in the wrong size, which is the one mistake that must never be made silently.
+  if (best && confident(phrase, best.product, best.score)) {
+    // Flagged as a guess: it is a similarity match, not an exact code or a learned alias, so the
+    // UI marks it for a quick check before the order goes out.
+    return { matched: best.product, suggestions: genuine(top.slice(1)), guess: true };
+  }
+
+  // 4. Everything else stays unmatched for a human to resolve. (AI similarity is a future seam.)
   return { matched: null, suggestions: genuine(top) };
 }
 
@@ -275,9 +348,11 @@ export function extractItems(text: string): ExtractedItem[] {
     ) {
       quantity = String(NUMWORDS[m[1]!.toLowerCase()]);
       phrase = m[3]!;
-    } else if ((m = seg.match(/^\s*(\d+)(?![\/'"”“′″])\s*(?:x\b|[-–—])?\s*(.+)$/i))) {
+    } else if ((m = seg.match(/^\s*(\d+)(?![\/'"”“′″])(?!\s*[xX×]\s*\d)(?!\s*(?:inch|inches|in)\b)\s*(?:x\b|[-–—])?\s*(.+)$/i))) {
       // "5 pumps" / "5x pumps" / "2 -Copper Street 90s" — but NOT when the leading number is a
-      // size (2' , 3/4, 6”), which must stay in the phrase.
+      // size (2' , 3/4, 6”), a dimension ("2x2-1/2" is 2 by 2½, not 2 of them), or a spelled-out
+      // measurement ("4 inch sprinkler cap"). Those must stay in the phrase or the wrong product
+      // is matched at the wrong size.
       quantity = m[1]!;
       phrase = m[2]!;
     } else if ((m = seg.match(/^(.+?)\s*x\s*(\d+)\s*$/i))) {

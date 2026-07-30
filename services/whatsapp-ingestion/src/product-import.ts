@@ -21,6 +21,7 @@ import nodemailer from 'nodemailer';
 import { parse } from 'csv-parse/sync';
 import { config } from './config';
 import { logger } from './logger';
+import { resetIndex } from './matcher';
 import * as products from './products';
 
 const log = logger.child({ mod: 'product-import' });
@@ -184,8 +185,13 @@ export async function runProductImport(): Promise<ImportResult> {
     fs.renameSync(tmp, dest);
 
     // Hot-reload the in-memory catalog so the running service uses the new data immediately.
+    // resetIndex() is NOT optional: the matcher caches a per-product trigram index and pairs it
+    // with the catalog BY ARRAY POSITION. Reloading without clearing it scores every product
+    // against another product's trigrams, and once the new file has more rows the lookup runs off
+    // the end of the cached array and every search throws.
     const before = products.count();
     products.load();
+    resetIndex();
     const after = products.count();
 
     log.info({ filename, rows: v.rows, catalogBefore: before, catalogAfter: after, audit: auditPath }, 'product catalog updated from email');

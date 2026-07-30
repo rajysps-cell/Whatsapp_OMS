@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import http from 'node:http';
+import nodePath from 'node:path';
 import QRCode from 'qrcode';
 import {
   COOKIE,
@@ -53,6 +55,19 @@ let status = 'starting';
 let qrDataUrl: string | null = null;
 let ordersProvider: () => Order[] = () => [];
 let chatStoreRef: ChatStore | null = null;
+/** Injected by index.ts so staff can attach a file to a chat. */
+let sendMediaFn:
+  | ((
+      chatId: string,
+      file: { data: string; mimetype: string; filename: string },
+      caption?: string,
+      mentions?: string[],
+      sentBy?: string,
+    ) => Promise<string>)
+  | null = null;
+/** Injected by index.ts so the thread can show images, voice notes and documents. */
+let mediaFn: ((messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>) | null =
+  null;
 /** Injected by index.ts so the UI can send a message through the live WhatsApp connection. */
 let sendMessageFn:
   | ((chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>)
@@ -153,6 +168,29 @@ function isSecureReq(req: http.IncomingMessage): boolean {
   const first = Array.isArray(proto) ? proto[0] : proto;
   if (first) return first.split(',')[0]?.trim() === 'https';
   return (req.socket as { encrypted?: boolean }).encrypted === true;
+}
+/** Minimal mime<->extension mapping for the media cache (only what WhatsApp actually sends). */
+const MIME_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'video/mp4': 'mp4', 'video/3gpp': '3gp',
+  'audio/ogg': 'ogg', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav',
+  'application/pdf': 'pdf',
+};
+function extFromMime(m: string): string {
+  return MIME_EXT[String(m).split(';')[0]!.trim()] ?? 'bin';
+}
+function mimeFromExt(file: string): string {
+  const ext = file.split('.').pop() ?? '';
+  for (const [mime, e] of Object.entries(MIME_EXT)) if (e === ext) return mime;
+  return 'application/octet-stream';
+}
+/** decodeURIComponent that answers null instead of throwing on a malformed escape like "%" or "%zz". */
+function safeDecode(s: string): string | null {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
 }
 function redirect(res: http.ServerResponse, to: string): void {
   res.writeHead(302, { location: to });
@@ -263,16 +301,27 @@ async function handleAdmin(
   }
   return false;
 }
-function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+/** Bigger cap for file uploads — base64 inflates a file by about a third. */
+const UPLOAD_MAX = 26_000_000;
+
+function readBody(req: http.IncomingMessage, max = 2_000_000): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     let data = '';
     req.on('data', (c) => {
       data += c;
-      if (data.length > 2_000_000) req.destroy();
+      // Resolve on destroy: an unresolved promise here leaked the handler frame for the life
+      // of the process, and the caller was left awaiting forever.
+      if (data.length > max) {
+        req.destroy();
+        resolve({});
+      }
     });
     req.on('end', () => {
       try {
-        resolve(JSON.parse(data || '{}'));
+        // A body of literal `null` parses fine but is not an object — every handler then threw on
+        // property access and returned 500, including on the unauthenticated /login route.
+        const parsed: unknown = JSON.parse(data || '{}');
+        resolve(parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {});
       } catch {
         resolve({});
       }
@@ -285,10 +334,20 @@ export function startWebServer(
   getOrders: () => Order[],
   chatStore: ChatStore,
   send?: (chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>,
+  media?: (messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>,
+  sendMedia?: (
+    chatId: string,
+    file: { data: string; mimetype: string; filename: string },
+    caption?: string,
+    mentions?: string[],
+    sentBy?: string,
+  ) => Promise<string>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
   sendMessageFn = send ?? null;
+  mediaFn = media ?? null;
+  sendMediaFn = sendMedia ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -467,7 +526,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
   if (path === '/api/products/search') {
     const q = u.searchParams.get('q') ?? '';
-    const limit = Math.min(20, Number(u.searchParams.get('limit') ?? 8) || 8);
+    // Math.max first: a negative limit made slice(0,-1) mean "all but the last", returning the
+    // whole 17k-row catalog (1.7 MB) instead of a handful of suggestions.
+    const limit = Math.min(20, Math.max(1, Number(u.searchParams.get('limit') ?? 8) || 8));
     json(res, 200, { results: search(q, limit).map((s) => s.product) });
     return;
   }
@@ -541,15 +602,74 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     });
     return;
   }
+  // Serve a message's media (image / voice / video / document). Downloaded from WhatsApp on first
+  // request and cached on disk, so a thread with 50 photos does not re-download on every scroll.
+  const mm2 = path.match(/^\/api\/media\/(.+)$/);
+  if (mm2) {
+    const id = safeDecode(mm2[1] ?? '');
+    if (!id) {
+      json(res, 400, { error: 'missing id' });
+      return;
+    }
+    const safe = id.replace(/[^A-Za-z0-9_.@-]/g, '_').slice(0, 120);
+    const dir = nodePath.join(config.storeDir, 'media');
+    try {
+      const hit = fs.readdirSync(dir).find((f) => f.startsWith(safe + '.'));
+      if (hit) {
+        const buf = fs.readFileSync(nodePath.join(dir, hit));
+        res.writeHead(200, {
+          'content-type': mimeFromExt(hit),
+          'cache-control': 'private, max-age=86400',
+          'content-length': buf.length,
+        });
+        res.end(buf);
+        return;
+      }
+    } catch {
+      /* no cache dir yet */
+    }
+    if (!mediaFn) {
+      json(res, 503, { error: 'media unavailable' });
+      return;
+    }
+    const got = await mediaFn(id);
+    if (!got) {
+      json(res, 404, { error: 'media could not be downloaded' });
+      return;
+    }
+    const buf = Buffer.from(got.data, 'base64');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(nodePath.join(dir, `${safe}.${extFromMime(got.mimetype)}`), buf);
+    } catch (err) {
+      logger.warn({ err }, 'could not cache media'); // serving still works
+    }
+    res.writeHead(200, {
+      'content-type': got.mimetype,
+      'cache-control': 'private, max-age=86400',
+      'content-length': buf.length,
+    });
+    res.end(buf);
+    return;
+  }
   // People who can be @-mentioned in this chat (fetched once when a chat is opened).
   const pm = path.match(/^\/api\/chats\/(.+)\/participants$/);
   if (pm) {
-    json(res, 200, { participants: chatParticipants(decodeURIComponent(pm[1] ?? '')) });
+    const pid = safeDecode(pm[1] ?? '');
+    if (pid === null) {
+      json(res, 400, { error: 'bad chat id' });
+      return;
+    }
+    json(res, 200, { participants: chatParticipants(pid) });
     return;
   }
   const mm = path.match(/^\/api\/chats\/(.+)\/messages$/);
   if (mm) {
-    const id = decodeURIComponent(mm[1] ?? '');
+    const id = safeDecode(mm[1] ?? '');
+    if (id === null) {
+      json(res, 400, { error: 'bad chat id' });
+      return;
+    }
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
@@ -608,6 +728,49 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch (err) {
       logger.error({ err, user: me.username, chatId }, 'send failed');
       json(res, 500, { ok: false, error: 'WhatsApp rejected the message. Try again.' });
+    }
+    return;
+  }
+  // Send a file to a chat. Same rules as a text send: human-initiated, one at a time, attributed.
+  if (path === '/api/send-media' && req.method === 'POST') {
+    if (!sendMediaFn) {
+      json(res, 503, { ok: false, error: 'Sending is not available.' });
+      return;
+    }
+    if (status !== 'connected') {
+      json(res, 409, { ok: false, error: 'WhatsApp is not connected — reconnect before sending.' });
+      return;
+    }
+    const body = await readBody(req, UPLOAD_MAX);
+    const chatId = typeof body['chatId'] === 'string' ? (body['chatId'] as string).trim() : '';
+    const data = typeof body['data'] === 'string' ? (body['data'] as string) : '';
+    const mimetype = typeof body['mimetype'] === 'string' ? (body['mimetype'] as string) : '';
+    const filename = (typeof body['filename'] === 'string' ? (body['filename'] as string) : 'file')
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .slice(0, 120);
+    const caption = typeof body['caption'] === 'string' ? (body['caption'] as string).trim() : '';
+    if (!chatId || !/@(g\.us|c\.us|lid)$/.test(chatId)) {
+      json(res, 400, { ok: false, error: 'Pick a chat first.' });
+      return;
+    }
+    if (!data || !mimetype) {
+      json(res, 400, { ok: false, error: 'No file received — try again.' });
+      return;
+    }
+    // base64 is ~4/3 of the real size; keep WhatsApp's practical limit in view.
+    if (data.length > 22_000_000) {
+      json(res, 400, { ok: false, error: 'File is too large (max about 16 MB).' });
+      return;
+    }
+    const signed = caption ? `${caption}\n\n✍🏼 BY *${me.username.toUpperCase()}*` : '';
+    try {
+      const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username);
+      if (messageId) recordSentBy(messageId, me.username);
+      logger.info({ user: me.username, chatId, filename, mimetype, messageId }, 'user sent a file');
+      json(res, 200, { ok: true, messageId });
+    } catch (err) {
+      logger.error({ err, user: me.username, chatId, filename }, 'file send failed');
+      json(res, 500, { ok: false, error: 'Send may have failed — check the chat before resending.' });
     }
     return;
   }
@@ -1070,7 +1233,7 @@ function matchPage(me: User): string {
      content — collapsed to ~190px and messages wrapped at about 12 characters.) */
   .wrap{flex:1;display:flex;min-height:0}
   .left{flex:1;min-width:0;border-right:1px solid var(--line);display:flex;min-height:0}
-  .chatcol{width:280px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
+  .chatcol{width:248px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
   .chatsearch{margin:10px;padding:9px 11px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:9px;font-size:13px;outline:none;transition:border-color .15s}
   .chatsearch:focus{border-color:var(--blue)}
   .chatlist{flex:1;overflow-y:auto;padding:0 6px 6px}
@@ -1084,6 +1247,9 @@ function matchPage(me: User): string {
   .chatrow.un .t{font-weight:700}
   .chatrow.un .p{color:var(--tx);font-weight:500}
   .learned{background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:6px}
+  /* Matched by similarity rather than an exact code or a learned alias — worth a glance. */
+  .guess{background:#fffbeb;color:#b45309;border:1px solid #fde68a;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:6px;font-weight:600}
+  .row.guessed{border-left-color:var(--amber)}
   .thread{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg)}
   .threadhead{padding:9px 16px;background:#f0f2f5;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
   .threadhead .tt{font-weight:600;font-size:15px;color:var(--tx)}
@@ -1092,10 +1258,13 @@ function matchPage(me: User): string {
   .btn.green{background:var(--em)}
   .btn.ghost{background:#0000;border:1px solid var(--line);color:var(--mut)}.btn.ghost:hover{border-color:var(--blue);color:var(--blue);filter:none}
   .iconbtn{width:34px;height:34px;padding:0;justify-content:center;font-size:13px}
-  .msgs{flex:1;overflow-y:auto;padding:12px 6% 22px;display:flex;flex-direction:column;gap:0;background:var(--chatbg)}
+  /* Centre the conversation and cap its width so a wide screen does not leave a band of empty
+     wallpaper. Done with padding, not align-self, so the left/right bubble alignment still works. */
+  .msgs{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:0;background:var(--chatbg);
+    padding:12px max(22px,calc((100% - 780px)/2)) 22px}
   .daysep{align-self:center;margin:14px 0 8px}
   .daysep span{background:#fff;color:#54656f;font-size:12.5px;font-weight:500;padding:5px 12px;border-radius:8px;box-shadow:0 1px .5px rgba(11,20,26,.13)}
-  .bubble{position:relative;max-width:65%;min-width:96px;padding:6px 9px 8px;border-radius:7.5px;font-size:14.2px;line-height:19px;box-shadow:0 1px .5px rgba(11,20,26,.13);margin-top:8px}
+  .bubble{position:relative;max-width:min(74%,540px);min-width:96px;padding:6px 9px 8px;border-radius:7.5px;font-size:14.2px;line-height:19px;box-shadow:0 1px .5px rgba(11,20,26,.13);margin-top:8px}
   .bubble.grp{margin-top:2px}
   .in{align-self:flex-start;background:#fff;border-top-left-radius:0}
   .out{align-self:flex-end;background:var(--wa);border-top-right-radius:0}
@@ -1104,6 +1273,15 @@ function matchPage(me: User): string {
   .out:not(.grp)::before{content:"";position:absolute;top:0;right:-8px;border-top:8px solid var(--wa);border-right:8px solid transparent}
   .who{font-size:12.8px;font-weight:600;margin-bottom:2px;line-height:1.2}
   .tx{white-space:pre-wrap;word-break:break-word}
+  /* Media in the thread. Fetched lazily, so a chat with hundreds of photos stays fast. */
+  .mediaimg{display:block;margin:0 0 3px}
+  .mediaimg img{display:block;max-width:100%;max-height:320px;border-radius:6px;background:#00000008}
+  .mediaaud{display:block;width:min(260px,100%);height:38px;margin:2px 0 3px}
+  .mediavid{display:block;max-width:100%;max-height:320px;border-radius:6px;margin-bottom:3px;background:#000}
+  .mediadoc{display:inline-block;margin-bottom:3px;padding:7px 11px;background:rgba(0,0,0,.05);
+    border-radius:7px;color:var(--tx);text-decoration:none;font-size:13px}
+  .mediadoc:hover{background:rgba(0,0,0,.08)}
+  .medianote{font-size:12px;color:var(--mut);font-style:italic;padding:3px 0}
   /* @mention: WhatsApp renders these as non-clickable coloured text (read-only here by design). */
   .mn{color:#027eb5;font-weight:500}
   /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
@@ -1125,6 +1303,19 @@ function matchPage(me: User): string {
     border:1px solid var(--line);border-radius:9px;background:#fff;color:var(--tx);outline:none;transition:border-color .15s}
   .composer textarea:focus{border-color:var(--em2)}
   .composer textarea:disabled{background:#f6f7f8;color:var(--mut)}
+  .attachbtn{width:36px;height:36px;flex-shrink:0;border:0;border-radius:50%;background:#0000;color:var(--mut);
+    font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,color .15s}
+  .attachbtn:hover:not(:disabled){background:#0000000d;color:var(--tx)}
+  .attachbtn:disabled{opacity:.4;cursor:default}
+  /* Chosen file, shown above the composer until it is sent or removed. */
+  .filechip{display:none;align-items:center;gap:9px;margin:0 14px 6px;padding:7px 11px;background:var(--panel);
+    border:1px solid var(--line);border-radius:9px;font-size:12.5px;color:var(--tx)}
+  .filechip.on{display:flex}
+  .filechip img{width:34px;height:34px;object-fit:cover;border-radius:6px;flex-shrink:0}
+  .filechip .fname{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .filechip .fsize{color:var(--mut);margin-left:auto;white-space:nowrap}
+  .filechip .fx{border:0;background:#0000;color:var(--mut);cursor:pointer;font-size:15px;padding:0 2px}
+  .filechip .fx:hover{color:var(--red)}
   .sendbtn{width:40px;height:40px;flex-shrink:0;border:0;border-radius:50%;background:var(--em);color:#fff;
     font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:filter .15s,opacity .15s}
   .sendbtn:hover:not(:disabled){filter:brightness(1.08)}
@@ -1171,30 +1362,50 @@ function matchPage(me: User): string {
     .chatcol{width:240px}
     .right{width:clamp(300px,34%,420px)}
   }
-  /* Phone: three side-by-side columns cannot work — stack them and scroll the page. */
+  /* Phone: three side-by-side columns cannot work. The chat fills the screen and the order panel
+     slides in over it from the right when a message is extracted — so you are never scrolling
+     between two half-height panes on a small screen. */
+  .panelclose{display:none}
+  .backchat{display:none} /* phone-only: desktop shows both columns at once */
   @media (max-width:860px){
-    body{overflow:auto}
-    header{flex-wrap:wrap;gap:8px 10px;padding:10px 14px}
+    header{flex-wrap:wrap;gap:8px 10px;padding:9px 12px}
     header h1{font-size:14px}
     .wrap{flex-direction:column;min-height:0}
-    .left{flex:none;flex-direction:column;border-right:0}
-    .chatcol{width:100%;max-height:38vh;border-right:0;border-bottom:1px solid var(--line)}
-    .thread{min-height:60vh}
-    .right{width:100%;flex:none;border-top:1px solid var(--line)}
-    .bubble{max-width:86%}
+    .left{flex:1;flex-direction:column;border-right:0;min-height:0}
+    /* Two screens like WhatsApp: the chat list fills the phone, then the conversation replaces it.
+       Showing a squashed list above a squashed thread made both unusable. */
+    .chatcol{width:100%;max-height:none;flex:1;border-right:0;border-bottom:0}
+    .thread{min-height:0;flex:1}
+    body.inchat .chatcol{display:none}
+    body:not(.inchat) .thread{display:none}
+    .backchat{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;
+      margin-right:2px;border:0;background:#0000;color:var(--blue);font-size:19px;cursor:pointer;flex-shrink:0}
+    .bubble{max-width:88%}
     .msgs{padding:12px 12px 20px}
+    /* the order panel becomes a full-screen sheet */
+    .right{position:fixed;inset:0;z-index:40;width:100%;padding:14px 14px 26px;
+      transform:translateX(100%);transition:transform .28s cubic-bezier(.22,.61,.36,1);
+      box-shadow:-8px 0 26px #00000026;overscroll-behavior:contain}
+    .right.open{transform:translateX(0)}
+    .panelclose{display:flex;align-items:center;gap:7px;position:sticky;top:-14px;z-index:2;
+      margin:-14px -14px 10px;padding:11px 14px;background:var(--panel);border-bottom:1px solid var(--line);
+      font-size:13px;font-weight:600;color:var(--tx)}
+    .panelclose button{border:0;background:#0000;color:var(--blue);font-size:14px;font-weight:700;
+      cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:2px 0}
+    .panelclose .hint{margin-left:auto;font-weight:400;font-size:11px;color:var(--mut)}
   }
-  .sect h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 10px}
-  .row{border:1px solid var(--line);border-radius:12px;margin-bottom:8px;background:var(--panel);border-left:3px solid var(--line);transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px #0000000f;overflow:hidden}
+  .sect h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 8px;display:flex;align-items:baseline;gap:8px}
+  .cnt{text-transform:none;letter-spacing:0;font-weight:600;color:var(--em2)}
+  .row{border:1px solid var(--line);border-radius:9px;margin-bottom:5px;background:var(--panel);border-left:3px solid var(--line);transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px #0000000f;overflow:hidden}
   .row.matched{border-left-color:var(--em)}.row.unmatched{border-left-color:var(--amber)}.row.resolved{border-left-color:var(--em)}
   .row.open{box-shadow:0 2px 8px #00000014}
-  .row .top{display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer}
+  .row .top{display:flex;align-items:center;gap:8px;padding:6px 9px;cursor:pointer}
   .row .top:hover{background:#f9fbfd}
-  .qty{width:52px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:6px;font-size:13px;text-align:center;outline:none;flex-shrink:0}
+  .qty{width:44px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:4px 3px;font-size:13px;font-weight:600;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
   .pinfo{flex:1;min-width:0}
   .pmain{font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .cust{font-size:11px;color:var(--mut);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .cust{font-size:10.5px;color:var(--mut);margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
@@ -1233,10 +1444,13 @@ function matchPage(me: User): string {
   <div class="left">
     <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off"><div class="chatlist" id="chatlist"></div></div>
     <div class="thread">
-      <div class="threadhead"><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
+      <div class="threadhead"><button class="backchat" id="tolist" title="All chats" aria-label="Back to all chats">&#8592;</button><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
       <div class="msgs" id="msgs"><div class="placeholder">Pick a conversation on the left.</div></div>
       <div class="mentionbox" id="mbox"></div>
+      <div class="filechip" id="filechip"></div>
       <div class="composer" id="composer">
+        <input type="file" id="cfile" hidden accept="image/*,video/*,audio/*,.pdf,.csv,.xlsx,.xls,.doc,.docx,.txt">
+        <button class="attachbtn" id="attachbtn" title="Attach a file" aria-label="Attach a file" disabled>&#128206;</button>
         <textarea id="cinput" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter for a new line)" disabled></textarea>
         <button class="sendbtn" id="sendbtn" disabled title="Send">➤</button>
       </div>
@@ -1247,6 +1461,26 @@ function matchPage(me: User): string {
 <script>
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
 var meName=${JSON.stringify(me.name || me.username)},appUsers=[];
+// --- mobile: chat list and conversation are two screens, like WhatsApp ---
+function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
+function showChat(){document.body.classList.add("inchat");}
+function showList(){document.body.classList.remove("inchat");closePanel();}
+function openPanel(){if(isMobile())el("right").classList.add("open");}
+function closePanel(){el("right").classList.remove("open");}
+// Swipe: right closes the panel, left opens it again (when there is something to show).
+function wireSwipe(elm){
+  var x0=0,y0=0,t0=0;
+  elm.addEventListener("touchstart",function(e){var t=e.changedTouches[0];x0=t.clientX;y0=t.clientY;t0=Date.now();},{passive:true});
+  elm.addEventListener("touchend",function(e){
+    if(!isMobile())return;
+    var t=e.changedTouches[0],dx=t.clientX-x0,dy=t.clientY-y0;
+    if(Date.now()-t0>600)return;                       // slow drag = scrolling, not a swipe
+    if(Math.abs(dx)<60||Math.abs(dy)>Math.abs(dx))return; // must be clearly horizontal
+    if(dx<0){ if(items.length)openPanel(); return; }        // swipe left: show the order panel
+    // swipe right: close the panel first, otherwise go back to the chat list
+    if(el("right").classList.contains("open"))closePanel(); else showList();
+  },{passive:true});
+}
 // Sign-out is a POST so a third-party page can't force it with an <img>/<a> to /logout.
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
@@ -1267,6 +1501,20 @@ function reactSummary(arr){var u=[];for(var i=0;i<arr.length;i++)if(u.indexOf(ar
 // (No entity produced by esc() contains '@', so this replace can never split one.)
 function fmtBody(s){return esc(s).replace(/@(\\d{5,})/g,function(m,id){var n=mentionMap[id];return n?'<span class="mn">@'+esc(n)+'</span>':m;});}
 function jidName(j){if(!j)return"";var id=String(j).split("@")[0].split(":")[0];return mentionMap[id]||"";}
+// Media is fetched on demand from /api/media/<id> — it is downloaded from WhatsApp the first time
+// and cached on disk, so a thread full of photos does not re-download while scrolling.
+function mediaBlock(m){
+  var k=m.kind||"", src="/api/media/"+encodeURIComponent(m.messageId);
+  if(k==="image"||k==="sticker")
+    return '<a class="mediaimg" href="'+src+'" target="_blank" rel="noopener"><img loading="lazy" src="'+src+'" alt="'+esc(k)+'" onerror="this.closest(\\'.mediaimg\\').outerHTML=\\'<div class=&quot;medianote&quot;>Image unavailable</div>\\'"></a>';
+  if(k==="voice"||k==="ptt"||k==="audio")
+    return '<audio class="mediaaud" controls preload="none" src="'+src+'"></audio>';
+  if(k==="video"||k==="ptv")
+    return '<video class="mediavid" controls preload="none" src="'+src+'"></video>';
+  if(k==="document")
+    return '<a class="mediadoc" href="'+src+'" target="_blank" rel="noopener">&#128206; Open document</a>';
+  return "";
+}
 // Chat-list preview: drop a trailing signature line so the sidebar shows the message, not "hi -- admin".
 function stripSig(t){return String(t||"").replace(/\\s*(?:\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?|sent by\\s*-\\s*|--\\s+)\\*?[A-Za-z0-9]{3,32}\\*?\\s*$/i,"").trim();}
 // Messages sent from this app end with a final line of "-- username". Split that off so the bubble
@@ -1306,9 +1554,14 @@ function quoteHtml(m){
 }
 function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;// Attribution: the server's sent_by record is authoritative; the text signature is only a
 // fallback for messages sent before attribution moved into the database.
-var sig=splitSignature(m.text||"",out);var sentBy=m.sentBy||sig.by;
-var body=sig.body||(m.hasMedia?("["+(m.kind||"media")+"]"):(m.text?"":"["+(m.kind||"msg")+"]"));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
-var inner=nm+quoteHtml(m)+'<div class="tx">'+fmtBody(body)+'</div>'+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+// Gate the signature on fromMe (what our own device actually sent), NOT on the layout side. The
+// layout side comes from a substring match on the sender's self-chosen WhatsApp name, so a customer
+// who renames themselves "...Shipping" would otherwise get a forged "Sent by staff" badge.
+// (No backticks in this comment: the page is a TS template literal and they would end the string.)
+var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
+var mediaHtml=mediaBlock(m);
+var body=sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]")));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
+var inner=nm+quoteHtml(m)+mediaHtml+(body?'<div class="tx">'+fmtBody(body)+'</div>':'')+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
@@ -1358,7 +1611,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();el("renamebtn").disabled=false;drafted=[];hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -1391,8 +1644,8 @@ async function toggleExtract(mid){
   try{
     var d=await(await fetch("/api/extract",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,messageId:mid})})).json();
     active[mid]=(d.sources&&d.sources[0]&&d.sources[0].text)||"(no text)";
-    var add=(d.items||[]).map(function(it){return {mid:mid,phrase:it.phrase,quantity:it.quantity||"1",matched:it.matched,chosen:it.matched||null,suggestions:it.suggestions||[],results:[]};});
-    items=items.concat(add);rebuildSources();renderRight();
+    var add=(d.items||[]).map(function(it){return {mid:mid,phrase:it.phrase,quantity:it.quantity||"1",matched:it.matched,chosen:it.matched||null,guess:!!it.guess,suggestions:it.suggestions||[],results:[]};});
+    items=items.concat(add);rebuildSources();renderRight();openPanel(); // slide the sheet in on phones
   }catch(e){}
   finally{if(b)b.classList.remove("busy");applyStates();}
 }
@@ -1401,6 +1654,7 @@ el("msgs").addEventListener("click",function(e){var b=e.target.closest(".xable")
 // Jump between extracted/processed messages in a long thread.
 var navIdx=-1;
 function navExtracted(dir){var list=Array.prototype.slice.call(document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done"));if(!list.length)return;navIdx+=dir;if(navIdx<0)navIdx=list.length-1;if(navIdx>=list.length)navIdx=0;var t=list[navIdx];t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.remove("flash");void t.offsetWidth;t.classList.add("flash");}
+el("tolist").addEventListener("click",showList);
 el("navprev").addEventListener("click",function(){navExtracted(-1);});
 el("navnext").addEventListener("click",function(){navExtracted(1);});
 
@@ -1413,23 +1667,28 @@ el("chatsearch").addEventListener("input",renderChats);
 // The whole header is clickable to expand an inline search (accordion, one open at a time).
 function rowHtml(i){
   var it=items[i],ch=it.chosen;
-  var cls=ch?(it.matched?"matched":"resolved"):"unmatched";
+  var cls=ch?(it.matched?(it.guess&&!it.learned?"matched guessed":"matched"):"resolved"):"unmatched";
   var head=ch
-    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust">&#8627; <b>Customer wrote:</b> '+esc(it.phrase)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+'</div></div>'
+    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust">&#8627; <b>Customer wrote:</b> '+esc(it.phrase)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
     : '<div class="pinfo"><div class="pmain">'+esc(it.phrase)+'</div></div>';
   var top='<div class="top" data-idx="'+i+'"><input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<span class="exp">&#9656;</span></div>';
   var body='<div class="expand"><div class="inner"><input class="psearch" data-idx="'+i+'" placeholder="search products…" autocomplete="off"><div class="results" data-res="'+i+'"></div></div></div>';
   return '<div class="row '+cls+'" data-row="'+i+'">'+top+body+'</div>';
 }
+// Panel header (phone only): a way back to the chat. Included in the empty state too, so an
+// order panel opened with nothing in it is never a dead end.
+function panelHeadHtml(){return '<div class="panelclose"><button type="button" id="backchat">&#8592; Chat</button><span class="hint">swipe right to close</span></div>';}
 function renderRight(){
   openIdx=null;
-  if(!items.length){el("right").innerHTML='<div class="placeholder">'+(sources.length?"No products found in the selected message(s).":"Click Extract on a customer message to begin.")+'</div>';return;}
-  var matched=[],unmatched=[];
-  items.forEach(function(it,i){(it.chosen?matched:unmatched).push(i);});
-  var h='<div class="sect"><h2>Matched ('+matched.length+')</h2>';
-  h+=matched.length?matched.map(rowHtml).join(""):'<div class="muted" style="font-size:12px;padding:0 2px 8px">None yet — resolve items below.</div>';
-  h+='</div><div class="sect"><h2>Unmatched ('+unmatched.length+')</h2>';
-  h+=unmatched.length?unmatched.map(rowHtml).join(""):'<div class="muted" style="font-size:12px;padding:0 2px 8px">All items matched.</div>';
+  if(!items.length){el("right").innerHTML=panelHeadHtml()+'<div class="placeholder">'+(sources.length?"No products found in the selected message(s).":"Click Extract on a customer message to begin.")+'</div>';return;}
+  // ONE list, in the order the customer wrote the items — splitting into Matched/Unmatched
+  // reordered the order lines and made them impossible to check against the message.
+  // Colour carries the state instead: green = matched, orange = still needs a product.
+  var done=items.filter(function(it){return it.chosen;}).length;
+  var h=panelHeadHtml();
+  h+='<div class="sect"><h2>Order lines &nbsp;<span class="cnt">'+done+' of '+items.length+' matched</span></h2>';
+  h+=items.map(function(_,i){return rowHtml(i);}).join("");
+  h+='</div>';
   h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table></div>';
   el("right").innerHTML=h;
   updateFinal();
@@ -1457,6 +1716,7 @@ el("right").addEventListener("input",function(e){var t=e.target;if(t.classList.c
 el("right").addEventListener("click",function(e){
   var o=e.target.closest(".opt");if(o){choose(o.dataset.idx,o.dataset.code);return;}
   var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){items[ri].chosen=null;items[ri].learned=false;}renderRight();return;}
+  if(e.target.closest("#backchat")){closePanel();return;}
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
   if(e.target.closest(".psearch")||e.target.closest(".expand"))return; // don't toggle when interacting inside the open panel
@@ -1561,13 +1821,53 @@ function resolveDraft(text){
   return {text:out,mentions:mentions};
 }
 
+// --- attachments -------------------------------------------------------------------------
+var pendingFile=null;   // {name, type, size, b64, previewUrl}
+function fmtSize(n){return n<1024?n+" B":n<1048576?(n/1024).toFixed(0)+" KB":(n/1048576).toFixed(1)+" MB";}
+function clearFile(){
+  if(pendingFile&&pendingFile.previewUrl)URL.revokeObjectURL(pendingFile.previewUrl);
+  pendingFile=null;el("cfile").value="";el("filechip").className="filechip";el("filechip").innerHTML="";syncComposer();
+}
+function showFile(){
+  if(!pendingFile)return;
+  var thumb=pendingFile.previewUrl?'<img src="'+pendingFile.previewUrl+'" alt="">':'<span style="font-size:19px">&#128206;</span>';
+  el("filechip").innerHTML=thumb+'<span class="fname">'+esc(pendingFile.name)+'</span>'
+    +'<span class="fsize">'+fmtSize(pendingFile.size)+'</span>'
+    +'<button class="fx" id="filex" title="Remove" aria-label="Remove file">&#10005;</button>';
+  el("filechip").className="filechip on";
+  syncComposer();
+}
+el("attachbtn").addEventListener("click",function(){if(curChat)el("cfile").click();});
+el("filechip").addEventListener("click",function(e){if(e.target.closest("#filex"))clearFile();});
+el("cfile").addEventListener("change",function(){
+  var f=el("cfile").files&&el("cfile").files[0];
+  if(!f)return;
+  if(f.size>16*1024*1024){alert("That file is too large. WhatsApp accepts about 16 MB.");el("cfile").value="";return;}
+  var r=new FileReader();
+  r.onload=function(){
+    var s=String(r.result||""),i=s.indexOf(",");
+    pendingFile={name:f.name,type:f.type||"application/octet-stream",size:f.size,b64:i>=0?s.slice(i+1):s,
+                 previewUrl:/^image\\//.test(f.type)?URL.createObjectURL(f):null};
+    showFile();
+  };
+  r.onerror=function(){alert("Could not read that file.");};
+  r.readAsDataURL(f);
+});
+
 // --- composer: send a message into the open chat (human-initiated, one at a time) ---
 var sending=false;
 function autoGrow(){var t=el("cinput");t.style.height="auto";t.style.height=Math.min(t.scrollHeight,120)+"px";}
-function syncComposer(){var on=!!curChat&&!sending;el("cinput").disabled=!on;el("sendbtn").disabled=!on||!el("cinput").value.trim();}
+function syncComposer(){
+  var on=!!curChat&&!sending;
+  el("cinput").disabled=!on;
+  el("attachbtn").disabled=!on;
+  el("sendbtn").disabled=!on||(!el("cinput").value.trim()&&!pendingFile); // a file alone is sendable
+}
 async function sendMsg(){
   var t=el("cinput"),txt=t.value.trim();
-  if(!curChat||!txt||sending)return;
+  if(!curChat||sending)return;
+  if(pendingFile){await sendFile(txt);return;}   // a file send carries the text as its caption
+  if(!txt)return;
   sending=true;syncComposer();el("sendbtn").textContent="…";
   var res=resolveDraft(txt);
   try{
@@ -1577,6 +1877,19 @@ async function sendMsg(){
     else{alert(d.error||"Could not send the message.");}
   }catch(e){alert("Network error — the message was not sent.");}
   sending=false;el("sendbtn").textContent="➤";syncComposer();t.focus();
+}
+// Upload + send the attached file, using whatever is typed as the caption.
+async function sendFile(caption){
+  if(!pendingFile||!curChat||sending)return;
+  sending=true;syncComposer();el("sendbtn").textContent="…";
+  try{
+    var r=await fetch("/api/send-media",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({chatId:curChat,filename:pendingFile.name,mimetype:pendingFile.type,data:pendingFile.b64,caption:caption||""})});
+    var d=await r.json();
+    if(d.ok){el("cinput").value="";drafted=[];clearFile();autoGrow();lastSig="";refreshThread();}
+    else{alert(d.error||"Could not send the file.");}
+  }catch(e){alert("Network error — the file may not have been sent. Check the chat before resending.");}
+  sending=false;el("sendbtn").textContent="➤";syncComposer();
 }
 el("sendbtn").addEventListener("click",sendMsg);
 el("cinput").addEventListener("input",function(){autoGrow();syncComposer();updateMentions();});
@@ -1595,6 +1908,8 @@ el("mbox").addEventListener("mousedown",function(e){   // mousedown: fires befor
   var r=e.target.closest(".mrow");if(r){e.preventDefault();pickMention(+r.dataset.i);}
 });
 
+wireSwipe(el("msgs"));wireSwipe(el("right"));
+// Selecting a different chat resets the working order, so the sheet should not stay open over it.
 loadCat();loadChats();setInterval(loadChats,6000);setInterval(refreshThread,4000);
 </script></body></html>`;
 }
