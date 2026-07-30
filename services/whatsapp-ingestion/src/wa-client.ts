@@ -80,20 +80,36 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     },
   });
 
+  // Watchdog state. A start that never reaches 'ready' used to sit there until an operator
+  // noticed — that is what caused the outage after the last deploy.
+  let catalogTimer: NodeJS.Timeout | null = null;
+  let ready = false;
+  let initAt = Date.now();
+  let sawQr = false; // WhatsApp asked for a scan: only a human can fix that
+  let stuckRestarts = 0;
+
   client.on('qr', (qr) => {
+    sawQr = true; // a human must scan; restarting the client cannot help and would loop forever
     logger.info('scan this QR from the phone: WhatsApp → Linked devices → Link a device (or open the web page)');
     qrcode.generate(qr, { small: true });
     handlers.onQr?.(qr);
     handlers.onStatus?.('waiting for scan');
   });
-  let catalogTimer: NodeJS.Timeout | null = null;
-  // Watchdog state: a start that never reaches 'ready' (seen once when the service was restarted
-  // mid-handshake) used to sit there until someone noticed. Now it self-recovers.
-  let ready = false;
-  let initAt = Date.now();
-  client.on('ready', () => {
+  /**
+   * Enter the connected state exactly once, whoever noticed first.
+   *
+   * whatsapp-web.js' 'ready' event is not reliable on WhatsApp Web 2.3000.x — the same root cause
+   * that makes its Store APIs throw Error "r". Usually it arrives in about 5 seconds; sometimes it
+   * never arrives at all for a session that is in fact live, and only a re-init shakes it loose.
+   * So the watchdog below also probes the page directly; either path lands here, and this stays
+   * idempotent because both can happen for the same connection.
+   */
+  const becomeReady = (via: string): void => {
+    if (ready) return;
     ready = true;
-    logger.info('connection open — listening for group events (read-only)');
+    sawQr = false;
+    stuckRestarts = 0;
+    logger.info({ via }, 'connection open — listening for group events (read-only)');
     handlers.onStatus?.('connected');
     if (handlers.onCatalog) {
       const sync = (): void => {
@@ -114,7 +130,8 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
         logger.error({ err }, 'history backfill failed'),
       );
     }
-  });
+  };
+  client.on('ready', () => becomeReady('ready event'));
   client.on('auth_failure', (msg) => {
     logger.error({ msg }, 'auth failure');
     handlers.onStatus?.('auth failure');
@@ -122,25 +139,69 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
   client.on('disconnected', (reason) => {
     ready = false;
     initAt = Date.now();
+    stuckRestarts = 0;
     logger.warn({ reason }, 'disconnected — reinitializing');
     handlers.onStatus?.('disconnected');
-    client.initialize().catch((err) => logger.error({ err }, 'reconnect failed'));
-  });
-
-  // Watchdog: if we never reach 'ready' within STUCK_MS, tear the browser down and start over.
-  // A normal cold start takes ~5s; the one stuck start observed took an operator to notice and
-  // restart the service by hand. This makes that self-healing.
-  const STUCK_MS = 6 * 60 * 1000;
-  const watchdog = setInterval(() => {
-    if (ready || Date.now() - initAt < STUCK_MS) return;
-    logger.warn({ stuckForMs: Date.now() - initAt }, 'WhatsApp never became ready — restarting the client');
-    initAt = Date.now(); // reset first so a slow restart cannot trigger a second one
+    if (String(reason).toUpperCase().includes('LOGOUT')) {
+      // The device was unlinked from the phone. whatsapp-web.js wipes the session on this path,
+      // so the reconnect below will surface a QR — which is correct, a human has to re-link.
+      logger.error('the linked device was signed out on the phone — a QR re-scan is required');
+    }
+    // destroy() first: this event fires synchronously from inside the library, which does NOT
+    // close the browser here. Calling initialize() straight away launched a second Chromium into
+    // the same profile directory, and whichever lost the race was orphaned and never closed.
     client
       .destroy()
       .catch(() => undefined)
       .then(() => client.initialize())
-      .catch((err) => logger.error({ err }, 'watchdog reinitialize failed'));
-  }, 60 * 1000);
+      .catch((err) => logger.error({ err }, 'reconnect failed'));
+  });
+
+  // Watchdog. Two jobs, in order of preference:
+  //
+  //  1. Probe. Ask the page whether the chat catalog reads back from IndexedDB. That is the same
+  //     call the app already relies on every 2 minutes, it needs no library API, and it answers
+  //     the only question that matters: is this session actually live? When it says yes we go
+  //     connected without restarting anything — which is what fixes the "connecting" stall,
+  //     because the session was live the whole time and only the 'ready' event was missing.
+  //  2. Restart, if the probe keeps coming back empty for STUCK_MS. That is the genuinely-dead
+  //     case (browser crashed, page navigated away), where a fresh browser is the only cure.
+  const PROBE_AFTER_MS = 15 * 1000; // let the normal path win first; the probe is read-only and cheap
+  const STUCK_MS = 90 * 1000;
+  const MAX_STUCK_RESTARTS = 6; // stop hammering a genuinely broken session
+  let probing = false; // catalogSync is async and the interval is not — never overlap two probes
+  const watchdog = setInterval(() => {
+    if (ready || probing) return;
+    if (sawQr) return; // waiting on a human to scan — restarting would loop and lose the QR
+    if (Date.now() - initAt < PROBE_AFTER_MS) return;
+    const restartIfStuck = (): void => {
+      if (Date.now() - initAt < STUCK_MS) return;
+      if (stuckRestarts >= MAX_STUCK_RESTARTS) return; // give up quietly; the pill says disconnected
+      stuckRestarts++;
+      logger.warn(
+        { stuckForMs: Date.now() - initAt, attempt: stuckRestarts },
+        'WhatsApp never became ready and the chat catalog is unreadable — restarting the client',
+      );
+      initAt = Date.now(); // reset first so a slow restart cannot trigger a second one
+      client
+        .destroy()
+        .catch(() => undefined)
+        .then(() => client.initialize())
+        .catch((err) => logger.error({ err }, 'watchdog reinitialize failed'));
+    };
+    probing = true;
+    catalogSync(client)
+      .then((rows) => {
+        // Empty is not the same as unreadable: a brand-new session legitimately has no chats, so
+        // only a non-empty read proves the session is live. rows === null means there is no page.
+        if (rows?.length) becomeReady('catalog probe');
+        else restartIfStuck();
+      })
+      .catch(() => restartIfStuck()) // page not up yet, or IndexedDB not open — both mean "not live"
+      .finally(() => {
+        probing = false;
+      });
+  }, 10 * 1000);
   watchdog.unref();
 
   // 'message' fires for inbound messages only (not our own) — exactly the read-only surface we want.
