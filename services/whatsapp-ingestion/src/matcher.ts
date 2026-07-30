@@ -8,6 +8,10 @@ export interface Scored {
 export interface MatchedItem {
   phrase: string;
   quantity: string;
+  line: number;
+  raw: string;
+  unit?: string;
+  material?: string;
   matched: Product | null;
   suggestions: Product[];
   /** True when `matched` came from fuzzy similarity rather than an exact code/alias — worth a look. */
@@ -40,9 +44,78 @@ function ensureIndex(): Idx[] {
 /** Call after (re)loading the catalog so the fuzzy index rebuilds. */
 export function resetIndex(): void {
   index = null;
+  materialPools.clear();
 }
 
-export function search(q: string, limit = 5): Scored[] {
+/**
+ * Material headers ("Nohub", "Sprinkler", "CXC" on a line of their own) that customers write once
+ * and mean to apply to every line below — the client's demonstrated failure was "2 inch coupling"
+ * under a "Nohub" header matching a COPPER coupling.
+ *
+ * Keyed by the normalized header word; `syns` are normalized phrases/tokens looked for in the
+ * product's description or Major Group ("no hub" is written with a space in the catalog — the
+ * synonym map is what bridges that). Seeded from the catalog's own Major Group vocabulary; the
+ * client owes a 10–50 word list from real traffic, which slots in here.
+ */
+const MATERIALS: Record<string, { syns: string[] }> = {
+  nohub: { syns: ['no hub', 'nohub', 'nh'] },
+  sprinkler: { syns: ['sprinkler'] },
+  copper: { syns: ['copper'] },
+  cxc: { syns: ['cxc', 'c x c', 'copper'] },
+  steam: { syns: ['steam'] },
+  brass: { syns: ['brass'] },
+  pvc: { syns: ['pvc'] },
+  cpvc: { syns: ['cpvc'] },
+  pex: { syns: ['pex'] },
+  black: { syns: ['black'] },
+  galvanized: { syns: ['galvanized', 'galv'] },
+  galv: { syns: ['galvanized', 'galv'] },
+  'cast iron': { syns: ['cast iron', 'no hub', 'service weight'] },
+  press: { syns: ['press', 'propress'] },
+  propress: { syns: ['press', 'propress'] },
+  sweat: { syns: ['sweat', 'cxc'] },
+  threaded: { syns: ['threaded', 'thread', 'npt'] },
+  grooved: { syns: ['grooved', 'groove'] },
+  groove: { syns: ['grooved', 'groove'] },
+  stainless: { syns: ['stainless'] },
+  sharkbite: { syns: ['sharkbite'] },
+  fernco: { syns: ['fernco'] },
+  insulation: { syns: ['insulation'] },
+};
+
+/** The material key when a message line is JUST a material header ("Nohub", "no hub:", "CXC —"). */
+export function headerMaterial(line: string): string | null {
+  const n = normalize(line.replace(/[:\-–—.]+\s*$/, ''));
+  if (!n) return null;
+  if (MATERIALS[n]) return n;
+  // A synonym used as the header ("no hub") maps back to its key.
+  for (const [key, def] of Object.entries(MATERIALS)) if (def.syns.includes(n)) return key;
+  return null;
+}
+
+/** Catalog indices whose description or Major Group mentions the material. Cached per material. */
+const materialPools = new Map<string, number[]>();
+function materialPool(material: string): number[] {
+  let pool = materialPools.get(material);
+  if (pool) return pool;
+  const def = MATERIALS[material];
+  const products = all();
+  pool = [];
+  if (def) {
+    for (let i = 0; i < products.length; i++) {
+      const p = products[i]!;
+      // Padded word-boundary match: "no hub" must not match inside "nohubless-like" tokens, and
+      // single words must match whole tokens ("press" not "compression" — norm splits words, so
+      // padding is a real boundary).
+      const hay = ` ${p.norm} ${normalize(p.group)} `;
+      if (def.syns.some((s) => hay.includes(` ${s} `))) pool.push(i);
+    }
+  }
+  materialPools.set(material, pool);
+  return pool;
+}
+
+export function search(q: string, limit = 5, pool?: number[]): Scored[] {
   const qn = normalize(q);
   if (!qn) return [];
   const qTri = trigrams(qn);
@@ -51,7 +124,8 @@ export function search(q: string, limit = 5): Scored[] {
   const idx = ensureIndex();
 
   const scored: Scored[] = [];
-  for (let i = 0; i < products.length; i++) {
+  const indices = pool ?? products.map((_, i) => i);
+  for (const i of indices) {
     const p = products[i]!;
     const ix = idx[i]!;
     let s: number;
@@ -197,7 +271,10 @@ function genuine(scored: Scored[]): Product[] {
   return scored.filter((s) => s.score >= SUGG_MIN).slice(0, 5).map((s) => s.product);
 }
 
-export function matchItem(phrase: string): { matched: Product | null; suggestions: Product[]; guess?: boolean } {
+export function matchItem(
+  phrase: string,
+  material?: string,
+): { matched: Product | null; suggestions: Product[]; guess?: boolean } {
   const qn = normalize(phrase);
   // 0. Exact SKU as typed. The catalog ships case-duplicate codes (BMCap07 vs BMCAP07 with
   //    different stock); normalize() lowercases, so both score 1.0 and the fuzzy tie-break picks
@@ -205,12 +282,27 @@ export function matchItem(phrase: string): { matched: Product | null; suggestion
   const direct = byCode(phrase.trim());
   if (direct) return { matched: direct, suggestions: [] };
 
-  const top = search(phrase, 8);
-  const best = top[0];
+  // A material header above this line restricts matching to that material's products, and the
+  // material's catalog wording joins the scoring phrase so token overlap sees it ("nohub" the
+  // customer wrote never literally appears in "2 NO HUB COUPLING"). Measured on the client's own
+  // failure: "2 inch coupling" under a Nohub header ranked a copper coupling first (0.557 vs
+  // 0.424) without this, because most of the catalog is not nohub and similarity does not know
+  // what the header meant. If the pool is empty (a material with no products) fall back to
+  // unrestricted rather than silently matching nothing.
+  const pool = material ? materialPool(material) : undefined;
+  const restrict = pool && pool.length ? pool : undefined;
+  const scoringPhrase = restrict ? `${phrase} ${MATERIALS[material!]!.syns[0]!}` : phrase;
 
-  // 1. Exact product hit (code / UPC / exact description).
+  // 1. Exact product hit (code / UPC / exact description) — checked UNRESTRICTED even when a
+  //    material header is active. A header means "the lines below are this material", but an exact
+  //    name trumps it: "ship with uber" in the middle of a Nohub section is still the consumable,
+  //    and hiding an exact hit behind the material pool would un-match something the customer
+  //    named precisely.
+  const gTop = restrict ? search(phrase, 8) : undefined;
+  const top = search(scoringPhrase, 8, restrict);
+  const best = (gTop ?? top)[0];
   const exact = !!best && (best.score >= 0.999 || best.product.norm === qn || normalize(best.product.code) === qn);
-  if (exact) return { matched: best.product, suggestions: genuine(top.slice(1)) };
+  if (exact) return { matched: best!.product, suggestions: genuine(top.filter((t) => t.product !== best!.product).slice(0, 7)) };
 
   // 2. Exact learned alias (this is how manual corrections auto-match next time).
   const alias = getAlias(qn);
@@ -221,6 +313,7 @@ export function matchItem(phrase: string): { matched: Product | null; suggestion
       upc: '',
       vendor: '',
       category: '',
+      group: '',
       imageUrl: '',
       stock: 0,
       norm: normalize(alias.desc),
@@ -231,10 +324,29 @@ export function matchItem(phrase: string): { matched: Product | null; suggestion
   // 3. Confident fuzzy: strong word similarity AND no size contradiction. Score alone is not
   //    enough — measured against real messages, the highest-scoring hits were routinely the right
   //    product in the wrong size, which is the one mistake that must never be made silently.
-  if (best && confident(phrase, best.product, best.score)) {
+  //
+  //    The FIRST candidate that passes wins, not just the top one. Similarity does not rank by
+  //    size, so "2 inch coupling" under a Nohub header put the 5" nohub coupling first and the 2"
+  //    one just below it — the top-only check left it unmatched with the right answer sitting in
+  //    the list. confident() is strict enough (size agreement + word floor) that walking the list
+  //    cannot pick a product the top-only check would have rejected for safety reasons.
+  //    Within the walk, a candidate whose sizes are EXACTLY what was asked for beats one that
+  //    merely contains them: "2 inch coupling" must prefer the straight 2" coupling over the
+  //    2x1-1/2 reducer, even when the reducer's wording scores a whisker higher.
+  const want = sizes(phrase);
+  const exactSize = (p: Product): boolean => {
+    if (!want.size) return true;
+    const have = sizes(p.description);
+    if (have.size !== want.size) return false;
+    for (const n of want) if (!have.has(n)) return false;
+    return true;
+  };
+  const walk = [...top.filter((t) => exactSize(t.product)), ...top.filter((t) => !exactSize(t.product))];
+  for (const cand of walk) {
+    if (!confident(phrase, cand.product, cand.score)) continue;
     // Flagged as a guess: it is a similarity match, not an exact code or a learned alias, so the
     // UI marks it for a quick check before the order goes out.
-    return { matched: best.product, suggestions: genuine(top.slice(1)), guess: true };
+    return { matched: cand.product, suggestions: genuine(top.filter((t) => t !== cand)), guess: true };
   }
 
   // 4. Everything else stays unmatched for a human to resolve. (AI similarity is a future seam.)
@@ -279,8 +391,10 @@ const NON_PRODUCT_WORDS = new Set([
 const NOTE_WORDS = new Set([
   'lmk', 'advice', 'advise', 'understanding', 'sorry', 'possible', 'correct', 'model', 'update', 'updated', 'info',
   'information', 'question', 'questions', 'guys', 'approx', 'time', 'eta', 'backorder', 'soon', 'price', 'quote',
-  // acknowledgements / status / logistics chatter
-  'add', 'copy', 'checking', 'entered', 'ready', 'here', 'outside', 'mins', 'min', 'hr', 'hrs', 'uber', 'uver',
+  // acknowledgements / status / logistics chatter. 'uber' is deliberately NOT here any more:
+  // "ship with uber" is a real order line (a consumable DDI item) — arrival chatter like "uber is
+  // outside" is caught by the dedicated UBER_CHATTER_RE in isNonProduct instead.
+  'add', 'copy', 'checking', 'entered', 'ready', 'here', 'outside', 'mins', 'min', 'hr', 'hrs',
   'link', 'driver', 'cancel', 'cancelled', 'approved', 'missing', 'perfect', 'omg', 'yup', 'yesss', 'oky', 'idea',
   'around', 'each', 'these', 'got', 'arrived', 'gm', 'done', 'anything', 'everything', 'nothing', 'ordered',
   'finishing', 'noted', 'received', 'looking', 'problem', 'problems', 'good', 'great', 'fine', 'sure',
@@ -336,6 +450,10 @@ const PRODUCT_TERMS = new Set([
   'wire', 'paste', 'water', 'cover', 'covers', 'kindorf', 'strut', 'nh', 'hub',
 ]);
 const STREET_RE = /\b(st|street|ave|avenue|blvd|rd|road|dr|drive|ln|lane|ct|court|pl|place|way|hwy|highway|pkwy|parkway|apt|suite|ste)\b/i;
+// Uber ARRIVAL chatter ("uber is outside", "uber in 20 mins", "uber driver here") — dropped.
+// A bare "uber" / "ship with uber" is NOT chatter: it is an order line for the ship-with-Uber
+// consumable item, which is why 'uber' came out of NOTE_WORDS.
+const UBER_CHATTER_RE = /\b(?:uber|uver|lyft)\b.*\b(?:is|was|will|here|outside|arrived?|arriving|coming|otw|way|waiting|driver|eta|min(?:ute)?s?|hrs?|called?|calling|booked?|location)\b|\b(?:is|here|outside|arrived|driver|book(?:ed)?|call(?:ed)?)\b.*\b(?:uber|uver|lyft)\b/i;
 
 /** A phrase has a "product signal" if it has a size/unit, a known product term, or is a saved alias. */
 export function hasProductSignal(phrase: string): boolean {
@@ -359,6 +477,7 @@ function isNonProduct(seg: string, phrase: string): boolean {
   if (s.includes('?')) return true; // a question is a note/inquiry, not an order line
   if (proseCount(norm) >= 2) return true; // 2+ conversational words ⇒ a sentence, not a product
   if (/^\d+\s*(?:mins?|minutes?|hrs?|hours?|secs?)\b/i.test(s)) return true; // a duration ("20 min", "45min")
+  if (UBER_CHATTER_RE.test(low)) return true; // "uber is outside" — arrival chatter, not the consumable
   if (STREET_RE.test(s) && /\d/.test(s)) return true; // street address
   if (s.replace(/\D/g, '').length >= 7) return true; // phone / long numeric id
   if (/^\d{5}(-\d{4})?$/.test(s.replace(/\s/g, ''))) return true; // ZIP
@@ -373,6 +492,16 @@ function isNonProduct(seg: string, phrase: string): boolean {
 export interface ExtractedItem {
   phrase: string;
   quantity: string;
+  /** 1-based line number in the source message (counting every line, including blank ones), so the
+   *  row can point back at "line 3" and mean the third line the customer actually sees. */
+  line: number;
+  /** The segment exactly as the customer wrote it, before any cleaning. */
+  raw: string;
+  /** Package unit the customer put on the quantity ("box", "case", "box of 100") — captured so it
+   *  stops poisoning the fuzzy match, surfaced so staff decide what it means for the order. */
+  unit?: string;
+  /** Material inherited from a header line above ("nohub", "sprinkler") — see MATERIALS. */
+  material?: string;
 }
 
 // Spelled-out counts customers write before a dash ("two – copper couplings"). Words are never
@@ -383,15 +512,47 @@ const NUMWORDS: Record<string, number> = {
   eighteen: 18, nineteen: 19, twenty: 20,
 };
 
+// Package units a customer puts in front of an order line ("box 2 inch coupling", "2 cases teflon
+// tape"). Captured into their own field: left in the phrase they feed the fuzzy scorer as if they
+// were product words, and "box two inch coupling" shipped as quantity 1 with no trace of the box.
+const UNIT_RE = /^\s*(box(?:es)?|bx|case(?:s)?|cs\b|pack(?:s)?|pk|bundle(?:s)?|carton(?:s)?|bag(?:s)?|roll(?:s)?)\b[\s.:)\-–—]*/i;
+
 export function extractItems(text: string): ExtractedItem[] {
-  const segments = String(text)
-    .split(/[\n,;•]+|\band\b/gi)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // Lines FIRST, then segments within a line. The old single-pass split flattened newlines and
+  // commas together, which made two of the client's asks impossible: numbering items by source
+  // line, and material headers ("Nohub" on its own line) applying to the lines below them.
+  const lines = String(text).split('\n');
 
   const items: ExtractedItem[] = [];
-  for (const raw of segments) {
-    if (/https?:\/\//i.test(raw)) continue; // links (e.g. Uber trip) are never order lines
+  let material: string | undefined;
+  for (let li = 0; li < lines.length; li++) {
+    const lineText = lines[li]!;
+    if (!lineText.trim()) continue; // blank lines still advance the line number, nothing else
+
+    // A line that is nothing but a material word is a header: it emits no item and colours every
+    // line after it until the next header.
+    const hdr = headerMaterial(lineText);
+    if (hdr) {
+      material = hdr;
+      continue;
+    }
+
+    const segments = lineText
+      .split(/[,;•]+|\band\b/gi)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    for (const raw of segments) {
+      const item = extractOne(raw, li + 1, material);
+      if (item) items.push(item);
+    }
+  }
+  return items;
+}
+
+function extractOne(raw: string, line: number, material: string | undefined): ExtractedItem | null {
+  {
+    if (/https?:\/\//i.test(raw)) return null; // links (e.g. Uber trip) are never order lines
     const seg = cleanSeg(raw);
     let quantity = '';
     let phrase = seg;
@@ -410,10 +571,13 @@ export function extractItems(text: string): ExtractedItem[] {
     ) {
       quantity = String(NUMWORDS[m[1]!.toLowerCase()]);
       phrase = m[3]!;
-    } else if ((m = seg.match(/^\s*(\d+)(?![\/'"”“′″])(?!\s*[xX×]\s*\d)(?!\s*(?:inch|inches|in)\b)\s*(?:x\b|[-–—])?\s*(.+)$/i))) {
+    } else if ((m = seg.match(/^\s*(\d+)(?!\d)(?![\/'"”“′″])(?!\s*[xX×]\s*\d)(?!\s*(?:inch|inches|in|gal|gallons?|lbs?|oz|hp|amps?|watts?|volts?|btu|gauge|ga)\b)\s*(?:x\b|[-–—])?\s*(.+)$/i))) {
+      // (?!\d) pins the capture to the WHOLE number: without it, "40 gallon" failed the unit
+      // lookahead on "40", backtracked to "4", and shipped quantity 4 of "0 gallon water heater".
       // "5 pumps" / "5x pumps" / "2 -Copper Street 90s" — but NOT when the leading number is a
       // size (2' , 3/4, 6”), a dimension ("2x2-1/2" is 2 by 2½, not 2 of them), or a spelled-out
-      // measurement ("4 inch sprinkler cap"). Those must stay in the phrase or the wrong product
+      // measurement ("4 inch sprinkler cap", "40 gallon water heater" — that one really shipped
+      // as quantity 40 of a 50-gallon heater). Those must stay in the phrase or the wrong product
       // is matched at the wrong size.
       quantity = m[1]!;
       phrase = m[2]!;
@@ -432,6 +596,21 @@ export function extractItems(text: string): ExtractedItem[] {
       quantity = m[2]!;
     }
 
+    // Package unit in front of the product ("box 2 inch coupling", "2 boxes teflon tape",
+    // "box of 100 wire nuts"). Capture it — with its pack count when written — then strip it so
+    // "box" never reaches the fuzzy scorer as a product word.
+    let unit = '';
+    let um = phrase.match(UNIT_RE);
+    if (um) {
+      unit = um[1]!.toLowerCase();
+      phrase = phrase.slice(um[0].length);
+      const of = phrase.match(/^of\s+(\d+)\s+/i);
+      if (of) {
+        unit = `${unit} of ${of[1]}`;
+        phrase = phrase.slice(of[0].length);
+      }
+    }
+
     // Clean the phrase: drop leading list-marker/punct, a leading unit/count word ("10 pieces - 2\" tee"
     // -> "2\" tee"), and a trailing instruction word ("2\" tee asap" -> "2\" tee").
     phrase = phrase
@@ -445,20 +624,21 @@ export function extractItems(text: string): ExtractedItem[] {
       .replace(/\s+/g, ' ')
       .trim();
     const meaningful = phrase.toLowerCase().split(/\s+/).filter((w) => w && !NOISE.has(w));
-    if (meaningful.join('').length < 2) continue; // pure noise / too short
+    if (meaningful.join('').length < 2) return null; // pure noise / too short
     // Skip clear non-product lines (address, greeting, phone, date…), unless it has a product signal.
-    if (!hasProductSignal(phrase) && isNonProduct(raw, phrase)) continue;
+    if (!hasProductSignal(phrase) && isNonProduct(raw, phrase)) return null;
 
-    items.push({ phrase, quantity });
+    const item: ExtractedItem = { phrase, quantity, line, raw: raw.trim() };
+    if (unit) item.unit = unit;
+    if (material) item.material = material;
+    return item;
   }
-  return items;
 }
 
 /** Extract line-items from conversation text and match each against the catalog. */
 export function extractAndMatch(text: string): MatchedItem[] {
   return extractItems(text).map((it) => ({
-    phrase: it.phrase,
-    quantity: it.quantity,
-    ...matchItem(it.phrase),
+    ...it,
+    ...matchItem(it.phrase, it.material),
   }));
 }

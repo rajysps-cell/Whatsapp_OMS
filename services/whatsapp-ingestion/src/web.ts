@@ -602,7 +602,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       text = sources.map((s) => s.text).join('\n');
       if (!mids.length) newCount = pick.length;
     }
-    json(res, 200, { items: extractAndMatch(text), sources, ...(newCount >= 0 ? { newMessages: newCount } : {}) });
+    // Per-source extraction: line numbers must mean "line N of THAT message", so a 3-message order
+    // cannot run its numbering across message boundaries. Material headers also stay scoped to the
+    // message that declared them.
+    const items = sources.length
+      ? sources.flatMap((s) => extractAndMatch(s.text).map((it) => ({ ...it, messageId: s.messageId })))
+      : extractAndMatch(text);
+    json(res, 200, { items, sources, ...(newCount >= 0 ? { newMessages: newCount } : {}) });
     return;
   }
   if (path === '/api/save' && req.method === 'POST') {
@@ -1331,6 +1337,12 @@ function matchPage(me: User): string {
   .out:not(.grp)::before{content:"";position:absolute;top:0;right:-8px;border-top:8px solid var(--wa);border-right:8px solid transparent}
   .who{font-size:12.8px;font-weight:600;margin-bottom:2px;line-height:1.2}
   .tx{white-space:pre-wrap;word-break:break-word}
+  /* Per-line rendering of extractable messages. The number gutter stays invisible until the
+     message is extracted — then each line shows the number its order rows refer to. */
+  .ml{display:flex;align-items:baseline;gap:6px}
+  .mln{display:none;flex:none;min-width:16px;text-align:right;color:var(--mut);font-size:10px;font-variant-numeric:tabular-nums;user-select:none}
+  .mlt{min-width:0;flex:1}
+  .bubble.ext .mln,.bubble.done .mln{display:inline-block}
   /* Media in the thread. Fetched lazily, so a chat with hundreds of photos stays fast. */
   .mediaimg{display:block;margin:0 0 3px}
   .mediaimg img{display:block;max-width:100%;max-height:320px;border-radius:6px;background:#00000008}
@@ -1462,6 +1474,12 @@ function matchPage(me: User): string {
   .row .top:hover{background:#f9fbfd}
   .qty{width:44px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:4px 3px;font-size:13px;font-weight:600;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
+  /* Line number tying an order row back to the message line it came from — "the first one and the
+     third one" is exactly what the client could not see. Same numbers render down the message
+     bubble once it is extracted. */
+  .lno{flex:none;min-width:18px;height:18px;line-height:18px;text-align:center;border-radius:9px;background:var(--bg);border:1px solid var(--line);color:var(--mut);font-size:10px;font-weight:600}
+  .unitchip{background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
+  .matchip{background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
   /* One physical line per order line: product and the customer's wording sit side by side rather
      than stacked. Both children need min-width:0 or flex refuses to shrink them; .cust shrinks
      first (flex:1 1 auto against .pmain's flex:0 1 auto) so the SKU is the last thing to be cut. */
@@ -1565,6 +1583,16 @@ function reactSummary(arr){var u=[];for(var i=0;i<arr.length;i++)if(u.indexOf(ar
 // no live markup, and the inserted name is escaped too, so a crafted message can't inject HTML.
 // (No entity produced by esc() contains '@', so this replace can never split one.)
 function fmtBody(s){return esc(s).replace(/@(\\d{5,})/g,function(m,id){var n=mentionMap[id];return n?'<span class="mn">@'+esc(n)+'</span>':m;});}
+// Extractable messages render line by line so a number gutter can appear once the message is
+// extracted — the same numbers the order rows carry, so "line 3" points at something visible.
+// String.fromCharCode(10) instead of a backslash-n literal: this JS lives inside a TS template
+// literal, where backslash-n becomes a real newline and truncates the emitted string.
+function fmtBodyLines(s){
+  var NL=String.fromCharCode(10);
+  return String(s).split(NL).map(function(l,ix){
+    return '<span class="ml"><span class="mln">'+(ix+1)+'</span><span class="mlt">'+(fmtBody(l)||"&nbsp;")+'</span></span>';
+  }).join('');
+}
 function jidName(j){if(!j)return"";var id=String(j).split("@")[0].split(":")[0];return mentionMap[id]||"";}
 // Media is fetched on demand from /api/media/<id> — it is downloaded from WhatsApp the first time
 // and cached on disk, so a thread full of photos does not re-download while scrolling.
@@ -1631,7 +1659,7 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
 var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
-var inner=nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+fmtBody(body)+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+var inner=nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
@@ -1714,7 +1742,7 @@ async function toggleExtract(mid){
   try{
     var d=await(await fetch("/api/extract",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,messageId:mid})})).json();
     active[mid]=(d.sources&&d.sources[0]&&d.sources[0].text)||"(no text)";
-    var add=(d.items||[]).map(function(it){return {mid:mid,phrase:it.phrase,quantity:it.quantity||"1",matched:it.matched,chosen:it.matched||null,guess:!!it.guess,suggestions:it.suggestions||[],results:[]};});
+    var add=(d.items||[]).map(function(it){return {mid:mid,phrase:it.phrase,quantity:it.quantity||"1",line:it.line||0,raw:it.raw||"",unit:it.unit||"",material:it.material||"",matched:it.matched,chosen:it.matched||null,guess:!!it.guess,suggestions:it.suggestions||[],results:[]};});
     items=items.concat(add);rebuildSources();renderRight();openPanel(); // slide the sheet in on phones
   }catch(e){}
   finally{if(b)b.classList.remove("busy");applyStates();}
@@ -1738,12 +1766,17 @@ el("chatsearch").addEventListener("input",renderChats);
 function rowHtml(i){
   var it=items[i],ch=it.chosen;
   var cls=ch?(it.matched?(it.guess&&!it.learned?"matched guessed":"matched"):"resolved"):"unmatched";
+  // Chips shared by both states: which message line this came from, the package unit the customer
+  // wrote ("box"), and the material inherited from a header line above ("nohub").
+  var chips=(it.unit?' <span class="unitchip" title="the customer gave the quantity in this unit — check what it means for the order">'+esc(it.unit)+'</span>':'')
+           +(it.material?' <span class="matchip" title="from the &quot;'+esc(it.material)+'&quot; header line above it in the message">'+esc(it.material)+'</span>':'');
+  var lno=it.line?'<span class="lno" title="line '+it.line+' of the message'+(it.raw?' — the customer wrote: '+esc(it.raw):'')+'">'+it.line+'</span>':'';
   var head=ch
     // Inline, the "Customer wrote:" label costs more room than it earns — the arrow says it, and
     // the full wording stays available on hover for anything the ellipsis cuts.
-    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust" title="Customer wrote: '+esc(it.phrase)+'">&#8627; '+esc(it.phrase)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
-    : '<div class="pinfo"><div class="pmain">'+esc(it.phrase)+'</div></div>';
-  var top='<div class="top" data-idx="'+i+'"><input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<span class="exp">&#9656;</span></div>';
+    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust" title="Customer wrote: '+esc(it.raw||it.phrase)+'">&#8627; '+esc(it.phrase)+chips+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
+    : '<div class="pinfo"><div class="pmain">'+esc(it.phrase)+'</div>'+(chips?'<div class="cust">'+chips+'</div>':'')+'</div>';
+  var top='<div class="top" data-idx="'+i+'">'+lno+'<input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<span class="exp">&#9656;</span></div>';
   var body='<div class="expand"><div class="inner"><input class="psearch" data-idx="'+i+'" placeholder="search products…" autocomplete="off"><div class="results" data-res="'+i+'"></div></div></div>';
   return '<div class="row '+cls+'" data-row="'+i+'">'+top+body+'</div>';
 }
