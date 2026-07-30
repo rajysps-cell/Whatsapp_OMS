@@ -12,7 +12,8 @@
     "demo:match": "tsx src/demo-match.ts",
     "import:products": "tsx src/product-import.ts",
     "set-password": "node scripts/set-password.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "demo:search": "tsx src/demo-search.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.112.1",

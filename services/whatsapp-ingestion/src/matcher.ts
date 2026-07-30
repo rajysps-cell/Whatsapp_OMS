@@ -75,6 +75,68 @@ export function search(q: string, limit = 5): Scored[] {
 }
 
 /**
+ * Catalog search for the product picker, ranked the way DDI ranks it.
+ *
+ * Deliberately separate from search() above. That one feeds matchItem, where the scoring has been
+ * tuned against real orders and where a wrong auto-match ships the wrong part; this one answers
+ * "show me everything called SDS", where missing a result is the only real failure.
+ *
+ * The difference that matters to the client: search() only ever compared the code with ===, so
+ * typing a genuine SKU prefix like "NBK" — 386 products — returned nothing at all. Codes are now
+ * matched by prefix and substring, and code hits outrank description hits, which is what he meant
+ * by "it gives priority to the product number".
+ */
+export function searchCatalog(q: string, limit = 200): { results: Scored[]; total: number } {
+  const raw = q.trim();
+  const qn = normalize(q);
+  if (!qn) return { results: [], total: 0 };
+  const qCode = raw.toLowerCase().replace(/\s+/g, '');
+  const qTri = trigrams(qn);
+  const qTokens = qn.split(' ').filter((t) => t.length >= 2);
+  const products = all();
+  const idx = ensureIndex();
+
+  // tier 0 exact code/UPC · 1 code prefix · 2 code substring · 3 description only
+  const hits: { product: Product; score: number; tier: number }[] = [];
+  for (let i = 0; i < products.length; i++) {
+    const p = products[i]!;
+    const code = p.code.toLowerCase();
+    let tier: number;
+    let s: number;
+    if (code === qCode || (raw !== '' && raw === p.upc)) {
+      tier = 0;
+      s = 1;
+    } else if (qCode.length >= 2 && code.startsWith(qCode)) {
+      tier = 1;
+      // Shorter codes first inside the tier: "NBK10" should beat "NBK10CL" when you typed "NBK10".
+      s = 1 / (1 + code.length - qCode.length);
+    } else if (qCode.length >= 3 && code.includes(qCode)) {
+      tier = 2;
+      s = 1 / (1 + code.length);
+    } else {
+      const d = dice(qTri, idx[i]!.tri);
+      const overlap = qTokens.length
+        ? qTokens.filter((t) => p.norm.includes(t)).length / qTokens.length
+        : 0;
+      const sub = qn.length >= 3 && p.norm.includes(qn) ? 0.15 : 0;
+      s = Math.min(0.98, 0.55 * d + 0.35 * overlap + sub);
+      // Every word typed appears in the description — keep it however the trigrams scored, so a
+      // deliberate multi-word search cannot be filtered out by a similarity threshold.
+      if (s <= 0.2 && !(overlap === 1 && qTokens.length > 0)) continue;
+      tier = 3;
+    }
+    hits.push({ product: p, score: s, tier });
+  }
+  hits.sort((a, b) => a.tier - b.tier || b.score - a.score || a.product.code.localeCompare(b.product.code));
+  // total is the honest count before the cap, so the UI can say "showing 200 of 386" rather than
+  // quietly pretending 200 was everything — silently truncating is the bug being fixed here.
+  return {
+    results: hits.slice(0, limit).map((h) => ({ product: h.product, score: h.score })),
+    total: hits.length,
+  };
+}
+
+/**
  * Every size mentioned in a piece of text, as numbers ("1/2" and "½" -> 0.5, "1-1/2" -> 1.5).
  *
  * Size is what separates a right fuzzy match from a wrong one here. Word similarity alone rates

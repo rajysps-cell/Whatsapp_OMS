@@ -31,7 +31,7 @@ import {
 import type { ChatStore } from './chat-store';
 import { config } from './config';
 import { logger } from './logger';
-import { extractAndMatch, search } from './matcher';
+import { extractAndMatch, search, searchCatalog } from './matcher';
 import type { Order } from './order-store';
 import { all as allProducts, byCode, count as productCount, normalize } from './products';
 import {
@@ -569,8 +569,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const q = u.searchParams.get('q') ?? '';
     // Math.max first: a negative limit made slice(0,-1) mean "all but the last", returning the
     // whole 17k-row catalog (1.7 MB) instead of a handful of suggestions.
-    const limit = Math.min(20, Math.max(1, Number(u.searchParams.get('limit') ?? 8) || 8));
-    json(res, 200, { results: search(q, limit).map((s) => s.product) });
+    //
+    // The ceiling is 300 rather than the old 20: staff searching "SDS" were getting six results
+    // while DDI showed pages of them. It is not unlimited, because a broad phrase legitimately
+    // matches thousands of products and that response was 1.7 MB.
+    const limit = Math.min(300, Math.max(1, Number(u.searchParams.get('limit') ?? 50) || 50));
+    const found = searchCatalog(q, limit);
+    json(res, 200, { results: found.results.map((s) => s.product), total: found.total });
     return;
   }
   if (path === '/api/extract' && req.method === 'POST') {
@@ -1469,11 +1474,14 @@ function matchPage(me: User): string {
   .exp{color:var(--mut);font-size:11px;flex-shrink:0;transition:transform .2s,color .2s}
   .row.open .exp{transform:rotate(90deg);color:var(--blue)}
   .expand{max-height:0;opacity:0;overflow:hidden;transition:max-height .25s ease,opacity .25s ease}
-  .expand.show{max-height:320px;opacity:1}
+  .expand.show{max-height:520px;opacity:1}
   .expand .inner{padding:0 12px 12px}
   .psearch{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s}
   .psearch:focus{border-color:var(--blue)}
-  .results{margin-top:8px;max-height:220px;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
+  /* Tall enough to be worth scrolling: a search for a code prefix can legitimately return
+     hundreds of products and the old 220px showed about four of them. */
+  .results{margin-top:8px;max-height:420px;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
+  .rescount{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);color:var(--mut);font-size:11px;padding:5px 10px;z-index:1}
   .opt{display:block;width:100%;text-align:left;background:#fff;border:0;border-bottom:1px solid var(--line);color:var(--tx);padding:8px 10px;font-size:12px;cursor:pointer}
   .opt:last-child{border-bottom:0}.opt:hover{background:#eef4fb}
   .opt .code{margin-right:2px}
@@ -1761,7 +1769,9 @@ function renderRight(){
   updateFinal();
 }
 // Accordion: expand one row's inline search, fade/slide in, auto-focus, collapse any other.
-function renderResults(i,list){var box=el("right").querySelector('.results[data-res="'+i+'"]');if(!box)return;box.innerHTML=(list&&list.length)?list.slice(0,5).map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join(""):'<div class="noopt">No suggestions — type to search.</div>';}
+// The initial suggestion list (before typing) stays short — these are the matcher's own guesses,
+// not a search. Typed searches go through doSearch and are not capped here.
+function renderResults(i,list){var box=el("right").querySelector('.results[data-res="'+i+'"]');if(!box)return;box.innerHTML=(list&&list.length)?list.slice(0,8).map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join(""):'<div class="noopt">No suggestions — type to search.</div>';}
 function collapseRow(){if(openIdx==null)return;var row=el("right").querySelector('.row[data-row="'+openIdx+'"]');if(row){row.classList.remove("open");var ex=row.querySelector(".expand");if(ex)ex.classList.remove("show");}openIdx=null;}
 function expandRow(i){
   if(openIdx===i){collapseRow();return;}
@@ -1777,7 +1787,9 @@ function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[
 function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
 
 // Typing in a row's search: <2 chars falls back to its suggestions; else live catalog search into .results.
-var doSearch=debounce(async function(i,q){if(!q||q.length<2){renderResults(i,items[i].suggestions||[]);return;}try{var d=await(await fetch("/api/products/search?limit=6&q="+encodeURIComponent(q))).json();items[i].results=d.results||[];var box=el("right").querySelector('.results[data-res="'+i+'"]');if(box)box.innerHTML=items[i].results.length?items[i].results.map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join(""):'<div class="noopt">No matches.</div>';}catch(e){}},220);
+// limit=200: DDI shows pages of results for a short code like "SDS" and staff were getting six.
+// The list scrolls, and the count line says when there are more than were fetched.
+var doSearch=debounce(async function(i,q){if(!q||q.length<2){renderResults(i,items[i].suggestions||[]);return;}try{var d=await(await fetch("/api/products/search?limit=200&q="+encodeURIComponent(q))).json();items[i].results=d.results||[];var box=el("right").querySelector('.results[data-res="'+i+'"]');if(!box)return;var n=items[i].results.length,tot=d.total||n;if(!n){box.innerHTML='<div class="noopt">No matches.</div>';return;}var cnt=(tot>n?('showing '+n+' of '+tot+' — type more to narrow'):(tot+(tot===1?' match':' matches')));box.innerHTML='<div class="rescount">'+cnt+'</div>'+items[i].results.map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join("");}catch(e){}},220);
 
 el("right").addEventListener("input",function(e){var t=e.target;if(t.classList.contains("qty")){items[t.dataset.idx].quantity=t.value;updateFinal();}else if(t.classList.contains("psearch")){doSearch(t.dataset.idx,t.value);}});
 el("right").addEventListener("click",function(e){
