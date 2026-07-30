@@ -443,5 +443,111 @@ def build():
     print(f"written: {OUT}  ({OUT.stat().st_size/1024:.0f} KB)")
 
 
+USER_OUT = Path(__file__).with_name("WhatsApp-OMS-User-Guide.pdf")
+
+
+def build_user():
+    """Short guide for everyday staff — no administrator content."""
+    doc = BaseDocTemplate(str(USER_OUT), pagesize=A4,
+                          leftMargin=20 * mm, rightMargin=20 * mm,
+                          topMargin=18 * mm, bottomMargin=18 * mm,
+                          title="WhatsApp OMS — User Guide", author="YS Plumbing")
+    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="f")
+    from reportlab.platypus import PageTemplate
+
+    def page(canvas, d):
+        canvas.saveState()
+        canvas.setFillColor(GREEN)
+        canvas.rect(0, A4[1] - 5 * mm, A4[0], 5 * mm, stroke=0, fill=1)
+        canvas.setFillColor(MUTE)
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(20 * mm, 10 * mm, "WhatsApp OMS — User Guide")
+        canvas.drawRightString(A4[0] - 20 * mm, 10 * mm, f"Page {canvas.getPageNumber()}")
+        canvas.restoreState()
+
+    doc.addPageTemplates([PageTemplate(id="p", frames=[frame], onPage=page)])
+
+    s = []
+    s += [para("WhatsApp OMS", st("t", fontName="Helvetica-Bold", fontSize=20, leading=24,
+                                  textColor=GREEN_DK, spaceAfter=2)),
+          para("How to process orders and reply to customers", LEAD)]
+
+    s += [table([
+        ["Website", "<font face='Courier-Bold' color='#065f46'>https://oms.ysps.shop</font>"],
+        ["Your login", "Ask your manager. You will choose your own password the first time."],
+    ], [30 * mm, 135 * mm], header=False)]
+
+    s += [para("The screen", H2),
+          table([
+            ["Left", "All your WhatsApp chats. New messages come to the top with a green count."],
+            ["Middle", "The conversation. Type your reply at the bottom."],
+            ["Right", "Products found in the message you clicked."],
+          ], [24 * mm, 141 * mm], header=False)]
+
+    s += [para("Processing an order", H2)]
+    s += steps([
+        "Click a chat on the left.",
+        "Click the customer's order message. Products appear on the right.",
+        "<b>Matched</b> items were recognised. <b>Unmatched</b> items need you: click one, "
+        "search for the right product, and pick it.",
+        "Check the quantities in the small boxes.",
+        "Click <b>Copy</b> — the order is on your clipboard, ready to paste.",
+    ])
+
+    s += [Spacer(1, 3),
+          callout("It learns from you",
+                  "Every product you match by hand is remembered. The same wording will match "
+                  "automatically next time, so this gets faster the more you use it.")]
+
+    s += [para("What the labels mean", H2),
+          table([
+            ["Label", "Meaning"],
+            ["<b>Extract</b>", "Click a message to pull the products out of it"],
+            ["<b>Extracted</b>", "Its products are showing on the right"],
+            ["<b>Processed</b>", "Already copied — shows who did it"],
+            ["<b>Re-Extract</b>", "Load it again"],
+          ], [36 * mm, 129 * mm])]
+
+    s += [para("Replying", H2),
+          para("Type in the box at the bottom and press <b>Enter</b>. Use <b>Shift + Enter</b> for "
+               "a new line. To tag someone, type <font face='Courier-Bold'>@</font> and pick their "
+               "name from the list — they get a notification.", BODY),
+          para("Your replies are signed with your username automatically, so everyone can see who "
+               "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
+
+    s += [Spacer(1, 3),
+          callout("There is no undo",
+                  "Messages go straight to real customers the moment you press Enter. Read it back "
+                  "before sending, and send one message at a time.", "warn")]
+
+    s += [para("If the screen goes blurry", H2),
+          para("A message will explain why. <b>“Connecting…”</b> clears on its own in about a "
+               "minute. Anything else — especially <b>“needs to be re-linked”</b> — means WhatsApp "
+               "is disconnected and nothing can be sent or received: tell your manager. Nothing is "
+               "lost; messages arrive once it reconnects.", BODY)]
+
+    s += [para("Quick keys", H2),
+          table([
+            ["<b>Enter</b>", "Send"],
+            ["<b>Shift + Enter</b>", "New line"],
+            ["<b>@</b>", "Tag someone"],
+            ["<b>Esc</b>", "Close the tag list"],
+          ], [40 * mm, 125 * mm], header=False)]
+
+    s += [Spacer(1, 8),
+          para(f"WhatsApp OMS User Guide · {date.today().strftime('%d %B %Y')} · internal use only",
+               SMALL)]
+
+    doc.build(s)
+    print(f"written: {USER_OUT}  ({USER_OUT.stat().st_size/1024:.0f} KB)")
+
+
 if __name__ == "__main__":
-    build()
+    import sys
+    if "--user" in sys.argv:
+        build_user()
+    elif "--both" in sys.argv:
+        build()
+        build_user()
+    else:
+        build()
