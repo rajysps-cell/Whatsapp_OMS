@@ -193,12 +193,23 @@ def build():
         "Open <font face='Courier-Bold'>https://oms.ysps.shop</font>.",
         "Enter your username and password.",
         "First-time users are asked to choose their own password before continuing.",
+        "On a browser you have never used before, a <b>6-digit code</b> is emailed to you — enter "
+        "it once and that browser is remembered.",
     ])
 
     s += [Spacer(1, 4),
           callout("Every user gets their own login",
                   "Do not share one account. Replies are stamped with the username of whoever sent "
                   "them, so individual logins are what make that record meaningful.")]
+
+    s += [Spacer(1, 4),
+          callout("Two-step verification",
+                  "The emailed code protects the account when someone's password leaks: a stranger "
+                  "with the password still cannot get in without the code. It only works for users "
+                  "whose <b>email address</b> is filled in on the Users page — accounts without one "
+                  "show a <b>no 2FA</b> badge there and skip the check, so fill every email in. If "
+                  "a phone or laptop is lost, open <b>Users</b> and press <b>Reset 2FA</b> on that "
+                  "person: every browser they used will ask for a fresh code.", "warn")]
 
     s += [para("The screen at a glance", H2),
           table([
@@ -269,6 +280,23 @@ def build():
           para("Type <font face='Courier-Bold'>@</font> and a list of people in that chat appears. "
                "Keep typing to narrow it, then press Enter or click a name. The person is properly "
                "tagged in WhatsApp and receives a notification.", BODY)]
+
+    s += [para("The message menu", H2),
+          para("<b>Right-click</b> any message (on a phone: <b>press and hold</b>) for the same "
+               "actions WhatsApp gives you:", BODY),
+          table([
+            ["Action", "What it does"],
+            ["<b>Reply</b>", "Quotes that message above your reply, like WhatsApp."],
+            ["<b>Copy</b>", "Copies the message text to your clipboard."],
+            ["<b>Forward</b>", "Sends a copy to another chat you pick. It goes out signed with "
+                               "YOUR username, like any message you send."],
+            ["<b>Delete</b>", "Only appears on messages <b>you</b> sent from this system. "
+                              "<b>Delete for everyone</b> removes it from the WhatsApp chat for "
+                              "all members (WhatsApp only allows this for a while after sending). "
+                              "<b>Delete for me</b> hides it in this system only."],
+          ], [30 * mm, 135 * mm]),
+          Spacer(1, 3),
+          para("Nobody can delete a message someone else sent — not even an administrator.", SMALL)]
 
     s += [para("How replies are marked", H2),
           para("Every message sent from this system carries a signature so anyone reading WhatsApp "
@@ -488,6 +516,9 @@ def build_user():
                               "Password <font face='Courier-Bold'>Ysps@123</font>"],
             ["Everyone else", "Your own username and a temporary password from the administrator. "
                               "You choose your own password the first time you sign in."],
+            ["New browser?", "A <b>6-digit code</b> is emailed to you the first time you sign in "
+                             "from a browser the system has not seen. Enter it once — that browser "
+                             "is then remembered."],
           ], [30 * mm, 135 * mm], header=False)]
 
     s += [Spacer(1, 5),
@@ -538,6 +569,10 @@ def build_user():
           para("Type in the box at the bottom and press <b>Enter</b>. Use <b>Shift + Enter</b> for "
                "a new line. To tag someone, type <font face='Courier-Bold'>@</font> and pick their "
                "name from the list — they get a notification.", BODY),
+          para("<b>Right-click</b> a message (press and hold on a phone) to <b>Reply</b>, "
+               "<b>Copy</b>, <b>Forward</b> to another chat, or <b>Delete</b> — Delete only "
+               "appears on messages you sent yourself, and “for everyone” also removes "
+               "it from the real WhatsApp chat.", BODY),
           para("Your replies are signed with your username automatically, so everyone can see who "
                "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
 

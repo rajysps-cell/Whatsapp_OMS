@@ -74,6 +74,9 @@ for (const [table, col] of [
   ['messages', 'reply_to TEXT'],
   ['messages', 'reply_text TEXT'],
   ['messages', 'reply_sender TEXT'],
+  // Tombstone, NOT a row delete: history backfill re-INSERTs on every reconnect (INSERT OR
+  // IGNORE), so a deleted row would quietly come back. A flagged row stays put and stays hidden.
+  ['messages', 'deleted INTEGER NOT NULL DEFAULT 0'],
 ] as const) {
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
@@ -107,6 +110,30 @@ const chatSentByStmt = db.prepare(
 export function recordSentBy(msgId: string, username: string): void {
   if (!msgId || !username) return;
   insSentBy.run(msgId, username, Date.now());
+}
+
+/** The OMS user this app recorded as the sender of a message, or null (phone-typed / pre-attribution). */
+export function sentByOf(msgId: string): string | null {
+  const r = db.prepare('SELECT username FROM sent_by WHERE msg_id = ?').get(msgId) as { username: string } | undefined;
+  return r?.username ?? null;
+}
+
+/** One message row, for the delete/forward endpoints. */
+export function getMessage(msgId: string): { chatId: string; kind: string; body: string; fromMe: boolean } | null {
+  const r = db.prepare('SELECT chat_id, kind, body, from_me FROM messages WHERE msg_id = ?').get(msgId) as
+    | { chat_id: string; kind: string; body: string | null; from_me: number }
+    | undefined;
+  return r ? { chatId: r.chat_id, kind: r.kind, body: r.body ?? '', fromMe: !!r.from_me } : null;
+}
+
+/** Delete-for-me: hide the message from every OMS view. WhatsApp on phones still shows it. */
+export function markDeleted(msgId: string): void {
+  db.prepare('UPDATE messages SET deleted = 1 WHERE msg_id = ?').run(msgId);
+}
+
+/** Delete-for-everyone landed (from this app or someone's phone): render the WhatsApp placeholder. */
+export function markRevoked(msgId: string): void {
+  db.prepare("UPDATE messages SET kind = 'revoked', body = '' WHERE msg_id = ?").run(msgId);
 }
 
 // Who completed each message in a chat, for the "Processed by …" badge in the thread.
@@ -161,6 +188,7 @@ const chatMsgsStmt = db.prepare(`
     SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender
     FROM messages
     WHERE chat_id = ?
+      AND deleted = 0
       AND NOT (COALESCE(body, '') = '' AND kind IN (${SYSTEM_KINDS.map((k) => `'${k}'`).join(',')}))
     ORDER BY ts DESC, msg_id DESC LIMIT ?
   ) ORDER BY ts ASC, msg_id ASC

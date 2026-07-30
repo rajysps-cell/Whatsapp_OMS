@@ -55,11 +55,15 @@ import {
   aliasesForProduct,
   deleteAlias,
   getAliasRow,
+  getMessage,
   chatParticipants,
   isProcessed,
+  markDeleted,
+  markRevoked,
   mentionNames,
   recordSentBy,
   saveExtraction,
+  sentByOf,
   setChatName,
   updateAliasText,
 } from './store';
@@ -83,8 +87,10 @@ let mediaFn: ((messageId: string) => Promise<{ data: string; mimetype: string; f
   null;
 /** Injected by index.ts so the UI can send a message through the live WhatsApp connection. */
 let sendMessageFn:
-  | ((chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>)
+  | ((chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string) => Promise<string>)
   | null = null;
+/** Injected by index.ts so a user can delete their own sent messages (for me / for everyone). */
+let deleteFn: ((messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -417,7 +423,7 @@ function readBody(req: http.IncomingMessage, max = 2_000_000): Promise<Record<st
 export function startWebServer(
   getOrders: () => Order[],
   chatStore: ChatStore,
-  send?: (chatId: string, text: string, mentions?: string[], stickerFor?: string) => Promise<string>,
+  send?: (chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string) => Promise<string>,
   media?: (messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>,
   sendMedia?: (
     chatId: string,
@@ -426,12 +432,14 @@ export function startWebServer(
     mentions?: string[],
     sentBy?: string,
   ) => Promise<string>,
+  del?: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
   sendMessageFn = send ?? null;
   mediaFn = media ?? null;
   sendMediaFn = sendMedia ?? null;
+  deleteFn = del ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -890,8 +898,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           .filter((x): x is string => typeof x === 'string' && /^\d{5,}@(lid|c\.us)$/.test(x))
           .slice(0, 32)
       : [];
+    // Reply: quote must reference a message in the SAME chat — a cross-chat id would quote
+    // something the recipients cannot see (and leak that other chat's text into this one).
+    let quotedId: string | undefined;
+    if (typeof body['replyTo'] === 'string' && body['replyTo']) {
+      const target = getMessage(body['replyTo'] as string);
+      if (target && target.chatId === chatId) quotedId = body['replyTo'] as string;
+    }
     try {
-      const messageId = await sendMessageFn(chatId, signed, mentions, me.username);
+      const messageId = await sendMessageFn(chatId, signed, mentions, me.username, quotedId);
       if (messageId) recordSentBy(messageId, me.username); // best-effort; index.ts also claims it
       logger.info(
         { user: me.username, chatId, chars: trimmed.length, mentions: mentions.length, messageId },
@@ -944,6 +959,101 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch (err) {
       logger.error({ err, user: me.username, chatId, filename }, 'file send failed');
       json(res, 500, { ok: false, error: 'Send may have failed — check the chat before resending.' });
+    }
+    return;
+  }
+  // Delete a message the signed-in user sent FROM THIS APP. The client's rule, stated twice in
+  // the meeting: "every user can only delete their own messages" — enforced here on the server
+  // against sent_by (recorded at send time), never on what the browser claims. Messages typed on
+  // a phone, or sent before attribution shipped, have no sent_by row: nobody can delete those
+  // from the app, by design. Admins get no exemption; the rule was "I don't want ANYBODY".
+  if (path === '/api/messages/delete' && req.method === 'POST') {
+    const body = await readBody(req);
+    const messageId = typeof body['messageId'] === 'string' ? (body['messageId'] as string) : '';
+    const everyone = !!body['everyone'];
+    const msg = messageId ? getMessage(messageId) : null;
+    if (!msg) {
+      json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    const owner = sentByOf(messageId);
+    if (!owner || owner.toLowerCase() !== me.username.toLowerCase()) {
+      json(res, 403, { ok: false, error: 'You can only delete messages you sent from this app.' });
+      return;
+    }
+    if (everyone) {
+      if (!deleteFn || status !== 'connected') {
+        json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+        return;
+      }
+      const r = await deleteFn(messageId, true);
+      if (!r.ok) {
+        json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused to delete this message.' });
+        return;
+      }
+      markRevoked(messageId); // thread now shows "This message was deleted", same as WhatsApp
+    } else {
+      // Delete-for-me: hidden from the OMS for every user. Deliberate — the OMS is one shared
+      // window onto the account, not per-user mailboxes. WhatsApp on phones still shows it.
+      // Best-effort mirror into the linked account; the OMS hide must not depend on it.
+      if (deleteFn && status === 'connected') void deleteFn(messageId, false);
+      markDeleted(messageId);
+    }
+    logger.info({ user: me.username, messageId, everyone }, 'message deleted');
+    json(res, 200, { ok: true });
+    return;
+  }
+  // Forward a message to another chat. Implemented as copy-and-send through the normal signed
+  // send path (media re-served from the cache): WhatsApp's own forward APIs go through the
+  // Msg.get lookup that breaks on @lid chats, and a signed copy also keeps the audit trail of
+  // WHO forwarded it. Recipients see a normal message, not WhatsApp's "Forwarded" label.
+  if (path === '/api/messages/forward' && req.method === 'POST') {
+    if (status !== 'connected') {
+      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+      return;
+    }
+    const body = await readBody(req);
+    const messageId = typeof body['messageId'] === 'string' ? (body['messageId'] as string) : '';
+    const toChat = typeof body['chatId'] === 'string' ? (body['chatId'] as string).trim() : '';
+    if (!toChat || !/@(g\.us|c\.us|lid)$/.test(toChat)) {
+      json(res, 400, { ok: false, error: 'Pick a chat to forward to.' });
+      return;
+    }
+    const msg = messageId ? getMessage(messageId) : null;
+    if (!msg) {
+      json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    // Strip the original sender's app signature — the forward gets the FORWARDER's signature.
+    const text = msg.body.replace(/\n\n✍🏼 BY \*[A-Za-z0-9]+\*\s*$/u, '').trim();
+    const MEDIA_KINDS = ['image', 'video', 'audio', 'voice', 'document', 'sticker', 'ptv'];
+    try {
+      let sentId = '';
+      if (MEDIA_KINDS.includes(msg.kind)) {
+        if (!mediaFn || !sendMediaFn) {
+          json(res, 503, { ok: false, error: 'Media is not available right now.' });
+          return;
+        }
+        const file = await mediaFn(messageId);
+        if (!file) {
+          json(res, 404, { ok: false, error: 'The file could not be retrieved from WhatsApp any more.' });
+          return;
+        }
+        const caption = text ? `${text}\n\n✍🏼 BY *${me.username.toUpperCase()}*` : undefined;
+        sentId = await sendMediaFn(toChat, { data: file.data, mimetype: file.mimetype, filename: file.filename ?? 'file' }, caption, undefined, me.username);
+      } else {
+        if (!sendMessageFn || !text) {
+          json(res, 400, { ok: false, error: 'There is no text to forward.' });
+          return;
+        }
+        sentId = await sendMessageFn(toChat, `${text}\n\n✍🏼 BY *${me.username.toUpperCase()}*`, undefined, me.username);
+      }
+      if (sentId) recordSentBy(sentId, me.username);
+      logger.info({ user: me.username, from: msg.chatId, to: toChat, messageId }, 'message forwarded');
+      json(res, 200, { ok: true });
+    } catch (err) {
+      logger.error({ err, user: me.username, messageId, toChat }, 'forward failed');
+      json(res, 500, { ok: false, error: 'Forward failed — check the destination chat before retrying.' });
     }
     return;
   }
@@ -1503,6 +1613,41 @@ function matchPage(me: User): string {
   .mediadoc:hover{background:rgba(0,0,0,.08)}
   .medianote{font-size:12px;color:var(--mut);font-style:italic;padding:3px 0}
   .tx.del{color:var(--mut);font-style:italic}
+  /* WhatsApp-style message menu: right-click on desktop, long-press on phones. */
+  .ctxmenu{position:fixed;z-index:60;background:#fff;border:1px solid var(--line);border-radius:10px;
+    box-shadow:0 8px 28px #00000022;min-width:168px;padding:5px 0;display:none}
+  .ctxmenu.on{display:block}
+  .ctxmenu button{display:block;width:100%;text-align:left;background:none;border:0;padding:9px 16px;
+    font-size:13.5px;color:var(--tx);cursor:pointer;font-family:inherit}
+  .ctxmenu button:hover{background:var(--bg)}
+  .ctxmenu button.danger{color:var(--red)}
+  .ctxmenu .sep{height:1px;background:var(--line);margin:4px 0}
+  /* "Replying to" bar above the composer. */
+  .replybar{display:none;align-items:center;gap:8px;background:var(--panel);border-top:1px solid var(--line);
+    padding:7px 12px}
+  .replybar.on{display:flex}
+  .replybar .rq{flex:1;min-width:0;border-left:3px solid var(--em);padding:3px 9px;background:var(--bg);border-radius:6px}
+  .replybar .rqn{font-size:11.5px;font-weight:700;color:var(--em2)}
+  .replybar .rqt{font-size:12px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .replybar .rx{flex:none;background:none;border:0;color:var(--mut);font-size:17px;cursor:pointer;padding:4px 8px}
+  /* Forward picker + delete confirm reuse one modal shell. */
+  .mmodal{position:fixed;inset:0;background:#0006;display:none;align-items:center;justify-content:center;padding:20px;z-index:70}
+  .mmodal.on{display:flex}
+  .msheet{background:#fff;border-radius:14px;padding:20px;width:100%;max-width:400px;box-shadow:0 12px 40px #00000026}
+  .msheet h3{margin:0 0 12px;font-size:15.5px}
+  .fwdlist{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:9px;margin-top:8px}
+  .fwdlist button{display:block;width:100%;text-align:left;background:none;border:0;border-bottom:1px solid var(--line);
+    padding:10px 12px;font-size:13px;color:var(--tx);cursor:pointer;font-family:inherit}
+  .fwdlist button:last-child{border-bottom:0}
+  .fwdlist button:hover{background:var(--bg)}
+  .fwdsearch{width:100%;padding:8px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none}
+  .fwdsearch:focus{border-color:var(--blue)}
+  .macts{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  .macts .btn.red{background:var(--red);color:#fff;border-color:var(--red)}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(70px);background:#111b21;
+    color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:80;pointer-events:none}
+  .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.bad{background:var(--red)}
   /* @mention: WhatsApp renders these as non-clickable coloured text (read-only here by design). */
   .mn{color:#027eb5;font-weight:500}
   /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
@@ -1681,6 +1826,7 @@ function matchPage(me: User): string {
       <div class="msgs" id="msgs"><div class="placeholder">Pick a conversation on the left.</div></div>
       <div class="mentionbox" id="mbox"></div>
       <div class="filechip" id="filechip"></div>
+      <div class="replybar" id="replybar"><div class="rq"><div class="rqn" id="rqn"></div><div class="rqt" id="rqt"></div></div><button class="rx" id="rx" title="Cancel reply" aria-label="Cancel reply">&#10005;</button></div>
       <div class="composer" id="composer">
         <input type="file" id="cfile" hidden accept="image/*,video/*,audio/*,.pdf,.csv,.xlsx,.xls,.doc,.docx,.txt">
         <button class="attachbtn" id="attachbtn" title="Attach a file" aria-label="Attach a file" disabled>&#128206;</button>
@@ -1691,9 +1837,21 @@ function matchPage(me: User): string {
   </div>
   <div class="right" id="right"><div class="placeholder">Click <b>Extract</b> on any customer message to add its products here.</div></div>
 </div>
+<div class="ctxmenu" id="ctxmenu"></div>
+<div class="mmodal" id="fwdmodal"><div class="msheet"><h3>Forward to…</h3>
+  <input class="fwdsearch" id="fwdsearch" placeholder="search chats…" autocomplete="off">
+  <div class="fwdlist" id="fwdlist"></div>
+  <div class="macts"><button class="btn ghost" id="fwdcancel">Cancel</button></div>
+</div></div>
+<div class="mmodal" id="delmodal"><div class="msheet"><h3>Delete message?</h3>
+  <p class="muted" id="delnote" style="font-size:12.5px;margin:0">Delete for everyone removes it from the WhatsApp chat for all members (only possible for a while after sending). Delete for me only hides it in this app.</p>
+  <div class="macts"><button class="btn ghost" id="delcancel">Cancel</button><button class="btn ghost" id="delme">Delete for me</button><button class="btn red" id="deleveryone">Delete for everyone</button></div>
+</div></div>
+<div class="toast" id="toast"></div>
 <script>
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
-var meName=${JSON.stringify(me.name || me.username)},appUsers=[];
+var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},appUsers=[];
+var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
 function showChat(){document.body.classList.add("inchat");}
@@ -1806,6 +1964,7 @@ function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){
 // who renames themselves "...Shipping" would otherwise get a forged "Sent by staff" badge.
 // (No backticks in this comment: the page is a TS template literal and they would end the string.)
 var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
+msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
 var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
@@ -1859,7 +2018,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -2133,9 +2292,11 @@ async function sendMsg(){
   sending=true;syncComposer();el("sendbtn").textContent="…";
   var res=resolveDraft(txt);
   try{
-    var r=await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,text:res.text,mentions:res.mentions})});
+    var payload={chatId:curChat,text:res.text,mentions:res.mentions};
+    if(replyTo&&replyTo.chatId===curChat)payload.replyTo=replyTo.mid; // quote the message being replied to
+    var r=await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
     var d=await r.json();
-    if(d.ok){t.value="";drafted=[];autoGrow();lastSig="";refreshThread();}   // clear + pull the sent message in
+    if(d.ok){t.value="";drafted=[];clearReply();autoGrow();lastSig="";refreshThread();}   // clear + pull the sent message in
     else{alert(d.error||"Could not send the message.");}
   }catch(e){alert("Network error — the message was not sent.");}
   sending=false;el("sendbtn").textContent="➤";syncComposer();t.focus();
@@ -2154,6 +2315,116 @@ async function sendFile(caption){
   sending=false;el("sendbtn").textContent="➤";syncComposer();
 }
 el("sendbtn").addEventListener("click",sendMsg);
+
+// --- WhatsApp-style message menu: right-click a bubble on desktop, long-press on phones ---
+function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},2600);}
+function clearReply(){replyTo=null;el("replybar").className="replybar";}
+function startReply(mid){
+  var m=msgIndex[mid];if(!m)return;
+  var who=isOut(m)?"You":(m.pushName||jidName(m.sender)||"Customer");
+  replyTo={mid:mid,chatId:curChat};
+  el("rqn").textContent=who;
+  el("rqt").textContent=(m._clean||"").slice(0,120)||("["+(m.kind||"media")+"]");
+  el("replybar").className="replybar on";
+  el("cinput").focus();
+}
+el("rx").addEventListener("click",clearReply);
+function copyMsg(mid){
+  var m=msgIndex[mid];if(!m)return;
+  var txt=m._clean||"";
+  if(!txt){toast("Nothing to copy in this message.",true);return;}
+  // Same two-step strategy as the order Copy button: clipboard API, then the textarea fallback —
+  // and never claim success unless one of them actually worked.
+  function fallback(){
+    try{
+      var ta=document.createElement("textarea");ta.value=txt;ta.style.position="fixed";ta.style.opacity="0";
+      document.body.appendChild(ta);ta.select();var ok=document.execCommand("copy");ta.remove();
+      toast(ok?"Message copied":"Copy failed — select the text by hand.",!ok);
+    }catch(e){toast("Copy failed — select the text by hand.",true);}
+  }
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){toast("Message copied");}).catch(fallback);
+  }else{fallback();}
+}
+function openForward(mid){
+  menuMid=mid;el("fwdsearch").value="";renderFwdList("");el("fwdmodal").className="mmodal on";el("fwdsearch").focus();
+}
+function renderFwdList(q){
+  var ql=q.toLowerCase();
+  var list=chats.filter(function(c){return c.id!==curChat&&(!ql||(c.title||c.id).toLowerCase().indexOf(ql)>=0);}).slice(0,40);
+  el("fwdlist").innerHTML=list.length?list.map(function(c){
+    return '<button data-fwd="'+esc(c.id)+'">'+esc(c.title||c.id)+'</button>';
+  }).join(""):'<div style="padding:12px;font-size:12.5px;color:var(--mut)">No chats match.</div>';
+}
+el("fwdsearch").addEventListener("input",function(){renderFwdList(this.value);});
+el("fwdcancel").addEventListener("click",function(){el("fwdmodal").className="mmodal";});
+el("fwdmodal").addEventListener("click",function(e){
+  if(e.target===el("fwdmodal")){el("fwdmodal").className="mmodal";return;}
+  var b=e.target.closest("[data-fwd]");if(!b||!menuMid)return;
+  var mid=menuMid,to=b.dataset.fwd;el("fwdmodal").className="mmodal";
+  fetch("/api/messages/forward",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({messageId:mid,chatId:to})}).then(function(r){return r.json();}).then(function(d){
+      toast(d.ok?"Forwarded":(d.error||"Forward failed"),!d.ok);
+    }).catch(function(){toast("Network error — the forward may not have gone out.",true);});
+});
+function openDelete(mid){menuMid=mid;el("delmodal").className="mmodal on";}
+el("delcancel").addEventListener("click",function(){el("delmodal").className="mmodal";});
+el("delmodal").addEventListener("click",function(e){if(e.target===el("delmodal"))el("delmodal").className="mmodal";});
+function doDelete(everyone){
+  var mid=menuMid;if(!mid)return;
+  el("delmodal").className="mmodal";
+  fetch("/api/messages/delete",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({messageId:mid,everyone:everyone})}).then(function(r){return r.json();}).then(function(d){
+      if(d.ok){toast(everyone?"Deleted for everyone":"Deleted for you");lastSig="";refreshThread();}
+      else{toast(d.error||"Delete failed",true);}
+    }).catch(function(){toast("Network error — the delete may not have happened.",true);});
+}
+el("delme").addEventListener("click",function(){doDelete(false);});
+el("deleveryone").addEventListener("click",function(){doDelete(true);});
+function showMenu(mid,x,y){
+  var m=msgIndex[mid];if(!m)return;
+  var mine=isOut(m)&&m._sby&&String(m._sby).toLowerCase()===meUser.toLowerCase();
+  var h='<button data-act="reply">&#8617;&nbsp; Reply</button>'
+       +'<button data-act="copy">&#128203;&nbsp; Copy</button>'
+       +'<button data-act="forward">&#10150;&nbsp; Forward</button>';
+  // Own messages only, enforced again server-side: the menu simply does not offer Delete on
+  // anything the DB does not attribute to this login.
+  if(mine)h+='<div class="sep"></div><button data-act="delete" class="danger">&#128465;&nbsp; Delete</button>';
+  var menu=el("ctxmenu");menu.innerHTML=h;menu.className="ctxmenu on";menuMid=mid;
+  var mw=menu.offsetWidth,mh=menu.offsetHeight;
+  menu.style.left=Math.min(x,window.innerWidth-mw-8)+"px";
+  menu.style.top=Math.min(y,window.innerHeight-mh-8)+"px";
+}
+function hideMenu(){el("ctxmenu").className="ctxmenu";}
+el("ctxmenu").addEventListener("click",function(e){
+  var b=e.target.closest("[data-act]");if(!b)return;
+  var mid=menuMid;hideMenu();
+  if(b.dataset.act==="reply")startReply(mid);
+  else if(b.dataset.act==="copy")copyMsg(mid);
+  else if(b.dataset.act==="forward")openForward(mid);
+  else if(b.dataset.act==="delete")openDelete(mid);
+});
+document.addEventListener("click",function(e){if(!e.target.closest("#ctxmenu"))hideMenu();});
+document.addEventListener("keydown",function(e){if(e.key==="Escape"){hideMenu();el("fwdmodal").className="mmodal";el("delmodal").className="mmodal";}});
+el("msgs").addEventListener("contextmenu",function(e){
+  var b=e.target.closest(".bubble");if(!b||!b.dataset.mid)return;
+  e.preventDefault();showMenu(b.dataset.mid,e.clientX,e.clientY);
+});
+// Long-press for phones: 550ms without movement opens the same menu.
+(function(){
+  var timer=null,sx=0,sy=0;
+  el("msgs").addEventListener("touchstart",function(e){
+    var b=e.target.closest(".bubble");if(!b||!b.dataset.mid)return;
+    var t=e.touches[0];sx=t.clientX;sy=t.clientY;
+    timer=setTimeout(function(){showMenu(b.dataset.mid,sx,sy);},550);
+  },{passive:true});
+  el("msgs").addEventListener("touchmove",function(e){
+    var t=e.touches[0];
+    if(Math.abs(t.clientX-sx)>10||Math.abs(t.clientY-sy)>10){clearTimeout(timer);timer=null;}
+  },{passive:true});
+  el("msgs").addEventListener("touchend",function(){clearTimeout(timer);timer=null;},{passive:true});
+})();
+
 el("cinput").addEventListener("input",function(){autoGrow();syncComposer();updateMentions();});
 el("cinput").addEventListener("blur",function(){setTimeout(hideMentions,150);}); // let a click land first
 el("cinput").addEventListener("keydown",function(e){

@@ -8,7 +8,7 @@ import { OrderStore } from './order-store';
 import { runProductImportWithReport } from './product-import';
 import * as products from './products';
 import { scheduleDailyTimes } from './scheduler';
-import { bumpUnread, clearUnread, recordSentBy, saveMessage, upsertCatalog } from './store';
+import { bumpUnread, clearUnread, markRevoked, recordSentBy, saveMessage, upsertCatalog } from './store';
 import { startWaClient } from './wa-client';
 import {
   closeWebServer,
@@ -191,12 +191,14 @@ function main(): void {
     // Recovered history goes straight to the messages table (dedup on msg id) — no order
     // extraction on backfill; the /match "only new messages" flow decides what to process.
     onHistory: (rows) => rows.forEach(saveMessage),
+    // Someone deleted-for-everyone (their phone or this app) — show WhatsApp's placeholder.
+    onRevoked: (messageId) => markRevoked(messageId),
   });
 
-  const server = startWebServer(() => orders.all(), chats, async (chatId, text, mentions, sentBy) => {
+  const server = startWebServer(() => orders.all(), chats, async (chatId, text, mentions, sentBy, quotedId) => {
     if (sentBy) queueSend(chatId, sentBy); // queue BEFORE sending so message_create can claim it
     try {
-      return await client.send(chatId, text, mentions);
+      return await client.send(chatId, text, mentions, quotedId);
     } catch (err) {
       claimSend(chatId); // send failed — drop the queued entry so it can't mis-attribute later
       throw err;
@@ -213,7 +215,8 @@ function main(): void {
       claimSend(chatId);
       throw err;
     }
-  });
+  },
+  (messageId, everyone) => client.del(messageId, everyone));
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 

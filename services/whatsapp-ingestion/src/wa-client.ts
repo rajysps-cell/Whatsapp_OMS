@@ -13,10 +13,18 @@ export interface WaClient {
   /**
    * Send a text message to a chat. Human-initiated only — never used for automated/bulk sending.
    * Attribution is recorded from the message_create event (see index.ts), not from the return value.
+   * quotedId replies to that message; if WhatsApp refuses the quote the text is sent un-quoted
+   * rather than not at all.
    */
-  send: (chatId: string, text: string, mentions?: string[]) => Promise<string>;
+  send: (chatId: string, text: string, mentions?: string[], quotedId?: string) => Promise<string>;
   /** Fetch one message's media as base64, or null if WhatsApp can no longer provide it. */
   media: (messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>;
+  /**
+   * Delete a message in WhatsApp. everyone=true revokes it for all group members (only possible
+   * within WhatsApp's own revoke window); false removes it from this linked account only.
+   * Permission (who may delete what) is the caller's job — this just performs it.
+   */
+  del: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>;
   /** Send a file (image / document / etc.) with an optional caption. Human-initiated only. */
   sendMedia: (
     chatId: string,
@@ -51,6 +59,8 @@ export interface WaClientHandlers {
   onCatalog?: (rows: CatalogRow[]) => void;
   /** History backfill: called once per chat with all messages recovered from the in-memory Store on connect. */
   onHistory?: (msgs: HistoryMsg[]) => void;
+  /** Someone deleted a message for everyone (from their phone or from this app). */
+  onRevoked?: (messageId: string) => void;
 }
 
 /** One message recovered from WhatsApp Web's in-memory (decrypted) message models. */
@@ -221,6 +231,18 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
       Promise.resolve(handlers.onSent?.(msg)).catch((err) => logger.error({ err }, 'onSent failed'));
     });
   }
+  if (handlers.onRevoked) {
+    // Fires when ANYONE deletes-for-everyone — a customer from their phone, or this app itself.
+    // `before` (the original message) carries the id we stored; `after` is the revocation stub.
+    client.on('message_revoke_everyone', (after, before) => {
+      const src = (before ?? after) as { id?: { fromMe?: boolean; remote?: string | { _serialized?: string }; id?: string; _serialized?: string } };
+      const id = src?.id;
+      if (!id) return;
+      const remote = typeof id.remote === 'object' ? (id.remote?._serialized ?? '') : (id.remote ?? '');
+      const messageId = id._serialized || (id.id ? `${id.fromMe ? 'true' : 'false'}_${remote}_${id.id}` : '');
+      if (messageId) handlers.onRevoked?.(messageId);
+    });
+  }
 
   client.initialize().catch((err) => logger.error({ err }, 'initialize failed'));
 
@@ -359,6 +381,54 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     return { data: res.data, mimetype: res.mimetype ?? 'application/octet-stream', filename: res.filename };
   }
 
+  /**
+   * Delete a message via the page's own modules. whatsapp-web.js's Message.delete looks the
+   * message up with Msg.get(serializedId) — undefined on @lid chats, which is nearly all of ours —
+   * so this does the same work but finds the model the way fetchMedia does, then calls the same
+   * Cmd.sendRevokeMsgs / sendDeleteMsgs the library would (2.3000+ argument shape; that is the
+   * only WhatsApp Web this app runs against).
+   */
+  async function deleteMsg(
+    c: InstanceType<typeof Client>,
+    messageId: string,
+    everyone: boolean,
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const page = c.pupPage;
+    if (!page) return { ok: false, reason: 'browser page not available' };
+    const res = (await page.evaluate(`(async () => {
+      const ID = ${JSON.stringify(messageId)};
+      const EVERYONE = ${JSON.stringify(everyone)};
+      const coll = window.require('WAWebCollections');
+      const rebuilt = (m) => {
+        if (!m.id) return '';
+        if (m.id._serialized) return m.id._serialized;
+        const rem = m.id.remote ? (m.id.remote._serialized || String(m.id.remote)) : '';
+        return String(!!m.id.fromMe) + '_' + rem + '_' + m.id.id;
+      };
+      const msg = coll.Msg.getModelsArray().find((m) => rebuilt(m) === ID);
+      if (!msg) return { err: 'message not in memory (too old to delete from here)' };
+      const remote = msg.id.remote ? (msg.id.remote._serialized || String(msg.id.remote)) : '';
+      const chat = coll.Chat.get(msg.id.remote) || coll.Chat.get(remote) || (await coll.Chat.find(msg.id.remote));
+      if (!chat) return { err: 'chat not found' };
+      const { Cmd } = window.require('WAWebCmd');
+      if (EVERYONE) {
+        const cap = window.require('WAWebMsgActionCapability');
+        const can = cap.canSenderRevokeMsg(msg) || cap.canAdminRevokeMsg(msg);
+        if (!can) return { err: 'WhatsApp will no longer revoke this message (too old, or not ours)' };
+        await Cmd.sendRevokeMsgs(chat, { list: [msg], type: 'message' }, { clearMedia: true });
+        return { done: true };
+      }
+      await Cmd.sendDeleteMsgs(chat, { list: [msg], type: 'message' }, true);
+      return { done: true };
+    })()`)) as { done?: boolean; err?: string };
+    if (!res?.done) {
+      logger.warn({ messageId, everyone, reason: res?.err ?? 'empty result' }, 'message delete failed');
+      return { ok: false, reason: res?.err ?? 'delete failed' };
+    }
+    logger.info({ messageId, everyone }, 'message deleted in WhatsApp');
+    return { ok: true };
+  }
+
   // Read the full chat list + real names from WhatsApp Web's IndexedDB ('model-storage').
   // whatsapp-web.js's Store-injection APIs (getChats etc.) are broken against current WhatsApp Web,
   // but the page's own persisted data is directly readable. Message BODIES are encrypted at rest
@@ -407,15 +477,28 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
   }
 
   return {
-    send: async (chatId: string, text: string, mentions?: string[]): Promise<string> => {
-      const opts = mentions && mentions.length ? { mentions } : undefined;
-      const sent = await client.sendMessage(chatId, text, opts);
+    send: async (chatId: string, text: string, mentions?: string[], quotedId?: string): Promise<string> => {
+      const opts: Record<string, unknown> = {};
+      if (mentions && mentions.length) opts['mentions'] = mentions;
+      if (quotedId) opts['quotedMessageId'] = quotedId;
+      let sent;
+      try {
+        sent = await client.sendMessage(chatId, text, Object.keys(opts).length ? opts : undefined);
+      } catch (err) {
+        if (!quotedId) throw err;
+        // The quote lookup uses the same Msg.get path that breaks on @lid chats. The reply text
+        // still matters more than the quote decoration — deliver it plain rather than fail.
+        logger.warn({ chatId, quotedId, err: (err as Error).message }, 'quoted send failed — sending without the quote');
+        delete opts['quotedMessageId'];
+        sent = await client.sendMessage(chatId, text, Object.keys(opts).length ? opts : undefined);
+      }
       // On @lid chats whatsapp-web.js returns an unusable id, so this is best-effort only —
       // attribution is claimed from the 'message_create' event in index.ts, not from here.
       const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
       logger.info({ chatId, chars: text.length, messageId: id }, 'message sent');
       return id;
     },
+    del: (messageId: string, everyone: boolean) => deleteMsg(client, messageId, everyone),
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions): Promise<string> => {
       const media = new MessageMedia(file.mimetype, file.data, file.filename);
