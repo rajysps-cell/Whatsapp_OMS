@@ -301,6 +301,13 @@ def build():
                "Keep typing to narrow it, then press Enter or click a name. The person is properly "
                "tagged in WhatsApp and receives a notification.", BODY)]
 
+    s += [para("Attachments, voice notes and emojis", H2),
+          para("The <b>paperclip</b> sends a photo or file (up to 16&nbsp;MB). The "
+               "<b>microphone</b> records a voice note — a recording bar shows the time with "
+               "Cancel and Send, and it arrives in WhatsApp as a real voice message, not a file. "
+               "The <b>smiley</b> button opens an emoji picker with search (“fire”, “thanks”, "
+               "“truck”…) where your most-used emojis rise to the top automatically.", BODY)]
+
     s += [para("The message menu", H2),
           para("Hover over any message and click the small <b>&#9662;</b> arrow in its corner "
                "(on a phone the arrow is always visible — or press and hold). Right-click works "
@@ -394,6 +401,18 @@ def build():
                                          "address gets a message whenever someone signs in from a "
                                          "device they have not used before."],
           ], [40 * mm, 125 * mm])]
+
+    s += [para("The Activity page", H2),
+          para("An audit trail of who did what: sign-ins (including <b>failed</b> attempts and new "
+               "devices), messages sent, deletes, forwards, reactions, order saves, DDI numbers, "
+               "taught words, user and settings changes. Filter by user, by action and by date "
+               "range. Kept for 90 days. Reading chats is not logged — only actions are.", BODY)]
+
+    s += [para("The Report page", H2),
+          para("Available to every user (tab in the header): search any SKU or description and see "
+               "every saved order line grouped by product — each product once, every customer "
+               "wording under it, with date, who saved it and the DDI number. Date-range filter, "
+               "tick-boxes and a CSV export of exactly the ticked products.", BODY)]
 
     s += [Spacer(1, 3),
           callout("Why usernames have no spaces",
@@ -590,13 +609,20 @@ def build_user():
     s += steps([
         "Click a chat on the left.",
         "Click the customer's order message. Products appear on the right, in the order the "
-        "customer wrote them, each with the line number it came from.",
+        "customer wrote them, each with the <b>line number</b> it came from. Lines that are fully "
+        "matched also turn green inside the message itself, so you see what is left to do.",
         "Rows with a <b>light-green background</b> were recognised. <b>White</b> rows with an "
-        "orange edge need you: click one, search for the right product, and pick it.",
-        "Need something the customer did not write (a reducer, a fitting)? Click <b>+ Add item</b>.",
+        "orange edge need you: click one and pick from the list (it shows everything, product "
+        "numbers first) or type to search.",
+        "Wrong row — a piece of text that is not a product? Press its <b>&#10005;</b>. The system "
+        "remembers and will not extract that wording again (the message at the bottom has an "
+        "<b>Undo</b>).",
+        "Need something the customer did not write (a reducer, a fitting)? Press the <b>+</b> on a "
+        "row to add an item under that line, or <b>+ Add item</b> at the bottom of the list.",
         "Check the quantities in the small boxes.",
         "Click <b>Copy</b> — the order is on your clipboard, ready to paste into DDI.",
-        "Type the order number DDI gives you into the <b>DDI order #</b> box and press Save.",
+        "Type the order number DDI gives you into the <b>DDI order #</b> box and press Save. "
+        "The box is required — the message then shows “Processed by you · DDI #…”.",
     ])
 
     s += [Spacer(1, 3),
@@ -606,9 +632,16 @@ def build_user():
                   "to remove just its lines. <b>Copy</b> finishes them all together.")]
 
     s += [Spacer(1, 3),
+          callout("Saving an order twice",
+                  "If someone already saved an order and you press Copy again, the system asks "
+                  "first and tells you who saved it and with which DDI number. Cancel keeps "
+                  "everything as it was.")]
+
+    s += [Spacer(1, 3),
           callout("It learns from you",
-                  "Every product you match by hand is remembered. The same wording will match "
-                  "automatically next time, so this gets faster the more you use it.")]
+                  "Every product you match by hand is remembered, and every wrong row you "
+                  "&#10005;-remove is remembered too. The same wording matches — or is skipped — "
+                  "automatically next time, so this gets more accurate the more you use it.")]
 
     s += [para("What the labels mean", H2),
           table([
@@ -623,15 +656,26 @@ def build_user():
           para("Type in the box at the bottom and press <b>Enter</b>. Use <b>Shift + Enter</b> for "
                "a new line. To tag someone, type <font face='Courier-Bold'>@</font> and pick their "
                "name from the list — they get a notification.", BODY),
+          para("<b>Attachments:</b> the paperclip sends a photo or file. <b>Voice notes:</b> the "
+               "microphone records one — a bar shows the time with <b>Cancel</b> and <b>Send</b>, "
+               "and it arrives in WhatsApp as a real voice message. <b>Emojis:</b> the smiley "
+               "button opens a picker with a search box (type “fire”, “thanks”, “truck”…) — the "
+               "ones you use most move to the top by themselves.", BODY),
           para("Click the small <b>&#9662;</b> arrow on any message (or right-click / press and "
                "hold) to <b>React with an emoji</b> (the row on top — the customer sees it, like "
-               "WhatsApp), <b>Reply</b>, <b>Copy</b>, <b>Forward</b>, <b>Star</b>, <b>Pin</b>, "
-               "<b>Download</b> a photo or file, or <b>Delete</b> — Delete only appears on "
-               "messages you sent yourself, and “for everyone” also removes it from the real "
-               "WhatsApp chat. The smiley button next to the paperclip puts emojis into your own "
-               "message.", BODY),
+               "WhatsApp; the <b>+</b> opens the full emoji search), <b>Reply</b>, <b>Copy</b>, "
+               "<b>Forward</b>, <b>Star</b>, <b>Pin</b>, <b>Download</b> a photo or file, or "
+               "<b>Delete</b> — Delete only appears on messages you sent yourself, and “for "
+               "everyone” also removes it from the real WhatsApp chat.", BODY),
           para("Your replies are signed with your username automatically, so everyone can see who "
                "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
+
+    s += [para("The Match Report", H2),
+          para("The <b>Report</b> tab answers “how did this product match customer orders?” Type "
+               "part of a SKU or description (even just <font face='Courier-Bold'>ac</font>) and "
+               "every saved order line appears, grouped by product — each product once, with every "
+               "customer wording under it. Filter by date range, tick the products you want, and "
+               "<b>Export</b> downloads them as a spreadsheet file.", BODY)]
 
     s += [Spacer(1, 3),
           callout("There is no undo",
