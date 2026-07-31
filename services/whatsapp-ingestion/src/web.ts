@@ -160,6 +160,32 @@ function html(res: http.ServerResponse, body: string): void {
   res.end(body);
 }
 /**
+ * The ONE tab bar, identical on every page: same tabs, same order (most important first), same
+ * look — the current page is a green pill, everything else neutral. Admin-only tabs simply do not
+ * render for normal users. Every page pastes NAV_CSS into its stylesheet so the bar cannot drift.
+ */
+function navHtml(me: User, current: string): string {
+  const tabs: Array<[href: string, label: string, show: boolean]> = [
+    ['/', 'Order Matching', true],
+    ['/report', 'Report', true],
+    ['/aliases', 'Aliases', true],
+    ['/admin', 'Users', me.role === 'admin'],
+    ['/settings', 'Settings', me.role === 'admin'],
+    ['/activity', 'Activity', me.role === 'admin'],
+  ];
+  return (
+    tabs
+      .filter((t) => t[2])
+      .map(([href, label]) => `<a class="navlink${href === current ? ' cur' : ''}" href="${href}">${label}</a>`)
+      .join('') + '<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a>'
+  );
+}
+const NAV_CSS = `
+  .navlink{color:#667781;text-decoration:none;font-size:13px;font-weight:600;margin-left:2px;padding:6px 11px;border-radius:8px;white-space:nowrap}
+  .navlink:hover{background:#f0f2f5;color:#111b21}
+  .navlink.cur{background:#e7f8f2;color:#059669}
+`;
+/**
  * Boot-time self-check: render each page and parse its inline <script> blocks. Catches the
  * template-literal escaping trap (\s / \d / \n eaten before the browser sees them), which
  * otherwise ships a page whose JavaScript never runs.
@@ -179,7 +205,7 @@ function checkInlineScripts(): void {
   const pages: Array<[string, string]> = [
     ['/match', matchPage(fake)],
     ['/admin', adminPage(fake)],
-    ['/aliases', aliasPage()],
+    ['/aliases', aliasPage(fake)],
     ['/board', dashboardPage()],
     ['/login', loginPage()],
     ['/change-password', changePasswordPage(fake)],
@@ -1462,7 +1488,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return;
   }
   if (path === '/aliases') {
-    html(res, aliasPage());
+    html(res, aliasPage(me));
     return;
   }
   if (path === '/match') {
@@ -1618,7 +1644,7 @@ function adminPage(me: User): string {
     border-bottom:1px solid var(--line);box-shadow:0 1px 3px #0000001a;position:sticky;top:0;z-index:5}
   header h1{font-size:15px;margin:0;font-weight:700}
   .spacer{flex:1}
-  .navlink{color:var(--blue);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  ${NAV_CSS}
   .navlink:hover{text-decoration:underline}
   .who{font-size:12px;color:var(--mut)}
   .wrap{max-width:960px;margin:0 auto;padding:22px 18px 60px}
@@ -1665,7 +1691,7 @@ function adminPage(me: User): string {
 </style></head><body>
 <header><h1>User Management</h1><span class="who">signed in as <b>${esc(me.username)}</b></span>
   <div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="/activity">Activity</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  ${navHtml(me, '/admin')}</header>
 <div class="wrap">
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
@@ -1779,7 +1805,7 @@ function settingsPage(me: User): string {
   header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
   header h1{font-size:15.5px;margin:0}
   .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
-  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  ${NAV_CSS}
   .wrap{max-width:640px;margin:22px auto;padding:0 16px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
   .card h2{font-size:14.5px;margin:0 0 4px}
@@ -1813,7 +1839,7 @@ function settingsPage(me: User): string {
   .hint{font-size:11.5px;color:var(--mut);margin-top:4px}
 </style></head><body>
 <header><h1>Settings</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="/activity">Activity</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  ${navHtml(me, '/settings')}</header>
 <div class="wrap">
   <div class="card">
     <h2>Email sending</h2>
@@ -1913,7 +1939,7 @@ function reportPage(me: User): string {
   header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
   header h1{font-size:15.5px;margin:0}
   .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
-  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  ${NAV_CSS}
   .wrap{max-width:1080px;margin:20px auto;padding:0 16px}
   .bar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
   .bar input[type=text]{flex:1;min-width:220px;padding:9px 12px;font-size:13.5px;border:1px solid var(--line);border-radius:9px;outline:none}
@@ -1936,7 +1962,7 @@ function reportPage(me: User): string {
   .empty{padding:22px;text-align:center;color:var(--mut)}
 </style></head><body>
 <header><h1>Match Report</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  ${navHtml(me, '/report')}</header>
 <div class="wrap">
   <div class="bar">
     <input type="text" id="q" placeholder="search SKU or description… (e.g. AC, NHC, coupling)" autocomplete="off">
@@ -2033,7 +2059,7 @@ function activityPage(me: User): string {
   header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
   header h1{font-size:15.5px;margin:0}
   .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
-  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  ${NAV_CSS}
   .wrap{max-width:980px;margin:20px auto;padding:0 16px}
   .bar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
   .bar select{padding:8px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff;outline:none}
@@ -2052,7 +2078,7 @@ function activityPage(me: User): string {
   .empty{padding:22px;text-align:center;color:var(--mut)}
 </style></head><body>
 <header><h1>User Activity</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  ${navHtml(me, '/activity')}</header>
 <div class="wrap">
   <div class="bar">
     <select id="fUser"><option value="">All users</option></select>
@@ -2156,7 +2182,8 @@ function matchPage(me: User): string {
   ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#00000026;border-radius:6px}::-webkit-scrollbar-thumb:hover{background:#0000003d}
   header{display:flex;align-items:center;gap:12px;padding:13px 20px;background:var(--panel);border-bottom:1px solid var(--line);box-shadow:0 1px 3px #0000001a}
   header h1{font-size:15px;margin:0;font-weight:700;letter-spacing:.2px}
-  .spacer{flex:1}.navlink{color:var(--blue);text-decoration:none;font-size:13px;font-weight:600}.navlink:hover{text-decoration:underline}
+  .spacer{flex:1}
+  ${NAV_CSS}
   .muted{color:var(--mut);font-size:12px}
   /* Live-connection pill: green pulse when WhatsApp is linked, red when it needs a QR re-scan. */
   .live{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:4px 11px;border-radius:20px;background:#eafaf0;color:var(--em2);border:1px solid #a7f3d0;white-space:nowrap}
@@ -2505,7 +2532,7 @@ function matchPage(me: User): string {
   .rmfinal:hover{background:#fee2e2;color:#dc2626}
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
-<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span><a class="navlink" href="/report">Report</a>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="/activity">Activity</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${navHtml(me, '/')}</header>
 <div class="offline" id="offline">
   <div class="offbox">
     <div class="officon" id="officon">⏳</div>
@@ -3507,7 +3534,7 @@ loadCat();loadChats();setInterval(loadChats,6000);setInterval(refreshThread,4000
 }
 
 // --- Product Alias Management page (at /aliases) ---
-function aliasPage(): string {
+function aliasPage(me: User): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Product Alias Management</title>
 <style>
   :root{color-scheme:light;
@@ -3519,7 +3546,8 @@ function aliasPage(): string {
   ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#00000026;border-radius:6px}
   header{display:flex;align-items:center;gap:12px;padding:13px 20px;background:var(--panel);border-bottom:1px solid var(--line);box-shadow:0 1px 3px #0000001a;position:sticky;top:0;z-index:5}
   header h1{font-size:16px;margin:0;font-weight:700}
-  .spacer{flex:1}.navlink{color:var(--blue);text-decoration:none;font-size:13px;font-weight:600}.navlink:hover{text-decoration:underline}
+  .spacer{flex:1}
+  ${NAV_CSS}
   .muted{color:var(--mut);font-size:12px}
   .wrap{max-width:1000px;margin:0 auto;padding:20px 18px}
   .toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
@@ -3579,7 +3607,7 @@ function aliasPage(): string {
   .modal p{margin:0 0 18px;color:var(--mut);font-size:14px;line-height:1.5;word-break:break-word}
   .modal .r{display:flex;justify-content:flex-end;gap:10px}
 </style></head><body>
-<header><h1>Product Alias Management</h1><span class="muted" id="stat"></span><div class="spacer"></div><a class="navlink" href="/">Order Matching</a></header>
+<header><h1>Product Alias Management</h1><span class="muted" id="stat"></span><div class="spacer"></div>${navHtml(me, '/aliases')}</header>
 <div class="wrap">
   <div class="toolbar">
     <div class="search"><span class="ic">&#9906;</span><input id="q" placeholder="Search by SKU, product name, or alias…" autocomplete="off"></div>
@@ -3592,6 +3620,7 @@ function aliasPage(): string {
 <div class="modal" id="modal"><div class="box"><h4>Delete alias?</h4><p id="mText"></p><div class="r"><button class="btn ghost" id="mCancel">Cancel</button><button class="btn danger" id="mOk">Delete</button></div></div></div>
 <script>
 var q="",page=1,limit=25,total=0,curCode=null,curAliases=[],curDetail=null;
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
