@@ -1,5 +1,5 @@
 import { all, byCode, normalize, type Product } from './products';
-import { getAlias } from './store';
+import { getAlias, isIgnoredPhrase } from './store';
 
 export interface Scored {
   product: Product;
@@ -627,6 +627,10 @@ function extractOne(raw: string, line: number, material: string | undefined): Ex
     if (meaningful.join('').length < 2) return null; // pure noise / too short
     // Skip clear non-product lines (address, greeting, phone, date…), unless it has a product signal.
     if (!hasProductSignal(phrase) && isNonProduct(raw, phrase)) return null;
+    // Staff-taught non-products: a phrase someone ✕-removed as "not a product" stays out of
+    // future extractions. An exact SKU or a learned alias always wins over the ignore list —
+    // a positive lesson taught later must be able to override a negative one.
+    if (isIgnoredPhrase(normalize(phrase)) && !byCode(phrase.trim()) && !getAlias(normalize(phrase))) return null;
 
     const item: ExtractedItem = { phrase, quantity, line, raw: raw.trim() };
     if (unit) item.unit = unit;

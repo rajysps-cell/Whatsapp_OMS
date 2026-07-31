@@ -59,6 +59,7 @@ import type { Order } from './order-store';
 import { all as allProducts, byCode, count as productCount, normalize } from './products';
 import {
   addAlias,
+  addIgnoredPhrase,
   aliasCodesMatching,
   aliasCount,
   aliasCountsByCode,
@@ -75,6 +76,7 @@ import {
   orderNoOf,
   pinnedMessage,
   recordSentBy,
+  removeIgnoredPhrase,
   saveExtraction,
   sentByOf,
   setChatName,
@@ -1178,6 +1180,35 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, { ok: true });
     return;
   }
+  // Learned non-products: ✕ on an unmatched extracted row teaches the system to skip that phrase
+  // in future extractions. Any signed-in user can teach (the aliases work the same way); the Undo
+  // in the toast calls the delete endpoint.
+  if (path === '/api/ignored' && req.method === 'POST') {
+    const body = await readBody(req);
+    const phrase = typeof body['phrase'] === 'string' ? (body['phrase'] as string).trim().slice(0, 200) : '';
+    const norm = normalize(phrase);
+    if (!norm) {
+      json(res, 400, { ok: false, error: 'Nothing to ignore.' });
+      return;
+    }
+    // A phrase that IS an exact SKU must never be silenced — refuse rather than trust the guard.
+    if (byCode(phrase)) {
+      json(res, 200, { ok: false, error: 'That is a real product code — not added to the ignore list.' });
+      return;
+    }
+    addIgnoredPhrase(norm, phrase, me.username);
+    logger.info({ user: me.username, phrase }, 'phrase added to the ignore list');
+    json(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/api/ignored/delete' && req.method === 'POST') {
+    const body = await readBody(req);
+    const norm = normalize(typeof body['phrase'] === 'string' ? (body['phrase'] as string) : '');
+    removeIgnoredPhrase(norm);
+    logger.info({ user: me.username, norm }, 'phrase removed from the ignore list');
+    json(res, 200, { ok: true });
+    return;
+  }
   // The DDI order number a sales rep types after Copy — stamped onto every processed message of
   // that order, so the thread badge can show "Processed by Nate · DDI #12345".
   if (path === '/api/processed/order-no' && req.method === 'POST') {
@@ -1979,6 +2010,7 @@ function matchPage(me: User): string {
     color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:80;pointer-events:none}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast.bad{background:var(--red)}
+  .toast.act{pointer-events:auto;cursor:pointer}
   /* The ⌄ that opens the message menu. Hidden until hover on mouse devices, always shown where
      there is no hover — before this, nothing on screen said the menu existed at all. */
   .mbtn{position:absolute;top:2px;right:3px;z-index:2;width:22px;height:20px;border:0;border-radius:6px;
@@ -2606,7 +2638,17 @@ el("right").addEventListener("click",function(e){
   if(e.target.closest("#additem")){addItem();return;}
   var ai=e.target.closest(".addinline");if(ai){addItemAt(+ai.dataset.add);return;}
   // ✕ removes the whole row — the fix for a piece of formal text wrongly treated as a product.
-  var rr=e.target.closest(".rmrow");if(rr){items.splice(+rr.dataset.rm,1);renderRight();return;}
+  // Removing an UNMATCHED extracted row also teaches the system: that phrase stays out of future
+  // extractions (undoable from the toast). A matched row teaches nothing — removing a real
+  // product from one order must never blacklist it.
+  var rr=e.target.closest(".rmrow");
+  if(rr){
+    var ri2=+rr.dataset.rm,it2=items[ri2];
+    var teach=it2&&!it2.manual&&!it2.chosen&&it2.phrase;
+    items.splice(ri2,1);renderRight();
+    if(teach)teachIgnore(it2.phrase);
+    return;
+  }
   if(e.target.closest("#ddisave")){saveDdiNo();return;}
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
@@ -2882,6 +2924,32 @@ function openEmojiPanel(mode,mid){
 
 // --- WhatsApp-style message menu: right-click a bubble on desktop, long-press on phones ---
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},2600);}
+// A toast with an Undo — click anywhere on it to take the action back.
+var undoTimer=null,undoHandler=null;
+function toastUndo(msg,cb){
+  var t=el("toast");
+  if(undoHandler)t.removeEventListener("click",undoHandler);
+  clearTimeout(undoTimer);
+  t.innerHTML=esc(msg)+' &nbsp;<b style="text-decoration:underline">Undo</b>';
+  t.className="toast on act";
+  var done=function(){t.removeEventListener("click",undoHandler);undoHandler=null;t.className="toast";t.textContent="";};
+  // done() BEFORE cb(): the callback usually shows its own confirmation toast, and cleaning up
+  // afterwards would wipe that toast the instant it appeared.
+  undoHandler=function(){done();cb();};
+  t.addEventListener("click",undoHandler);
+  undoTimer=setTimeout(done,6000);
+}
+// Teach the extractor that this phrase is NOT a product. Undo deletes the lesson again.
+function teachIgnore(phrase){
+  fetch("/api/ignored",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:phrase})})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok)return; // the row is already removed either way; a refused lesson needs no noise
+      toastUndo('Removed — "'+phrase.slice(0,60)+'" will be skipped next time.',function(){
+        fetch("/api/ignored/delete",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:phrase})});
+        toast('Okay — "'+phrase.slice(0,60)+'" will extract again.');
+      });
+    }).catch(function(){});
+}
 function clearReply(){replyTo=null;el("replybar").className="replybar";}
 // Pinned bar above the thread, like WhatsApp's: newest pinned message, click scrolls to it.
 function renderPinBar(p){

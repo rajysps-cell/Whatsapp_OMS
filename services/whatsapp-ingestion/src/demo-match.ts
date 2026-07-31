@@ -126,4 +126,22 @@ assert.ok(
   assert.ok(/40\s*gal/i.test(wh!.matched?.description ?? ''), 'matched a 40-gallon heater');
 }
 
+// Staff-taught non-products (the ✕ button): an ignored phrase stays out of future extractions,
+// removal brings it back, and the guard means a phrase with a product signal is still skippable
+// while an exact SKU never is.
+{
+  const { addIgnoredPhrase, removeIgnoredPhrase } = await import('./store');
+  const { normalize } = await import('./products');
+  const phrase = 'galvanized bracket special testcase';
+  assert.equal(extractItems(phrase).length, 1, 'phrase extracts before it is taught');
+  addIgnoredPhrase(normalize(phrase), phrase, 'demo');
+  assert.equal(extractItems(phrase).length, 0, 'taught phrase is skipped');
+  removeIgnoredPhrase(normalize(phrase));
+  assert.equal(extractItems(phrase).length, 1, 'undo brings the phrase back');
+  // an exact SKU can never be silenced, even if a row for it lands in the table
+  addIgnoredPhrase(normalize('PABCFA15'), 'PABCFA15', 'demo');
+  assert.equal(extractItems('PABCFA15').length, 1, 'exact SKU wins over the ignore list');
+  removeIgnoredPhrase(normalize('PABCFA15'));
+}
+
 console.log('✓ non-product extraction filter checks passed');

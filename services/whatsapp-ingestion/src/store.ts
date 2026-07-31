@@ -66,6 +66,12 @@ db.exec(`
     value      TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS ignored_phrases (
+    phrase_norm TEXT PRIMARY KEY,
+    phrase_text TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL
+  );
 `);
 
 // Added columns on existing tables (idempotent-by-catch: they already exist after one run).
@@ -153,6 +159,27 @@ export function setStarred(msgId: string, on: boolean): void {
 
 export function setPinned(msgId: string, on: boolean): void {
   db.prepare('UPDATE messages SET pinned = ? WHERE msg_id = ?').run(on ? Date.now() : 0, msgId);
+}
+
+// --- learned NON-products -----------------------------------------------------------------
+// When staff hit ✕ on an extracted row that never matched, the phrase lands here and future
+// extractions skip it — the mirror image of the aliases table. Deliberately consulted only for
+// phrases with no exact SKU and no learned alias, so a real product can never be silenced.
+const insIgnored = db.prepare(
+  'INSERT OR REPLACE INTO ignored_phrases (phrase_norm, phrase_text, created_by, created_at) VALUES (?, ?, ?, ?)',
+);
+const getIgnoredStmt = db.prepare('SELECT 1 FROM ignored_phrases WHERE phrase_norm = ?');
+const delIgnoredStmt = db.prepare('DELETE FROM ignored_phrases WHERE phrase_norm = ?');
+
+export function addIgnoredPhrase(norm: string, text: string, by: string): void {
+  if (!norm) return;
+  insIgnored.run(norm, text.slice(0, 200), by, Date.now());
+}
+export function removeIgnoredPhrase(norm: string): void {
+  delIgnoredStmt.run(norm);
+}
+export function isIgnoredPhrase(norm: string): boolean {
+  return getIgnoredStmt.get(norm) !== undefined;
 }
 
 // --- app settings (admin-editable at /settings; DB so they survive restarts and stay off git) ---
