@@ -31,13 +31,15 @@ export interface WaClient {
   pin: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
   /** React to a message with an emoji ('' removes the reaction), like tapping it in WhatsApp. */
   react: (messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>;
-  /** Send a file (image / document / etc.) with an optional caption. Human-initiated only. */
+  /** Send a file (image / document / etc.) with an optional caption. Human-initiated only.
+   *  asVoice sends an audio file as a WhatsApp VOICE NOTE (the push-to-talk bubble). */
   sendMedia: (
     chatId: string,
     file: { data: string; mimetype: string; filename: string },
     caption?: string,
     mentions?: string[],
     sentBy?: string,
+    asVoice?: boolean,
   ) => Promise<string>;
 }
 
@@ -573,11 +575,14 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     pin: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'pin' : 'unpin'),
     react: (messageId: string, emoji: string) => msgAction(client, messageId, 'react', emoji),
     media: (messageId: string) => fetchMedia(client, messageId),
-    sendMedia: async (chatId, file, caption, mentions): Promise<string> => {
+    sendMedia: async (chatId, file, caption, mentions, _sentBy, asVoice): Promise<string> => {
       const media = new MessageMedia(file.mimetype, file.data, file.filename);
       const sent = await client.sendMessage(chatId, media, {
         ...(caption ? { caption } : {}),
         ...(mentions && mentions.length ? { mentions } : {}),
+        // The push-to-talk bubble instead of an audio-file attachment — how WhatsApp itself
+        // sends a recorded voice note.
+        ...(asVoice ? { sendAudioAsVoice: true } : {}),
       });
       const id = (sent as { id?: { _serialized?: string } })?.id?._serialized ?? '';
       logger.info({ chatId, filename: file.filename, mimetype: file.mimetype, messageId: id }, 'media sent');

@@ -72,6 +72,16 @@ db.exec(`
     created_by  TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS activity_log (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       INTEGER NOT NULL,
+    username TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    detail   TEXT NOT NULL DEFAULT '',
+    ip       TEXT NOT NULL DEFAULT ''
+  );
+  CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(ts);
+  CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_log(username, ts);
 `);
 
 // Added columns on existing tables (idempotent-by-catch: they already exist after one run).
@@ -114,8 +124,13 @@ const aliasCodesMatchStmt = db.prepare('SELECT DISTINCT product_code AS code FRO
 const getAliasRowStmt = db.prepare('SELECT product_code AS code, product_desc AS desc, alias_text AS text FROM aliases WHERE phrase_norm = ?');
 const delAliasStmt = db.prepare('DELETE FROM aliases WHERE phrase_norm = ?');
 const updAliasTextStmt = db.prepare('UPDATE aliases SET alias_text = ? WHERE phrase_norm = ?');
+// ON CONFLICT UPDATE, not OR REPLACE: REPLACE rewrites the whole row, which silently wiped the
+// DDI order number (and everything else not in the column list) every time an order was re-saved.
+// A resave updates who/when/what; the order number survives until someone types a new one.
 const insProcessed = db.prepare(
-  'INSERT OR REPLACE INTO processed (message_id, chat_id, processed_at, message_text, items, processed_by) VALUES (?, ?, ?, ?, ?, ?)',
+  'INSERT INTO processed (message_id, chat_id, processed_at, message_text, items, processed_by) VALUES (?, ?, ?, ?, ?, ?) ' +
+    'ON CONFLICT(message_id) DO UPDATE SET chat_id = excluded.chat_id, processed_at = excluded.processed_at, ' +
+    'message_text = excluded.message_text, items = excluded.items, processed_by = excluded.processed_by',
 );
 const insSentBy = db.prepare('INSERT OR REPLACE INTO sent_by (msg_id, username, ts) VALUES (?, ?, ?)');
 const chatSentByStmt = db.prepare(
@@ -181,6 +196,105 @@ export function removeIgnoredPhrase(norm: string): void {
 export function isIgnoredPhrase(norm: string): boolean {
   return getIgnoredStmt.get(norm) !== undefined;
 }
+
+// --- match report ------------------------------------------------------------------------
+// "Show me how our products matched customer requirements": every line of every SAVED order,
+// flattened, searchable by SKU / description / the customer's own words, date-filterable.
+export interface ReportRow {
+  code: string;
+  description: string;
+  phrase: string;
+  qty: string;
+  ts: number;
+  by: string;
+  orderNo: string;
+  chatId: string;
+}
+export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { rows: ReportRow[]; total: number } {
+  const conds: string[] = [];
+  const args: number[] = [];
+  if (fromTs > 0) { conds.push('processed_at >= ?'); args.push(fromTs); }
+  if (toTs > 0) { conds.push('processed_at <= ?'); args.push(toTs); }
+  const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
+  const saved = db
+    .prepare(`SELECT items, processed_at, processed_by, order_no, chat_id FROM processed${where} ORDER BY processed_at DESC`)
+    .all(...args) as Array<{ items: string | null; processed_at: number; processed_by: string | null; order_no: string | null; chat_id: string | null }>;
+  const ql = q.toLowerCase().trim();
+  const out: ReportRow[] = [];
+  let total = 0;
+  for (const s of saved) {
+    if (!s.items) continue;
+    let lines: Array<{ qty?: string; code?: string; description?: string; phrase?: string }>;
+    try {
+      lines = JSON.parse(s.items) as typeof lines;
+    } catch {
+      continue;
+    }
+    for (const l of lines) {
+      const code = l.code ?? '';
+      const desc = l.description ?? '';
+      const phrase = l.phrase ?? '';
+      // Space-insensitive on top of substring: customers write "nohub", the catalog writes
+      // "NO HUB" — both must find each other.
+      const hay = `${code} ${desc} ${phrase}`.toLowerCase();
+      const qq = ql.replace(/\s+/g, '');
+      if (ql && !(hay.includes(ql) || hay.replace(/\s+/g, '').includes(qq))) continue;
+      total++;
+      if (out.length < limit) {
+        out.push({
+          code,
+          description: desc,
+          phrase,
+          qty: l.qty ?? '1',
+          ts: s.processed_at,
+          by: s.processed_by ?? '',
+          orderNo: s.order_no ?? '',
+          chatId: s.chat_id ?? '',
+        });
+      }
+    }
+  }
+  return { rows: out, total };
+}
+
+// --- user activity log -------------------------------------------------------------------
+// Every consequential user action lands here so an admin can reconstruct "who did what, when"
+// if something ever looks suspicious. Reads (opening chats, searching) are deliberately NOT
+// logged — they would drown the signal in noise. 90-day retention, swept on boot.
+const insActivity = db.prepare('INSERT INTO activity_log (ts, username, action, detail, ip) VALUES (?, ?, ?, ?, ?)');
+export function logActivity(username: string, action: string, detail = '', ip = ''): void {
+  try {
+    insActivity.run(Date.now(), username, action, detail.slice(0, 300), ip.slice(0, 60));
+  } catch {
+    /* the log must never break the action it describes */
+  }
+}
+export interface ActivityRow {
+  id: number;
+  ts: number;
+  username: string;
+  action: string;
+  detail: string;
+  ip: string;
+}
+export function listActivity(limit = 100, beforeId = 0, user = '', action = '', fromTs = 0, toTs = 0): { rows: ActivityRow[]; total: number } {
+  const conds: string[] = [];
+  const args: (string | number)[] = [];
+  if (beforeId > 0) { conds.push('id < ?'); args.push(beforeId); }
+  if (user) { conds.push('username = ?'); args.push(user); }
+  if (action) { conds.push('action = ?'); args.push(action); }
+  if (fromTs > 0) { conds.push('ts >= ?'); args.push(fromTs); }
+  if (toTs > 0) { conds.push('ts <= ?'); args.push(toTs); }
+  const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
+  const rows = db.prepare(`SELECT id, ts, username, action, detail, ip FROM activity_log${where} ORDER BY id DESC LIMIT ?`).all(...args, limit) as unknown as ActivityRow[];
+  // total ignores the paging cursor but respects the filters — it answers "how many match".
+  const condsT = conds.filter((c) => !c.startsWith('id <'));
+  const argsT = args.slice(beforeId > 0 ? 1 : 0);
+  const whereT = condsT.length ? ' WHERE ' + condsT.join(' AND ') : '';
+  const total = (db.prepare(`SELECT COUNT(*) AS n FROM activity_log${whereT}`).get(...argsT) as { n: number }).n;
+  return { rows, total };
+}
+db.prepare('DELETE FROM activity_log WHERE ts < ?').run(Date.now() - 90 * 86_400_000); // boot sweep
 
 // --- app settings (admin-editable at /settings; DB so they survive restarts and stay off git) ---
 export function getSetting(key: string, fallback = ''): string {

@@ -70,6 +70,8 @@ import {
   getSetting,
   chatParticipants,
   isProcessed,
+  listActivity,
+  logActivity,
   markDeleted,
   markRevoked,
   mentionNames,
@@ -77,6 +79,7 @@ import {
   pinnedMessage,
   recordSentBy,
   removeIgnoredPhrase,
+  reportRows,
   saveExtraction,
   sentByOf,
   setChatName,
@@ -99,6 +102,7 @@ let sendMediaFn:
       caption?: string,
       mentions?: string[],
       sentBy?: string,
+      asVoice?: boolean,
     ) => Promise<string>)
   | null = null;
 /** Injected by index.ts so the thread can show images, voice notes and documents. */
@@ -350,6 +354,7 @@ async function handleAdmin(
     if (body['adminNewDevice'] !== undefined) setSetting('notify.adminNewDevice', body['adminNewDevice'] ? '1' : '0');
     resetMailCache(); // a cached MS365 token for the old app registration must not survive a change
     logger.info({ user: me.username }, 'settings updated');
+    logActivity(me.username, 'settings', 'changed email/notification settings', clientIp(req));
     json(res, 200, { ok: true, sender: senderAddress() });
     return true;
   }
@@ -407,6 +412,7 @@ async function handleAdmin(
         logger.warn({ err, to: em.value }, 'welcome email failed — give the user their password by hand');
       }
     }
+    logActivity(me.username, 'user-add', `${created.username} (${role})${em.value ? ' — welcome mail ' + (mailed ? 'sent' : 'FAILED') : ''}`, clientIp(req));
     json(res, 200, { ok: true, mailed, users: listUsers() });
     return true;
   }
@@ -450,6 +456,7 @@ async function handleAdmin(
       return true;
     }
     updateUser(id, patch);
+    logActivity(me.username, 'user-edit', `${target.username}${patch.password ? ' (password reset)' : ''}${patch.active === false ? ' (disabled)' : ''}`, clientIp(req));
     json(res, 200, { ok: true, users: listUsers() });
     return true;
   }
@@ -470,6 +477,7 @@ async function handleAdmin(
       return true;
     }
     deleteUser(id);
+    logActivity(me.username, 'user-delete', target.username, clientIp(req));
     json(res, 200, { ok: true, users: listUsers() });
     return true;
   }
@@ -483,7 +491,26 @@ async function handleAdmin(
       return true;
     }
     const n = revokeDevices(target.id);
+    logActivity(me.username, 'reset-2fa', `${target.username} — ${n} device(s) forgotten`, clientIp(req));
     json(res, 200, { ok: true, devices: n, users: listUsers() });
+    return true;
+  }
+  // The activity log itself: what everyone did, newest first, filterable. Read-only by design —
+  // an audit trail nobody can edit from the UI is the whole point.
+  if (path === '/activity') {
+    html(res, activityPage(me));
+    return true;
+  }
+  if (path === '/api/activity' && req.method !== 'POST') {
+    const q = new URL(req.url ?? '/', 'http://localhost').searchParams;
+    const limit = Math.min(200, Math.max(1, Number(q.get('limit') ?? 100) || 100));
+    const beforeId = Math.max(0, Number(q.get('before') ?? 0) || 0);
+    const user = (q.get('user') ?? '').slice(0, 32);
+    const action = (q.get('action') ?? '').slice(0, 32);
+    const fromTs = Date.parse(q.get('from') ?? '') || 0;
+    const toRaw = Date.parse(q.get('to') ?? '') || 0;
+    const toTs = toRaw ? toRaw + 86_400_000 - 1 : 0; // "to" is an inclusive DATE
+    json(res, 200, { ...listActivity(limit, beforeId, user, action, fromTs, toTs), users: allUsernames() });
     return true;
   }
   return false;
@@ -528,6 +555,7 @@ export function startWebServer(
     caption?: string,
     mentions?: string[],
     sentBy?: string,
+    asVoice?: boolean,
   ) => Promise<string>,
   del?: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>,
   star?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
@@ -617,6 +645,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const r = await authLogin(body['username'], body['password'], clientIp(req));
       if (!r.ok) {
         logger.warn({ username: String(body['username'] ?? '').slice(0, 40) }, 'failed login');
+        logActivity(String(body['username'] ?? '').slice(0, 32), 'login-failed', '', clientIp(req));
         json(res, 401, { ok: false, error: r.error });
         return;
       }
@@ -651,6 +680,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       });
       res.end(JSON.stringify({ ok: true, mustChange: r.user.mustChange }));
       logger.info({ user: r.user.username }, 'login ok');
+      logActivity(r.user.username, 'login', '', clientIp(req));
       return;
     }
     if (me) {
@@ -679,6 +709,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     });
     res.end(JSON.stringify({ ok: true, mustChange: v.user.mustChange }));
     logger.info({ user: v.user.username }, 'two-step verification passed — device remembered');
+    logActivity(v.user.username, 'login-new-device', ua.slice(0, 120), clientIp(req));
     // Heads-up to the admins (Settings switch): a verified sign-in from a brand-new device is
     // exactly the event worth a second pair of eyes. Fire-and-forget — mail must never block login.
     if (getSetting('notify.adminNewDevice', '0') === '1') {
@@ -713,6 +744,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       redirect(res, me ? '/' : '/login');
       return;
     }
+    if (me) logActivity(me.username, 'logout', '', clientIp(req));
     destroySession(token);
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
@@ -760,6 +792,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return;
       }
       changePassword(me.id, v.value, token ?? undefined);
+      logActivity(me.username, 'password-changed', '', clientIp(req));
       // "Your password was changed" — the mail that matters when it WASN'T them. Best-effort.
       if (me.email) {
         const t = tplPasswordChanged(me.name || me.username);
@@ -777,7 +810,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // --- admin-only surface ---------------------------------------------------
   // /qr shows the WhatsApp device-linking QR: scanning it links a phone to the business account
   // with full read+send, outside this app and unaffected by disabling the OMS user. Admins only.
-  if (path === '/admin' || path === '/qr' || path === '/settings' || path.startsWith('/api/users') || path.startsWith('/api/settings')) {
+  if (path === '/admin' || path === '/qr' || path === '/settings' || path === '/activity' || path.startsWith('/api/users') || path.startsWith('/api/settings') || path.startsWith('/api/activity')) {
     if (me.role !== 'admin') {
       if (path.startsWith('/api/')) {
         json(res, 403, { error: 'admin only' });
@@ -859,6 +892,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
     logger.info({ user: me.username, chatId: cid, messages: saved }, 'order marked processed');
+    logActivity(me.username, 'order-saved', `chat ${cid} — ${saved} message(s)`, clientIp(req));
     json(res, 200, { ok: saved > 0, saved });
     return;
   }
@@ -867,7 +901,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const phrase = typeof body['phrase'] === 'string' ? (body['phrase'] as string) : '';
     const code = typeof body['code'] === 'string' ? (body['code'] as string) : '';
     const desc = typeof body['description'] === 'string' ? (body['description'] as string) : '';
-    if (phrase && code) addAlias(normalize(phrase), code, desc, phrase.trim());
+    if (phrase && code) {
+      addAlias(normalize(phrase), code, desc, phrase.trim());
+      logActivity(me.username, 'teach-alias', `"${phrase.trim().slice(0, 80)}" -> ${code}`, clientIp(req));
+    }
     json(res, 200, { ok: true, aliases: aliasCount() });
     return;
   }
@@ -875,7 +912,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const body = await readBody(req);
     const cid = typeof body['chatId'] === 'string' ? (body['chatId'] as string) : '';
     const name = typeof body['name'] === 'string' ? (body['name'] as string).trim() : '';
-    if (cid && name) setChatName(cid, name);
+    if (cid && name) {
+      setChatName(cid, name);
+      logActivity(me.username, 'rename-chat', `${cid} -> "${name.slice(0, 60)}"`, clientIp(req));
+    }
     json(res, 200, { ok: !!(cid && name) });
     return;
   }
@@ -1039,6 +1079,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         { user: me.username, chatId, chars: trimmed.length, mentions: mentions.length, messageId },
         'user sent message',
       );
+      logActivity(me.username, 'send-message', `${chatId} (${trimmed.length} chars${quotedId ? ', reply' : ''})`, clientIp(req));
       json(res, 200, { ok: true, messageId });
     } catch (err) {
       logger.error({ err, user: me.username, chatId }, 'send failed');
@@ -1078,10 +1119,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     const signed = caption ? `${caption}\n\n✍🏼 BY *${me.username.toUpperCase()}*` : '';
+    // voice:true = a recorded voice note, sent as WhatsApp's push-to-talk bubble.
+    const asVoice = !!body['voice'] && /^audio\//.test(mimetype);
     try {
-      const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username);
+      const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username, asVoice);
       if (messageId) recordSentBy(messageId, me.username);
       logger.info({ user: me.username, chatId, filename, mimetype, messageId }, 'user sent a file');
+      logActivity(me.username, 'send-file', `${filename} -> ${chatId}`, clientIp(req));
       json(res, 200, { ok: true, messageId });
     } catch (err) {
       logger.error({ err, user: me.username, chatId, filename }, 'file send failed');
@@ -1127,6 +1171,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       markDeleted(messageId);
     }
     logger.info({ user: me.username, messageId, everyone }, 'message deleted');
+    logActivity(me.username, 'delete-message', `${everyone ? 'for everyone' : 'for me'} — ${messageId}`, clientIp(req));
     json(res, 200, { ok: true });
     return;
   }
@@ -1154,6 +1199,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (isStar) setStarred(messageId, on);
     else setPinned(messageId, on);
     logger.info({ user: me.username, messageId, action: (on ? '' : 'un') + (isStar ? 'star' : 'pin') }, 'message action');
+    logActivity(me.username, (on ? '' : 'un') + (isStar ? 'star' : 'pin'), messageId, clientIp(req));
     json(res, 200, { ok: true });
     return;
   }
@@ -1177,6 +1223,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     logger.info({ user: me.username, messageId, emoji }, 'reaction sent');
+    logActivity(me.username, 'react', `${emoji || '(removed)'} — ${messageId}`, clientIp(req));
     json(res, 200, { ok: true });
     return;
   }
@@ -1198,6 +1245,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     addIgnoredPhrase(norm, phrase, me.username);
     logger.info({ user: me.username, phrase }, 'phrase added to the ignore list');
+    logActivity(me.username, 'teach-ignore', phrase, clientIp(req));
     json(res, 200, { ok: true });
     return;
   }
@@ -1206,6 +1254,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const norm = normalize(typeof body['phrase'] === 'string' ? (body['phrase'] as string) : '');
     removeIgnoredPhrase(norm);
     logger.info({ user: me.username, norm }, 'phrase removed from the ignore list');
+    logActivity(me.username, 'undo-ignore', norm, clientIp(req));
     json(res, 200, { ok: true });
     return;
   }
@@ -1223,6 +1272,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const n = setOrderNo(ids, orderNo);
     logger.info({ user: me.username, orderNo, messages: n }, 'DDI order number saved');
+    logActivity(me.username, 'ddi-number', `#${orderNo} on ${n} message(s)`, clientIp(req));
     json(res, 200, { ok: true, updated: n });
     return;
   }
@@ -1273,11 +1323,27 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       if (sentId) recordSentBy(sentId, me.username);
       logger.info({ user: me.username, from: msg.chatId, to: toChat, messageId }, 'message forwarded');
+      logActivity(me.username, 'forward', `${msg.chatId} -> ${toChat}`, clientIp(req));
       json(res, 200, { ok: true });
     } catch (err) {
       logger.error({ err, user: me.username, messageId, toChat }, 'forward failed');
       json(res, 500, { ok: false, error: 'Forward failed — check the destination chat before retrying.' });
     }
+    return;
+  }
+  // Match report: every saved order line, searchable by SKU / description / the customer's own
+  // words, date-filterable. Feeds the /report page and its export.
+  if (path === '/api/report') {
+    const q = (u.searchParams.get('q') ?? '').slice(0, 100);
+    const from = Date.parse(u.searchParams.get('from') ?? '') || 0;
+    // "to" is a DATE (inclusive): add a day so 31-07 includes everything ON the 31st.
+    const toRaw = Date.parse(u.searchParams.get('to') ?? '') || 0;
+    const to = toRaw ? toRaw + 86_400_000 - 1 : 0;
+    json(res, 200, reportRows(q, from, to));
+    return;
+  }
+  if (path === '/report') {
+    html(res, reportPage(me));
     return;
   }
   if (path === '/api/products/count') {
@@ -1592,7 +1658,7 @@ function adminPage(me: User): string {
 </style></head><body>
 <header><h1>User Management</h1><span class="who">signed in as <b>${esc(me.username)}</b></span>
   <div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="/activity">Activity</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="wrap">
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
@@ -1740,7 +1806,7 @@ function settingsPage(me: User): string {
   .hint{font-size:11.5px;color:var(--mut);margin-top:4px}
 </style></head><body>
 <header><h1>Settings</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="/activity">Activity</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="wrap">
   <div class="card">
     <h2>Email sending</h2>
@@ -1827,6 +1893,181 @@ el("test").addEventListener("click",async function(){
   b.disabled=false;b.textContent="Send a test email to me";
 });
 load();
+</script></body></html>`;
+}
+
+// --- Match report (all users): how products matched customer requirements, with export ---
+function reportPage(me: User): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Match Report · WhatsApp OMS</title>
+<style>
+  :root{color-scheme:light;--bg:#f0f2f5;--panel:#fff;--line:#e5e7eb;--tx:#111b21;--mut:#667781;--em2:#059669;--blue:#2563eb}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+  header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
+  header h1{font-size:15.5px;margin:0}
+  .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
+  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  .wrap{max-width:1080px;margin:20px auto;padding:0 16px}
+  .bar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .bar input[type=text]{flex:1;min-width:220px;padding:9px 12px;font-size:13.5px;border:1px solid var(--line);border-radius:9px;outline:none}
+  .bar input[type=date]{padding:8px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none}
+  .bar input:focus{border-color:var(--em2)}
+  .btn{padding:9px 16px;font-size:13px;font-weight:600;border-radius:8px;border:1px solid var(--em2);background:#10b981;color:#fff;cursor:pointer}
+  .btn.ghost{background:#fff;color:var(--tx);border-color:var(--line)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .muted{color:var(--mut);font-size:12.5px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:760px}
+  th{background:#f8fafc;text-align:left;padding:9px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--mut);border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:8px 12px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+  tr:last-child td{border-bottom:0}
+  .code{font-family:ui-monospace,Consolas,monospace;font-weight:700;color:var(--blue);white-space:nowrap}
+  .ph{color:var(--mut);overflow-wrap:anywhere}
+  .empty{padding:22px;text-align:center;color:var(--mut)}
+</style></head><body>
+<header><h1>Match Report</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<div class="wrap">
+  <div class="bar">
+    <input type="text" id="q" placeholder="search SKU or description… (e.g. AC, NHC, coupling)" autocomplete="off">
+    <input type="date" id="from" title="From date"><span class="muted">to</span><input type="date" id="to" title="To date">
+    <button class="btn ghost" id="exportbtn" disabled>Export selected (0)</button>
+  </div>
+  <div class="bar"><span class="muted" id="count"></span></div>
+  <div class="card"><div class="scroll"><table><thead><tr>
+    <th style="width:34px"><input type="checkbox" id="all" title="Select everything shown"></th>
+    <th style="width:120px">SKU</th><th>Our product</th><th>Customer wrote</th>
+    <th style="width:50px">Qty</th><th style="width:110px">Date</th><th style="width:90px">Saved by</th><th style="width:100px">DDI #</th>
+  </tr></thead><tbody id="tb"></tbody></table></div></div>
+</div>
+<script>
+function el(id){return document.getElementById(id);}
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
+var rows=[];
+function when(ts){var d=new Date(ts);return d.toLocaleDateString([],{year:"2-digit",month:"short",day:"numeric"});}
+function syncExport(){var n=document.querySelectorAll(".pick:checked").length;var b=el("exportbtn");b.disabled=!n;b.textContent="Export selected ("+n+")";}
+function render(){
+  el("tb").innerHTML=rows.length?rows.map(function(r,i){
+    return '<tr><td><input type="checkbox" class="pick" data-i="'+i+'"></td>'+
+      '<td class="code">'+esc(r.code)+'</td><td>'+esc(r.description)+'</td>'+
+      '<td class="ph">'+esc(r.phrase||"—")+'</td><td>'+esc(r.qty)+'</td>'+
+      '<td class="muted">'+when(r.ts)+'</td><td>'+esc(r.by||"—")+'</td><td>'+esc(r.orderNo||"—")+'</td></tr>';
+  }).join(""):'<tr><td colspan="8" class="empty">No saved order lines match. Try a broader search or a wider date range.</td></tr>';
+  el("all").checked=false;syncExport();
+}
+var loadSeq=0;
+var load=debounce(async function(){
+  var seq=++loadSeq; // a slower older response must never overwrite a newer search
+  var q="q="+encodeURIComponent(el("q").value)+"&from="+el("from").value+"&to="+el("to").value;
+  var d=await(await fetch("/api/report?"+q)).json();
+  if(seq!==loadSeq)return;
+  rows=d.rows||[];
+  el("count").textContent=d.total+" matched line"+(d.total===1?"":"s")+(d.total>rows.length?(" — showing the newest "+rows.length):"");
+  render();
+},250);
+el("q").addEventListener("input",load);
+el("from").addEventListener("change",load);
+el("to").addEventListener("change",load);
+el("all").addEventListener("change",function(){var on=this.checked;document.querySelectorAll(".pick").forEach?document.querySelectorAll(".pick").forEach(function(c){c.checked=on;}):null;syncExport();});
+el("tb").addEventListener("change",function(e){if(e.target.classList.contains("pick"))syncExport();});
+// Export = a CSV of exactly the ticked rows, straight from the browser.
+el("exportbtn").addEventListener("click",function(){
+  var picked=[];document.querySelectorAll(".pick:checked").forEach(function(c){picked.push(rows[+c.dataset.i]);});
+  if(!picked.length)return;
+  var NL=String.fromCharCode(10);
+  var csvq=function(s){s=String(s==null?"":s);return '"'+s.replace(/"/g,'""')+'"';};
+  var csv="SKU,Product,Customer wrote,Qty,Date,Saved by,DDI order"+NL+picked.map(function(r){
+    return [r.code,r.description,r.phrase,r.qty,new Date(r.ts).toLocaleString(),r.by,r.orderNo].map(csvq).join(",");
+  }).join(NL);
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
+  a.download="match-report.csv";document.body.appendChild(a);a.click();a.remove();
+});
+load();
+</script></body></html>`;
+}
+
+// --- Activity log (admin-only): who did what, when — the audit trail ---
+function activityPage(me: User): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Activity · WhatsApp OMS</title>
+<style>
+  :root{color-scheme:light;--bg:#f0f2f5;--panel:#fff;--line:#e5e7eb;--tx:#111b21;--mut:#667781;--em2:#059669;--red:#dc2626}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+  header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
+  header h1{font-size:15.5px;margin:0}
+  .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
+  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  .wrap{max-width:980px;margin:20px auto;padding:0 16px}
+  .bar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .bar select{padding:8px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff;outline:none}
+  .muted{color:var(--mut);font-size:12.5px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{background:#f8fafc;text-align:left;padding:9px 14px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--mut);border-bottom:1px solid var(--line)}
+  td{padding:8px 14px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+  tr:last-child td{border-bottom:0}
+  .act{display:inline-block;background:#eef2f6;border:1px solid var(--line);border-radius:7px;padding:1px 8px;font-size:11.5px;font-weight:700;color:#475569;white-space:nowrap}
+  .act.warn{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
+  .detail{color:var(--mut);overflow-wrap:anywhere}
+  .u{font-weight:700}
+  .more{display:block;width:100%;border:0;background:#f8fafc;border-top:1px solid var(--line);padding:10px;font-size:12.5px;font-weight:600;color:var(--em2);cursor:pointer}
+  .more:hover{background:#f1f5f9}
+  .empty{padding:22px;text-align:center;color:var(--mut)}
+</style></head><body>
+<header><h1>User Activity</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<div class="wrap">
+  <div class="bar">
+    <select id="fUser"><option value="">All users</option></select>
+    <select id="fAction"><option value="">All actions</option></select>
+    <input type="date" id="fFrom" title="From date" style="padding:7px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none">
+    <span class="muted">to</span>
+    <input type="date" id="fTo" title="To date" style="padding:7px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none">
+    <span class="muted" id="count"></span>
+  </div>
+  <div class="card"><table><thead><tr>
+    <th style="width:150px">When</th><th style="width:110px">User</th><th style="width:150px">Action</th><th>Details</th><th style="width:120px">IP</th>
+  </tr></thead><tbody id="tb"></tbody></table><button class="more" id="more" style="display:none">Load older entries</button></div>
+  <p class="muted" style="margin-top:12px">Sends, deletes, forwards, reactions, sign-ins (including failures), order saves, DDI numbers,
+    taught aliases and ignores, user and settings changes — kept for 90 days. Reading chats is not logged.</p>
+</div>
+<script>
+function el(id){return document.getElementById(id);}
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
+var lastId=0,ACTIONS=["login","login-failed","login-new-device","logout","password-changed","send-message","send-file","forward","delete-message","react","star","unstar","pin","unpin","order-saved","ddi-number","teach-alias","teach-ignore","undo-ignore","rename-chat","user-add","user-edit","user-delete","reset-2fa","settings"];
+function when(ts){var d=new Date(ts);return d.toLocaleDateString([],{month:"short",day:"numeric"})+" "+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});}
+function rowHtml(r){
+  var warn=r.action==="login-failed"||r.action==="delete-message"||r.action==="user-delete";
+  return '<tr><td class="muted">'+when(r.ts)+'</td><td class="u">'+esc(r.username)+'</td>'+
+    '<td><span class="act'+(warn?" warn":"")+'">'+esc(r.action)+'</span></td>'+
+    '<td class="detail">'+esc(r.detail||"—")+'</td><td class="muted">'+esc(r.ip||"—")+'</td></tr>';
+}
+async function load(older){
+  var q="limit=100&user="+encodeURIComponent(el("fUser").value)+"&action="+encodeURIComponent(el("fAction").value)
+       +"&from="+el("fFrom").value+"&to="+el("fTo").value;
+  if(older&&lastId)q+="&before="+lastId;
+  var d=await(await fetch("/api/activity?"+q)).json();
+  var rows=d.rows||[];
+  if(!older){el("tb").innerHTML="";lastId=0;}
+  if(rows.length)lastId=rows[rows.length-1].id;
+  el("tb").insertAdjacentHTML("beforeend",rows.map(rowHtml).join("")||(older?"":'<tr><td colspan="5" class="empty">Nothing recorded yet.</td></tr>'));
+  el("count").textContent=d.total+" entr"+(d.total===1?"y":"ies");
+  el("more").style.display=(rows.length===100)?"block":"none";
+  // fill the user filter once
+  if(el("fUser").options.length===1&&d.users)d.users.forEach(function(u){var o=document.createElement("option");o.value=u;o.textContent=u;el("fUser").appendChild(o);});
+  if(el("fAction").options.length===1)ACTIONS.forEach(function(a){var o=document.createElement("option");o.value=a;o.textContent=a;el("fAction").appendChild(o);});
+}
+el("fUser").addEventListener("change",function(){load(false);});
+el("fAction").addEventListener("change",function(){load(false);});
+el("fFrom").addEventListener("change",function(){load(false);});
+el("fTo").addEventListener("change",function(){load(false);});
+el("more").addEventListener("click",function(){load(true);});
+load(false);
 </script></body></html>`;
 }
 
@@ -2158,6 +2399,15 @@ function matchPage(me: User): string {
   .ddirow label{font-size:12px;font-weight:700;color:var(--mut);white-space:nowrap}
   .ddirow input{flex:1;min-width:0;padding:8px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none}
   .ddirow input:focus{border-color:var(--em2)}
+  .ddirow.need label{color:var(--red)}
+  .ddirow.need input{border-color:#fca5a5;background:#fffafa}
+  /* Voice-note recording bar (replaces the composer while recording). */
+  .recbar{display:none;align-items:center;gap:10px;background:var(--panel);border-top:1px solid var(--line);padding:9px 14px}
+  .recbar.on{display:flex}
+  .recdot{width:10px;height:10px;border-radius:50%;background:var(--red);animation:recblink 1s infinite}
+  @keyframes recblink{50%{opacity:.25}}
+  #rectime{font-variant-numeric:tabular-nums;font-weight:700;font-size:13px}
+  .micbtn-rec{color:var(--red)!important}
   /* Quick-react strip on top of the message menu, and the composer emoji panel. */
   .rstrip{display:flex;gap:1px;padding:5px 8px;border-bottom:1px solid var(--line)}
   .rstrip button{font-size:17px;background:none;border:0;cursor:pointer;padding:4px 6px;border-radius:7px;line-height:1;width:auto}
@@ -2222,7 +2472,7 @@ function matchPage(me: User): string {
   .rmfinal:hover{background:#fee2e2;color:#dc2626}
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
-<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span><a class="navlink" href="/report">Report</a>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="/activity">Activity</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="offline" id="offline">
   <div class="offbox">
     <div class="officon" id="officon">⏳</div>
@@ -2241,12 +2491,14 @@ function matchPage(me: User): string {
       <div class="mentionbox" id="mbox"></div>
       <div class="filechip" id="filechip"></div>
       <div class="replybar" id="replybar"><div class="rq"><div class="rqn" id="rqn"></div><div class="rqt" id="rqt"></div></div><button class="rx" id="rx" title="Cancel reply" aria-label="Cancel reply">&#10005;</button></div>
+      <div class="recbar" id="recbar"><span class="recdot"></span><span id="rectime">0:00</span><span class="muted" style="font-size:12px">recording…</span><div class="spacer" style="flex:1"></div><button class="btn ghost" id="reccancel">Cancel</button><button class="btn green" id="recsend">Send voice note</button></div>
       <div class="epanel" id="epanel"></div>
       <div class="composer" id="composer">
         <input type="file" id="cfile" hidden accept="image/*,video/*,audio/*,.pdf,.csv,.xlsx,.xls,.doc,.docx,.txt">
         <button class="attachbtn" id="emojibtn" title="Emoji" aria-label="Insert an emoji" disabled>&#128578;</button>
         <button class="attachbtn" id="attachbtn" title="Attach a file" aria-label="Attach a file" disabled>&#128206;</button>
         <textarea id="cinput" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter for a new line)" disabled></textarea>
+        <button class="attachbtn" id="micbtn" title="Record a voice note" aria-label="Record a voice note" disabled>&#127908;</button>
         <button class="sendbtn" id="sendbtn" disabled title="Send">➤</button>
       </div>
     </div>
@@ -2438,7 +2690,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -2658,7 +2910,13 @@ el("right").addEventListener("click",function(e){
 });
 // Clear = discard the current extraction and reset the right panel (bubbles revert to Extract/Re-Extract).
 // Does NOT touch the database — nothing is un-processed; it just wipes the unsaved working order.
-function clearOrder(){active={};items=[];rebuildSources();renderRight();applyStates();}
+// A message someone SAVED earlier keeps its "Processed by … · DDI #…" badge; only this screen's
+// working state is dropped. And if the order just copied still has no DDI number, warn first —
+// the number is required, not optional.
+function clearOrder(){
+  if(ddiPending()&&!window.confirm("You have not saved the DDI order number for the order you just copied. Leave without it?"))return;
+  lastCopied=[];active={};items=[];rebuildSources();renderRight();applyStates();
+}
 // Clipboard with a fallback: the async API is blocked in some browsers/policies, so fall back to a
 // hidden textarea + execCommand. Returns false only when BOTH fail, which the caller must respect.
 async function copyText(s){
@@ -2678,6 +2936,18 @@ async function copyCsv(){
   var rows=items.filter(function(it){return it.chosen;});
   // Nothing resolved → don't copy an empty order and (crucially) don't mark messages processed.
   if(!rows.length){var cb=el("copybtn");if(cb){var o=cb.textContent;cb.textContent="Resolve a product first";setTimeout(function(){cb.textContent=o;},1600);}return;}
+  // Already saved by someone? Ask BEFORE touching anything. Cancel leaves the old save — who
+  // saved it, its DDI number, everything — exactly as it was.
+  var midsPre=Object.keys(active),prevMid=null;
+  for(var pi=0;pi<midsPre.length;pi++){if(proc[midsPre[pi]]){prevMid=midsPre[pi];break;}}
+  if(prevMid){
+    var pwho=procBy[prevMid]||"someone",pno=orderNos[prevMid];
+    var q="This order was already saved by "+pwho+(pno?(" with DDI order #"+pno):" (no DDI order number yet)")+".";
+    q+=String.fromCharCode(10)+String.fromCharCode(10)+"Save it again? OK replaces who saved it";
+    q+=pno?" — the DDI number stays until you type a new one.":".";
+    q+=" Cancel keeps everything as it is.";
+    if(!window.confirm(q))return;
+  }
   var csv=rows.map(function(it){return (it.quantity||"1")+","+it.chosen.code;}).join("\\n");
   // The clipboard can refuse (permission, unfocused page, browser policy). If it does we must NOT
   // mark the order Processed — otherwise staff paste nothing and the order silently looks done.
@@ -2695,15 +2965,24 @@ async function copyCsv(){
   // Keep the panel exactly as-is — just flash the button. The copy + "mark Processed" still happen (above);
   // we only skip the reset so the extracted order stays visible after copying.
   var cb=el("copybtn");if(cb){cb.textContent="Copied ✓";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},1600);}
-  // The sales rep now pastes into DDI and gets an order number back — give them the box for it.
+  // The sales rep now pastes into DDI and gets an order number back — the box is REQUIRED from
+  // here: it stays highlighted (and Clear warns) until the number is saved. On a resave the
+  // existing number is prefilled so they keep it or type the new one.
   lastCopied=mids;syncDdiRow();
-  var di=el("ddino");if(di)di.focus();
+  var di=el("ddino");if(di){di.value=(prevMid&&orderNos[prevMid])||"";di.focus();}
   applyStates();
 }
 // The "DDI order #" box shows only once an order has been copied (that is when DDI hands out
 // the number). Saving stamps it on every message of that copy, so the thread badge reads
-// "Processed by Nate · DDI #12345".
-function syncDdiRow(){var r=el("ddirow");if(!r)return;r.style.display=lastCopied.length?"flex":"none";}
+// "Processed by Nate · DDI #12345". While any copied message still has no number, the box is
+// marked required.
+function ddiPending(){return lastCopied.length>0&&lastCopied.some(function(m){return !orderNos[m];});}
+function syncDdiRow(){
+  var r=el("ddirow");if(!r)return;
+  r.style.display=lastCopied.length?"flex":"none";
+  r.classList.toggle("need",ddiPending());
+  var lb=r.querySelector("label");if(lb)lb.textContent=ddiPending()?"DDI order # (required)":"DDI order #";
+}
 async function saveDdiNo(){
   var no=(el("ddino")?el("ddino").value:"").trim();
   if(!lastCopied.length)return;
@@ -2711,7 +2990,7 @@ async function saveDdiNo(){
   try{
     var d=await(await fetch("/api/processed/order-no",{method:"POST",headers:{"content-type":"application/json"},
       body:JSON.stringify({messageIds:lastCopied,orderNo:no})})).json();
-    if(d.ok){lastCopied.forEach(function(m){orderNos[m]=no;});toast("DDI order #"+no+" saved");applyStates();}
+    if(d.ok){lastCopied.forEach(function(m){orderNos[m]=no;});toast("DDI order #"+no+" saved");syncDdiRow();applyStates();}
     else toast(d.error||"Could not save",true);
   }catch(e){toast("Network error — not saved",true);}
 }
@@ -2814,6 +3093,7 @@ function syncComposer(){
   el("cinput").disabled=!on;
   el("attachbtn").disabled=!on;
   el("emojibtn").disabled=!on;
+  el("micbtn").disabled=!on;
   if(!on)el("epanel").classList.remove("on");
   el("sendbtn").disabled=!on||(!el("cinput").value.trim()&&!pendingFile); // a file alone is sendable
 }
@@ -2848,6 +3128,66 @@ async function sendFile(caption){
   sending=false;el("sendbtn").textContent="➤";syncComposer();
 }
 el("sendbtn").addEventListener("click",sendMsg);
+
+// --- voice notes: record with the mic, send as WhatsApp's push-to-talk bubble ---
+var recStream=null,recorder=null,recChunks=[],recTimer=null,recT0=0;
+function recStop(keep){
+  clearInterval(recTimer);recTimer=null;
+  if(recorder&&recorder.state!=="inactive"){recorder._keep=keep;recorder.stop();}
+  else recCleanup();
+}
+function recCleanup(){
+  if(recStream){recStream.getTracks().forEach(function(t){t.stop();});recStream=null;}
+  recorder=null;
+  el("recbar").classList.remove("on");
+  el("micbtn").classList.remove("micbtn-rec");
+  el("composer").style.display="";
+}
+async function recStart(){
+  if(!curChat||sending)return;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast("This browser cannot record audio.",true);return;}
+  try{recStream=await navigator.mediaDevices.getUserMedia({audio:true});}
+  catch(e){toast("Microphone not available — allow it in the browser.",true);return;}
+  // Opus is what WhatsApp voice notes use; webm is the container Chrome records it in.
+  var mt=window.MediaRecorder&&MediaRecorder.isTypeSupported("audio/webm;codecs=opus")?"audio/webm;codecs=opus":"";
+  try{recorder=mt?new MediaRecorder(recStream,{mimeType:mt}):new MediaRecorder(recStream);}
+  catch(e){toast("Recording is not supported here.",true);recCleanup();return;}
+  recChunks=[];
+  recorder.ondataavailable=function(ev){if(ev.data&&ev.data.size)recChunks.push(ev.data);};
+  recorder.onstop=function(){
+    var keep=recorder&&recorder._keep;
+    var blob=keep&&recChunks.length?new Blob(recChunks,{type:(recorder&&recorder.mimeType)||"audio/webm"}):null;
+    recCleanup();
+    if(blob)sendVoice(blob);
+  };
+  recorder.start(250);
+  recT0=Date.now();
+  el("rectime").textContent="0:00";
+  recTimer=setInterval(function(){
+    var s=Math.floor((Date.now()-recT0)/1000);
+    el("rectime").textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0");
+    if(s>=120){toast("Voice notes are capped at 2 minutes — sending.");recStop(true);} // keep uploads sane
+  },250);
+  el("recbar").classList.add("on");
+  el("micbtn").classList.add("micbtn-rec");
+  el("composer").style.display="none";
+}
+async function sendVoice(blob){
+  if(!curChat)return;
+  sending=true;syncComposer();
+  try{
+    var b64=await new Promise(function(res2,rej){var r=new FileReader();r.onload=function(){var s=String(r.result);var i=s.indexOf(",");res2(i>=0?s.slice(i+1):s);};r.onerror=rej;r.readAsDataURL(blob);});
+    var r2=await fetch("/api/send-media",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({chatId:curChat,filename:"voice-note.webm",mimetype:blob.type||"audio/webm",data:b64,caption:"",voice:true})});
+    var d=await r2.json();
+    if(d.ok){toast("Voice note sent");lastSig="";refreshThread();}
+    else toast(d.error||"Could not send the voice note",true);
+  }catch(e){toast("Network error — the voice note may not have been sent.",true);}
+  sending=false;syncComposer();
+}
+el("micbtn").addEventListener("click",function(){if(el("recbar").classList.contains("on"))recStop(true);else recStart();});
+el("reccancel").addEventListener("click",function(){recStop(false);});
+el("recsend").addEventListener("click",function(){recStop(true);});
 
 // --- emoji picker: searchable, most-used first, shared by the composer AND reactions ---
 // Each entry: [emoji, search keywords]. Keywords are what the search box matches against.

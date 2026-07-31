@@ -205,12 +205,12 @@ function main(): void {
     }
   },
   (messageId) => client.media(messageId),
-  async (chatId, file, caption, mentions, sentBy) => {
+  async (chatId, file, caption, mentions, sentBy, asVoice) => {
     // Same attribution path as a text send: the id that comes back is unusable on @lid chats,
     // so queue the sender and let the message_create event claim it.
     if (sentBy) queueSend(chatId, sentBy);
     try {
-      return await client.sendMedia(chatId, file, caption, mentions);
+      return await client.sendMedia(chatId, file, caption, mentions, sentBy, asVoice);
     } catch (err) {
       claimSend(chatId);
       throw err;
