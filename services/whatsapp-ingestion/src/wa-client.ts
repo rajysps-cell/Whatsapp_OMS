@@ -25,6 +25,10 @@ export interface WaClient {
    * Permission (who may delete what) is the caller's job — this just performs it.
    */
   del: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>;
+  /** Star/unstar a message in the linked WhatsApp account (shows under Starred on the phone). */
+  star: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
+  /** Pin/unpin a message in the chat — visible to everyone in it, like WhatsApp's own pin. */
+  pin: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
   /** Send a file (image / document / etc.) with an optional caption. Human-initiated only. */
   sendMedia: (
     chatId: string,
@@ -429,6 +433,64 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     return { ok: true };
   }
 
+  /**
+   * Star or pin a message via the page's own modules. Same story as deleteMsg: the library's
+   * Message.star()/pin() look the message up with Msg.get(serializedId), broken on @lid chats,
+   * so the model is found with the rebuilt-id scan and then the SAME actions the library would
+   * call are issued (Cmd.sendStarMsgs / WAWebSendPinMessageAction.sendPinInChatMsg).
+   */
+  async function msgAction(
+    c: InstanceType<typeof Client>,
+    messageId: string,
+    action: 'star' | 'unstar' | 'pin' | 'unpin',
+  ): Promise<{ ok: boolean; reason?: string }> {
+    const page = c.pupPage;
+    if (!page) return { ok: false, reason: 'browser page not available' };
+    const res = (await page.evaluate(`(async () => {
+      const ID = ${JSON.stringify(messageId)};
+      const ACTION = ${JSON.stringify(action)};
+      const coll = window.require('WAWebCollections');
+      const rebuilt = (m) => {
+        if (!m.id) return '';
+        if (m.id._serialized) return m.id._serialized;
+        const rem = m.id.remote ? (m.id.remote._serialized || String(m.id.remote)) : '';
+        return String(!!m.id.fromMe) + '_' + rem + '_' + m.id.id;
+      };
+      const msg = coll.Msg.getModelsArray().find((m) => rebuilt(m) === ID);
+      if (!msg) return { err: 'message not in memory (too old for this action)' };
+      const remote = msg.id.remote ? (msg.id.remote._serialized || String(msg.id.remote)) : '';
+      const chat = coll.Chat.get(msg.id.remote) || coll.Chat.get(remote) || (await coll.Chat.find(msg.id.remote));
+      if (!chat) return { err: 'chat not found' };
+      if (ACTION === 'star' || ACTION === 'unstar') {
+        if (!window.require('WAWebMsgActionCapability').canStarMsg(msg)) return { err: 'WhatsApp does not allow starring this message' };
+        const { Cmd } = window.require('WAWebCmd');
+        if (ACTION === 'star') await Cmd.sendStarMsgs(chat, [msg], false);
+        else await Cmd.sendUnstarMsgs(chat, [msg], false);
+        return { done: true };
+      }
+      // Pin: WhatsApp pins carry an expiry; 7 days is WhatsApp's own default choice. The constant
+      // patch mirrors the library's pinUnpinMsgAction (1 = pin, 2 = unpin).
+      const DURATION = 604800;
+      const constants = window.require('WAWebPinMsgConstants');
+      const original = constants.getPinExpiryDuration;
+      constants.getPinExpiryDuration = () => DURATION;
+      try {
+        const r = await window.require('WAWebSendPinMessageAction')
+          .sendPinInChatMsg(msg, ACTION === 'pin' ? 1 : 2, DURATION);
+        if (r && r.messageSendResult && r.messageSendResult !== 'OK') return { err: 'WhatsApp refused: ' + r.messageSendResult };
+        return { done: true };
+      } finally {
+        constants.getPinExpiryDuration = original;
+      }
+    })()`)) as { done?: boolean; err?: string };
+    if (!res?.done) {
+      logger.warn({ messageId, action, reason: res?.err ?? 'empty result' }, 'message action failed');
+      return { ok: false, reason: res?.err ?? `${action} failed` };
+    }
+    logger.info({ messageId, action }, 'message action done');
+    return { ok: true };
+  }
+
   // Read the full chat list + real names from WhatsApp Web's IndexedDB ('model-storage').
   // whatsapp-web.js's Store-injection APIs (getChats etc.) are broken against current WhatsApp Web,
   // but the page's own persisted data is directly readable. Message BODIES are encrypted at rest
@@ -499,6 +561,8 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
       return id;
     },
     del: (messageId: string, everyone: boolean) => deleteMsg(client, messageId, everyone),
+    star: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'star' : 'unstar'),
+    pin: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'pin' : 'unpin'),
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions): Promise<string> => {
       const media = new MessageMedia(file.mimetype, file.data, file.filename);

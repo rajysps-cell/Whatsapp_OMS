@@ -216,7 +216,9 @@ function main(): void {
       throw err;
     }
   },
-  (messageId, everyone) => client.del(messageId, everyone));
+  (messageId, everyone) => client.del(messageId, everyone),
+  (messageId, on) => client.star(messageId, on),
+  (messageId, on) => client.pin(messageId, on));
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 

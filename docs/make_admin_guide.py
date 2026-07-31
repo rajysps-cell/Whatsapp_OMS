@@ -282,14 +282,22 @@ def build():
                "tagged in WhatsApp and receives a notification.", BODY)]
 
     s += [para("The message menu", H2),
-          para("<b>Right-click</b> any message (on a phone: <b>press and hold</b>) for the same "
-               "actions WhatsApp gives you:", BODY),
+          para("Hover over any message and click the small <b>&#9662;</b> arrow in its corner "
+               "(on a phone the arrow is always visible — or press and hold). Right-click works "
+               "too. The menu has the same actions WhatsApp gives you:", BODY),
           table([
             ["Action", "What it does"],
             ["<b>Reply</b>", "Quotes that message above your reply, like WhatsApp."],
             ["<b>Copy</b>", "Copies the message text to your clipboard."],
             ["<b>Forward</b>", "Sends a copy to another chat you pick. It goes out signed with "
                                "YOUR username, like any message you send."],
+            ["<b>Star</b>", "Stars the message in the linked WhatsApp account (it appears under "
+                            "Starred on the phone) and shows a small ★ on it here."],
+            ["<b>Pin</b>", "Pins the message in the chat for 7 days, like WhatsApp — everyone in "
+                           "the chat sees the pin. A bar above the conversation shows the pinned "
+                           "message; click it to jump there."],
+            ["<b>Download</b>", "On photos, voice notes and files: saves the file to your "
+                                "computer under its original name."],
             ["<b>Delete</b>", "Only appears on messages <b>you</b> sent from this system. "
                               "<b>Delete for everyone</b> removes it from the WhatsApp chat for "
                               "all members (WhatsApp only allows this for a while after sending). "
@@ -569,10 +577,11 @@ def build_user():
           para("Type in the box at the bottom and press <b>Enter</b>. Use <b>Shift + Enter</b> for "
                "a new line. To tag someone, type <font face='Courier-Bold'>@</font> and pick their "
                "name from the list — they get a notification.", BODY),
-          para("<b>Right-click</b> a message (press and hold on a phone) to <b>Reply</b>, "
-               "<b>Copy</b>, <b>Forward</b> to another chat, or <b>Delete</b> — Delete only "
-               "appears on messages you sent yourself, and “for everyone” also removes "
-               "it from the real WhatsApp chat.", BODY),
+          para("Click the small <b>&#9662;</b> arrow on any message (or right-click / press and "
+               "hold) to <b>Reply</b>, <b>Copy</b>, <b>Forward</b>, <b>Star</b>, <b>Pin</b>, "
+               "<b>Download</b> a photo or file, or <b>Delete</b> — Delete only appears on "
+               "messages you sent yourself, and “for everyone” also removes it from the real "
+               "WhatsApp chat.", BODY),
           para("Your replies are signed with your username automatically, so everyone can see who "
                "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
 

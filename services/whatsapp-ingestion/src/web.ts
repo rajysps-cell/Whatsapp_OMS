@@ -61,10 +61,13 @@ import {
   markDeleted,
   markRevoked,
   mentionNames,
+  pinnedMessage,
   recordSentBy,
   saveExtraction,
   sentByOf,
   setChatName,
+  setPinned,
+  setStarred,
   updateAliasText,
 } from './store';
 
@@ -91,6 +94,9 @@ let sendMessageFn:
   | null = null;
 /** Injected by index.ts so a user can delete their own sent messages (for me / for everyone). */
 let deleteFn: ((messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+/** Injected by index.ts: star/unstar and pin/unpin in the real WhatsApp. */
+let starFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+let pinFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -433,6 +439,8 @@ export function startWebServer(
     sentBy?: string,
   ) => Promise<string>,
   del?: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>,
+  star?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
+  pin?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
@@ -440,6 +448,8 @@ export function startWebServer(
   mediaFn = media ?? null;
   sendMediaFn = sendMedia ?? null;
   deleteFn = del ?? null;
+  starFn = star ?? null;
+  pinFn = pin ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -783,9 +793,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const safe = mediaCacheKey(id);
     const dir = mediaCacheDir();
     // Content-Disposition so a document saves under the name the customer sent it with, instead of
-    // "false_1203...@g.us_3EB0....pdf". inline keeps images and audio rendering in the page.
-    const disposition = (name?: string): Record<string, string> =>
-      name ? { 'content-disposition': `inline; filename*=UTF-8''${encodeURIComponent(name)}` } : {};
+    // "false_1203...@g.us_3EB0....pdf". inline keeps images and audio rendering in the page;
+    // ?dl=1 (the menu's Download) switches to attachment so the browser saves instead of opening.
+    const asDownload = u.searchParams.get('dl') === '1';
+    const disposition = (name?: string): Record<string, string> => {
+      const kind = asDownload ? 'attachment' : 'inline';
+      if (name) return { 'content-disposition': `${kind}; filename*=UTF-8''${encodeURIComponent(name)}` };
+      return asDownload ? { 'content-disposition': 'attachment' } : {};
+    };
     try {
       const hit = fs.readdirSync(dir).find((f) => f.startsWith(safe + '.') && !f.endsWith('.name'));
       if (hit) {
@@ -796,6 +811,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         } catch {
           /* no original filename recorded */
         }
+        // Downloads always need SOME filename with the right extension, or the browser saves an
+        // extension-less blob named after the URL.
+        if (!name && asDownload) name = `whatsapp-${Date.now()}.${hit.split('.').pop()}`;
         res.writeHead(200, {
           'content-type': mimeFromExt(hit),
           'cache-control': 'private, max-age=86400',
@@ -828,7 +846,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       'content-type': got.mimetype,
       'cache-control': 'private, max-age=86400',
       'content-length': bytes,
-      ...disposition(got.filename),
+      ...disposition(got.filename ?? (asDownload ? `whatsapp-${Date.now()}.${extFromMime(got.mimetype)}` : undefined)),
     });
     res.end(Buffer.from(got.data, 'base64'));
     return;
@@ -855,7 +873,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy })),
+      pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned })),
     });
     return;
   }
@@ -1000,6 +1019,33 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       markDeleted(messageId);
     }
     logger.info({ user: me.username, messageId, everyone }, 'message deleted');
+    json(res, 200, { ok: true });
+    return;
+  }
+  // Star / pin, mirrored into the real WhatsApp. Any signed-in user may do these — unlike delete
+  // they are additive and reversible, and WhatsApp itself lets any group member pin/star.
+  if ((path === '/api/messages/star' || path === '/api/messages/pin') && req.method === 'POST') {
+    const isStar = path.endsWith('/star');
+    const fn = isStar ? starFn : pinFn;
+    if (!fn || status !== 'connected') {
+      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+      return;
+    }
+    const body = await readBody(req);
+    const messageId = typeof body['messageId'] === 'string' ? (body['messageId'] as string) : '';
+    const on = !!body['on'];
+    if (!messageId || !getMessage(messageId)) {
+      json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    const r = await fn(messageId, on);
+    if (!r.ok) {
+      json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused.' });
+      return;
+    }
+    if (isStar) setStarred(messageId, on);
+    else setPinned(messageId, on);
+    logger.info({ user: me.username, messageId, action: (on ? '' : 'un') + (isStar ? 'star' : 'pin') }, 'message action');
     json(res, 200, { ok: true });
     return;
   }
@@ -1648,6 +1694,22 @@ function matchPage(me: User): string {
     color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:80;pointer-events:none}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast.bad{background:var(--red)}
+  /* The ⌄ that opens the message menu. Hidden until hover on mouse devices, always shown where
+     there is no hover — before this, nothing on screen said the menu existed at all. */
+  .mbtn{position:absolute;top:2px;right:3px;z-index:2;width:22px;height:20px;border:0;border-radius:6px;
+    background:inherit;color:var(--mut);font-size:14px;line-height:18px;cursor:pointer;opacity:0;
+    transition:opacity .12s;box-shadow:-6px 0 8px -2px inherit}
+  .bubble:hover .mbtn,.mbtn:focus{opacity:1}
+  @media (hover:none){.mbtn{opacity:.55}}
+  .starred{color:#f59e0b;margin-right:4px;font-size:11px}
+  /* Pinned-message bar above the thread, like WhatsApp's. Click scrolls to the message. */
+  .pinbar{display:none;align-items:center;gap:8px;background:var(--panel);border-bottom:1px solid var(--line);
+    padding:6px 12px;cursor:pointer;min-width:0}
+  .pinbar.on{display:flex}
+  .pinbar .pico{flex:none;color:var(--em2);font-size:13px}
+  .pinbar .ptxt{flex:1;min-width:0;font-size:12.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pinbar .ptxt b{color:var(--tx);font-weight:600}
+  .bubble.flash{outline:2px solid var(--em);outline-offset:2px;transition:outline-color 1s}
   /* @mention: WhatsApp renders these as non-clickable coloured text (read-only here by design). */
   .mn{color:#027eb5;font-weight:500}
   /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
@@ -1823,6 +1885,7 @@ function matchPage(me: User): string {
     <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off"><div class="chatlist" id="chatlist"></div></div>
     <div class="thread">
       <div class="threadhead"><button class="backchat" id="tolist" title="All chats" aria-label="Back to all chats">&#8592;</button><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
+      <div class="pinbar" id="pinbar"></div>
       <div class="msgs" id="msgs"><div class="placeholder">Pick a conversation on the left.</div></div>
       <div class="mentionbox" id="mbox"></div>
       <div class="filechip" id="filechip"></div>
@@ -1968,10 +2031,13 @@ msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // 
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
 var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
-var inner=nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+// ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
+var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
+var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
+var inner=arrow+nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
-function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0;for(var i=0;i<ms.length;i++)rc+=(ms[i].reactions?ms[i].reactions.length:0);return ms.length+"|"+last.messageId+"|"+rc;}
-async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
+function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
 async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];setLive(d.status);renderChats();}catch(e){setLive("offline");}}
@@ -2018,7 +2084,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -2057,7 +2123,11 @@ async function toggleExtract(mid){
   finally{if(b)b.classList.remove("busy");applyStates();}
 }
 // Whole bubble is the extract trigger (button included, since it lives inside .xable).
-el("msgs").addEventListener("click",function(e){var b=e.target.closest(".xable");if(b&&!b.classList.contains("busy"))toggleExtract(b.dataset.mid);});
+el("msgs").addEventListener("click",function(e){
+  // The ⌄ arrow opens the message menu — the visible way in; right-click/long-press still work.
+  var mb=e.target.closest(".mbtn");
+  if(mb){e.stopPropagation();var r=mb.getBoundingClientRect();showMenu(mb.closest(".bubble").dataset.mid,r.left,r.bottom+4);return;}
+  var b=e.target.closest(".xable");if(b&&!b.classList.contains("busy"))toggleExtract(b.dataset.mid);});
 // Jump between extracted/processed messages in a long thread.
 var navIdx=-1;
 function navExtracted(dir){var list=Array.prototype.slice.call(document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done"));if(!list.length)return;navIdx+=dir;if(navIdx<0)navIdx=list.length-1;if(navIdx>=list.length)navIdx=0;var t=list[navIdx];t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.remove("flash");void t.offsetWidth;t.classList.add("flash");}
@@ -2319,6 +2389,19 @@ el("sendbtn").addEventListener("click",sendMsg);
 // --- WhatsApp-style message menu: right-click a bubble on desktop, long-press on phones ---
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},2600);}
 function clearReply(){replyTo=null;el("replybar").className="replybar";}
+// Pinned bar above the thread, like WhatsApp's: newest pinned message, click scrolls to it.
+function renderPinBar(p){
+  var bar=el("pinbar");
+  if(!p){bar.className="pinbar";bar.innerHTML="";bar.onclick=null;return;}
+  var label=p.body?stripSig(p.body):("["+(p.kind||"media")+"]");
+  bar.innerHTML='<span class="pico">&#128204;</span><span class="ptxt"><b>Pinned</b> &nbsp;'+esc(label.slice(0,140))+'</span>';
+  bar.className="pinbar on";
+  bar.onclick=function(){
+    var t=document.querySelector('.msgs .bubble[data-mid="'+(window.CSS&&CSS.escape?CSS.escape(p.msgId):p.msgId)+'"]');
+    if(t){t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.add("flash");setTimeout(function(){t.classList.remove("flash");},1200);}
+    else toast("That message is further back than this view loads.",true);
+  };
+}
 function startReply(mid){
   var m=msgIndex[mid];if(!m)return;
   var who=isOut(m)?"You":(m.pushName||jidName(m.sender)||"Customer");
@@ -2381,12 +2464,16 @@ function doDelete(everyone){
 }
 el("delme").addEventListener("click",function(){doDelete(false);});
 el("deleveryone").addEventListener("click",function(){doDelete(true);});
+var MEDIA_KINDS=["image","video","audio","voice","document","sticker","ptv"];
 function showMenu(mid,x,y){
   var m=msgIndex[mid];if(!m)return;
   var mine=isOut(m)&&m._sby&&String(m._sby).toLowerCase()===meUser.toLowerCase();
   var h='<button data-act="reply">&#8617;&nbsp; Reply</button>'
        +'<button data-act="copy">&#128203;&nbsp; Copy</button>'
-       +'<button data-act="forward">&#10150;&nbsp; Forward</button>';
+       +'<button data-act="forward">&#10150;&nbsp; Forward</button>'
+       +'<button data-act="star">'+(m.starred?'&#9734;&nbsp; Unstar':'&#9733;&nbsp; Star')+'</button>'
+       +'<button data-act="pin">'+(m.pinned?'&#128204;&nbsp; Unpin':'&#128204;&nbsp; Pin')+'</button>';
+  if(MEDIA_KINDS.indexOf(m.kind||"")>=0)h+='<button data-act="download">&#11015;&nbsp; Download</button>';
   // Own messages only, enforced again server-side: the menu simply does not offer Delete on
   // anything the DB does not attribute to this login.
   if(mine)h+='<div class="sep"></div><button data-act="delete" class="danger">&#128465;&nbsp; Delete</button>';
@@ -2396,12 +2483,30 @@ function showMenu(mid,x,y){
   menu.style.top=Math.min(y,window.innerHeight-mh-8)+"px";
 }
 function hideMenu(){el("ctxmenu").className="ctxmenu";}
+function starPin(mid,which){
+  var m=msgIndex[mid];if(!m)return;
+  var on=which==="star"?!m.starred:!m.pinned;
+  fetch("/api/messages/"+which,{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({messageId:mid,on:on})}).then(function(r){return r.json();}).then(function(d){
+      if(d.ok){toast((on?"":"Un")+(which==="star"?"starred":"pinned"));lastSig="";refreshThread();}
+      else{toast(d.error||"Could not do that",true);}
+    }).catch(function(){toast("Network error",true);});
+}
+function downloadMedia(mid){
+  // ?dl=1 makes the server answer with attachment disposition, so the browser saves the file
+  // under its real name instead of opening it.
+  var a=document.createElement("a");a.href="/api/media/"+encodeURIComponent(mid)+"?dl=1";a.download="";
+  document.body.appendChild(a);a.click();a.remove();
+}
 el("ctxmenu").addEventListener("click",function(e){
   var b=e.target.closest("[data-act]");if(!b)return;
   var mid=menuMid;hideMenu();
   if(b.dataset.act==="reply")startReply(mid);
   else if(b.dataset.act==="copy")copyMsg(mid);
   else if(b.dataset.act==="forward")openForward(mid);
+  else if(b.dataset.act==="star")starPin(mid,"star");
+  else if(b.dataset.act==="pin")starPin(mid,"pin");
+  else if(b.dataset.act==="download")downloadMedia(mid);
   else if(b.dataset.act==="delete")openDelete(mid);
 });
 document.addEventListener("click",function(e){if(!e.target.closest("#ctxmenu"))hideMenu();});

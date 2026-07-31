@@ -77,6 +77,11 @@ for (const [table, col] of [
   // Tombstone, NOT a row delete: history backfill re-INSERTs on every reconnect (INSERT OR
   // IGNORE), so a deleted row would quietly come back. A flagged row stays put and stays hidden.
   ['messages', 'deleted INTEGER NOT NULL DEFAULT 0'],
+  // Star/pin state as this app last set it. Deliberately OUR record, not a live mirror of
+  // WhatsApp: stars applied on a phone do not sync back, and that is fine — this drives the UI
+  // badges for actions taken here. pinned holds the pin timestamp (0 = not pinned).
+  ['messages', 'starred INTEGER NOT NULL DEFAULT 0'],
+  ['messages', 'pinned INTEGER NOT NULL DEFAULT 0'],
 ] as const) {
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
@@ -136,6 +141,22 @@ export function markRevoked(msgId: string): void {
   db.prepare("UPDATE messages SET kind = 'revoked', body = '' WHERE msg_id = ?").run(msgId);
 }
 
+export function setStarred(msgId: string, on: boolean): void {
+  db.prepare('UPDATE messages SET starred = ? WHERE msg_id = ?').run(on ? 1 : 0, msgId);
+}
+
+export function setPinned(msgId: string, on: boolean): void {
+  db.prepare('UPDATE messages SET pinned = ? WHERE msg_id = ?').run(on ? Date.now() : 0, msgId);
+}
+
+/** The most recently pinned, still-visible message of a chat — drives the banner above the thread. */
+export function pinnedMessage(chatId: string): { msgId: string; body: string; kind: string } | null {
+  const r = db
+    .prepare('SELECT msg_id, body, kind FROM messages WHERE chat_id = ? AND pinned > 0 AND deleted = 0 ORDER BY pinned DESC LIMIT 1')
+    .get(chatId) as { msg_id: string; body: string | null; kind: string } | undefined;
+  return r ? { msgId: r.msg_id, body: r.body ?? '', kind: r.kind } : null;
+}
+
 // Who completed each message in a chat, for the "Processed by …" badge in the thread.
 const chatProcessedStmt = db.prepare(
   'SELECT p.message_id AS id, p.processed_by AS who FROM processed p ' +
@@ -184,8 +205,8 @@ const SYSTEM_KINDS = [
   'interactive',
 ];
 const chatMsgsStmt = db.prepare(`
-  SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender FROM (
-    SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender
+  SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned FROM (
+    SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned
     FROM messages
     WHERE chat_id = ?
       AND deleted = 0
@@ -324,6 +345,9 @@ export interface MsgRow {
   processedBy?: string;
   /** Username who sent this message from the app (recorded at send time). */
   sentBy?: string;
+  /** Starred/pinned from this app (drives the badges; phone-side stars do not sync back). */
+  starred?: boolean;
+  pinned?: boolean;
 }
 
 // --- @mention names ------------------------------------------------------------------
@@ -566,6 +590,8 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     replySender: r.reply_sender ?? undefined,
     processedBy: byMap.get(r.msg_id),
     sentBy: sentMap.get(r.msg_id),
+    starred: !!(r as unknown as { starred?: number }).starred,
+    pinned: !!(r as unknown as { pinned?: number }).pinned,
   }));
 }
 
