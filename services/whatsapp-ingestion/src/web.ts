@@ -2125,10 +2125,16 @@ function matchPage(me: User): string {
   .rstrip{display:flex;gap:1px;padding:5px 8px;border-bottom:1px solid var(--line)}
   .rstrip button{font-size:17px;background:none;border:0;cursor:pointer;padding:4px 6px;border-radius:7px;line-height:1;width:auto}
   .rstrip button:hover{background:var(--bg);transform:scale(1.15)}
-  .epanel{display:none;grid-template-columns:repeat(10,1fr);gap:2px;background:var(--panel);border-top:1px solid var(--line);padding:8px 12px;max-height:168px;overflow-y:auto}
-  .epanel.on{display:grid}
-  .epanel button{font-size:19px;background:none;border:0;cursor:pointer;padding:5px 0;border-radius:7px;line-height:1.2}
-  .epanel button:hover{background:var(--bg)}
+  .epanel{display:none;background:var(--panel);border-top:1px solid var(--line);max-height:230px;overflow-y:auto}
+  .epanel.on{display:block}
+  .esearchwrap{position:sticky;top:0;background:var(--panel);padding:8px 12px 6px;z-index:2}
+  #esearch{width:100%;padding:7px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none}
+  #esearch:focus{border-color:var(--em2)}
+  #egrid{display:grid;grid-template-columns:repeat(10,1fr);gap:2px;padding:2px 12px 10px}
+  #egrid button{font-size:19px;background:none;border:0;cursor:pointer;padding:5px 0;border-radius:7px;line-height:1.2}
+  #egrid button:hover{background:var(--bg)}
+  .ehead{grid-column:1/-1;font-size:10px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;padding:6px 2px 2px}
+  .enone{grid-column:1/-1;color:var(--mut);font-size:12.5px;padding:10px 2px}
   .row .top:hover{background:#f9fbfd}
   .qty{width:44px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:4px 3px;font-size:13px;font-weight:600;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
@@ -2138,12 +2144,16 @@ function matchPage(me: User): string {
   .lno{flex:none;min-width:18px;height:18px;line-height:18px;text-align:center;border-radius:9px;background:var(--bg);border:1px solid var(--line);color:var(--mut);font-size:10px;font-weight:600}
   .unitchip{background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
   .matchip{background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
-  /* Product and the customer's wording side by side, but NOTHING gets cut off — the client was
-     clear: "I want to be able to see everything." Long text wraps to more lines instead of
-     ellipsising, so a row grows taller when it needs to. */
-  .pinfo{flex:1;min-width:0;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 7px}
-  .pmain{flex:0 1 auto;min-width:0;font-size:13px;line-height:1.35;overflow-wrap:anywhere}
-  .cust{flex:1 1 auto;min-width:0;font-size:10.5px;color:var(--mut);margin-top:0;line-height:1.3;overflow-wrap:anywhere}
+  /* Template shape on every row: product line, then "Customer Require ->" on its OWN line.
+     Nothing shares a line and nothing is cut off — long text wraps and the row grows. */
+  .pinfo{flex:1;min-width:0}
+  .pmain{min-width:0;font-size:13px;line-height:1.35;overflow-wrap:anywhere}
+  .pmain.nopick{color:#b45309;font-style:italic}
+  .cust{display:block;min-width:0;font-size:11px;color:var(--mut);margin-top:3px;line-height:1.35;overflow-wrap:anywhere}
+  .creq{font-weight:700;color:#64748b;text-transform:uppercase;font-size:9.5px;letter-spacing:.4px}
+  .addinline{flex:none;width:20px;height:20px;margin-top:1px;border:1px solid var(--line);border-radius:6px;background:#fff;
+    color:var(--em2);font-size:14px;line-height:1;font-weight:700;cursor:pointer;padding:0}
+  .addinline:hover{border-color:var(--em2);background:#f2fbf5}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
@@ -2449,17 +2459,20 @@ el("chatsearch").addEventListener("input",renderChats);
 function rowHtml(i){
   var it=items[i],ch=it.chosen;
   var cls=ch?(it.matched?(it.guess&&!it.learned?"matched guessed":"matched"):"resolved"):"unmatched";
-  // Chips shared by both states: which message line this came from, the package unit the customer
-  // wrote ("box"), and the material inherited from a header line above ("nohub").
+  // Chips: which message line this came from, the package unit the customer wrote ("box"), the
+  // material inherited from a header line above ("nohub"), and hand-added rows.
   var chips=(it.unit?' <span class="unitchip" title="the customer gave the quantity in this unit — check what it means for the order">'+esc(it.unit)+'</span>':'')
-           +(it.material?' <span class="matchip" title="from the &quot;'+esc(it.material)+'&quot; header line above it in the message">'+esc(it.material)+'</span>':'');
-  var lno=it.line?'<span class="lno" title="line '+it.line+' of the message'+(it.raw?' — the customer wrote: '+esc(it.raw):'')+'">'+it.line+'</span>':'';
-  var head=ch
-    // Inline, the "Customer wrote:" label costs more room than it earns — the arrow says it, and
-    // the full wording stays available on hover for anything the ellipsis cuts.
-    ? '<div class="pinfo"><div class="pmain">'+fmt(ch)+'</div><div class="cust" title="Customer wrote: '+esc(it.raw||it.phrase)+'">&#8627; '+esc(it.phrase)+chips+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div></div>'
-    : '<div class="pinfo"><div class="pmain">'+esc(it.phrase)+'</div>'+(chips?'<div class="cust">'+chips+'</div>':'')+'</div>';
-  var top='<div class="top" data-idx="'+i+'">'+lno+'<input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<span class="exp">&#9656;</span></div>';
+           +(it.material?' <span class="matchip" title="from the &quot;'+esc(it.material)+'&quot; header line above it in the message">'+esc(it.material)+'</span>':'')
+           +(it.manual?' <span class="matchip" title="added by hand — was not in the customer&#39;s message">added</span>':'');
+  var lno=it.line?'<span class="lno" title="line '+it.line+' of the message">'+it.line+'</span>':'';
+  // Template shape, the same on every row (the client's ask): the product on its own line, then
+  // "Customer Require -> <their words>" on a NEW line. Nothing shares a line, nothing is cut off.
+  var prod=ch?'<div class="pmain">'+fmt(ch)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div>'
+             :'<div class="pmain nopick">not matched yet — click to choose</div>';
+  var custText=it.manual?"":(it.raw||it.phrase);
+  var cust=custText?'<div class="cust"><span class="creq">Customer Require</span> &#10132; '+esc(custText)+chips+'</div>':(chips?'<div class="cust">'+chips+'</div>':'');
+  var head='<div class="pinfo">'+prod+cust+'</div>';
+  var top='<div class="top" data-idx="'+i+'">'+lno+'<input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<button class="addinline" data-add="'+i+'" title="Add an item below this line (e.g. split into two products)">+</button><span class="exp">&#9656;</span></div>';
   var body='<div class="expand"><div class="inner"><input class="psearch" data-idx="'+i+'" placeholder="search products…" autocomplete="off"><div class="results" data-res="'+i+'"></div></div></div>';
   return '<div class="row '+cls+'" data-row="'+i+'">'+top+body+'</div>';
 }
@@ -2525,16 +2538,22 @@ function findProduct(i,code){var it=items[i];var pool=(it.results||[]).concat(it
 // Manual rows never teach the matcher: their "phrase" is a placeholder, not customer wording,
 // and learning it would poison future matching.
 function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[i].matched&&!items[i].manual;items[i].chosen=p;items[i].learned=learn;if(learn){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:items[i].phrase,code:p.code,description:p.description})}).then(function(){loadCat();}).catch(function(){});}openIdx=null;renderRight();}
-// "+ Add item": an extra product on the order that was never in the message — e.g. the customer
-// wants a 1/2" pump we only have in 3/4", so the 3/4" pump goes on the order plus the reducer
-// that makes it fit. Opens straight into the product search.
-function addItem(){
-  items.push({mid:"",manual:true,phrase:"added by you",quantity:"1",line:0,raw:"",unit:"",material:"",matched:null,chosen:null,guess:false,suggestions:[],results:[]});
+// Add an extra product the customer never wrote — e.g. the customer wants a 1/2" pump we only
+// have in 3/4", so the 3/4" pump goes on plus the reducer that makes it fit.
+//
+// Two entry points: the "+" on a row inserts DIRECTLY BELOW that row and keeps its line number
+// (splitting one customer line into two products stays visibly one line), while the button under
+// the list appends at the end. Both open straight into the product search.
+function addItemAt(after){
+  var at=(after==null)?items.length:after+1;
+  var line=(after!=null&&items[after])?items[after].line:0;
+  items.splice(at,0,{mid:"",manual:true,phrase:"",quantity:"1",line:line,raw:"",unit:"",material:"",matched:null,chosen:null,guess:false,suggestions:[],results:[]});
   renderRight();
-  expandRow(items.length-1);
-  var row=el("right").querySelector('.row[data-row="'+(items.length-1)+'"]');
+  expandRow(at);
+  var row=el("right").querySelector('.row[data-row="'+at+'"]');
   if(row){var ps=row.querySelector(".psearch");if(ps)ps.placeholder="search the product to add…";}
 }
+function addItem(){addItemAt(null);}
 function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
 
 // Typing in a row's search: <2 chars falls back to its suggestions; else live catalog search into .results.
@@ -2548,6 +2567,7 @@ el("right").addEventListener("click",function(e){
   var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){if(items[ri].manual){items.splice(ri,1);}else{items[ri].chosen=null;items[ri].learned=false;}}renderRight();return;}
   if(e.target.closest("#backchat")){closePanel();return;}
   if(e.target.closest("#additem")){addItem();return;}
+  var ai=e.target.closest(".addinline");if(ai){addItemAt(+ai.dataset.add);return;}
   if(e.target.closest("#ddisave")){saveDdiNo();return;}
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
@@ -2748,14 +2768,70 @@ async function sendFile(caption){
 }
 el("sendbtn").addEventListener("click",sendMsg);
 
-// --- composer emoji picker: a plain grid, click inserts at the caret ---
-var EMOJIS=["😀","😁","😂","🤣","😊","😍","🥰","😘","😉","😎","🤔","🙄","😅","😬","😭","😢","😡","🥳","🤯","😴","🤝","👍","👎","👌","🙏","💪","🙌","👏","✌️","🤞","👊","🫡","❤️","💚","💙","💛","🔥","⭐","✨","✅","❌","⚠️","❓","❗","🎉","🎯","📦","🚚","🕐","📞","📋","💰","🧾","🔧","🔩","🪛","🚿","🛁","🧰","⏳"];
+// --- emoji picker: searchable, most-used first, shared by the composer AND reactions ---
+// Each entry: [emoji, search keywords]. Keywords are what the search box matches against.
+var EMO=[
+["😀","grinning happy smile"],["😁","beaming grin teeth"],["😂","joy laugh tears funny lol"],["🤣","rofl rolling laugh"],["😊","smile blush happy"],["😍","heart eyes love"],["🥰","love hearts adore"],["😘","kiss love"],["😉","wink"],["😎","cool sunglasses"],["🤩","star struck wow"],["🤔","thinking hmm"],["🙄","eye roll"],["😅","sweat relief phew"],["😬","grimace awkward"],["😭","crying sob sad"],["😢","cry sad tear"],["😡","angry mad red"],["😤","frustrated steam"],["🥳","party celebrate birthday"],["🤯","mind blown"],["😴","sleep tired zzz"],["🤒","sick fever ill"],["🤗","hug"],["😇","angel innocent"],["🫤","meh unsure"],["😐","neutral blank"],["🙂","slight smile ok"],
+["🤝","handshake deal agree"],["👍","thumbs up ok yes like good"],["👎","thumbs down no bad"],["👌","ok perfect"],["🙏","thanks pray please folded hands"],["💪","strong muscle power"],["🙌","raised hands praise celebrate"],["👏","clap applause"],["✌️","peace victory"],["🤞","fingers crossed luck"],["👊","fist bump punch"],["🫡","salute yes sir"],["👋","wave hello bye hi"],["🤙","call me shaka"],["👉","point right"],["👈","point left"],["☝️","point up one"],["✋","stop hand high five"],
+["❤️","red heart love"],["🧡","orange heart"],["💚","green heart"],["💙","blue heart"],["💛","yellow heart"],["🖤","black heart"],["💯","hundred 100 percent perfect"],["💔","broken heart"],
+["🔥","fire hot lit flame"],["⭐","star"],["✨","sparkles shine new"],["⚡","lightning fast bolt"],["💥","boom explosion"],["🎉","party popper congrats celebrate"],["🎊","confetti celebrate"],["🎯","target bullseye goal"],["🏆","trophy winner champion"],["🥇","gold medal first"],
+["✅","check done yes complete green tick"],["☑️","checkbox done tick"],["✔️","check mark tick done"],["❌","cross no wrong x cancel"],["⚠️","warning caution alert"],["❓","question mark"],["❗","exclamation important"],["🚫","prohibited no ban stop"],["♻️","recycle"],["🆗","ok button"],["🆕","new"],["🔴","red circle"],["🟢","green circle go"],["🟡","yellow circle wait"],
+["📦","package box parcel order"],["🚚","truck delivery shipping"],["🚛","lorry truck shipping"],["🛻","pickup truck"],["🚗","car"],["🏃","running hurry rush"],["⏳","hourglass waiting time"],["⏰","alarm clock time"],["🕐","clock one time"],["📅","calendar date"],["📍","pin location place"],["🗺️","map directions"],["🏠","house home"],["🏢","building office"],["🏗️","construction crane site"],["🚧","construction barrier work"],
+["📞","phone call telephone"],["📱","mobile phone cell"],["💬","speech chat message"],["📧","email envelope mail"],["📋","clipboard list"],["📝","memo note write"],["📄","document page paper"],["🧾","receipt invoice bill"],["💰","money bag cash"],["💵","dollar money cash"],["💳","credit card payment"],["🛒","cart shopping buy"],["🏷️","tag label price"],["⚖️","scale balance weigh"],["📏","ruler measure"],["📐","triangle ruler measure"],
+["🔧","wrench tool fix plumbing"],["🔨","hammer tool"],["🛠️","hammer wrench tools repair"],["🔩","nut bolt screw"],["🪛","screwdriver tool"],["⚙️","gear settings cog"],["🧰","toolbox tools kit"],["🪠","plunger plumbing drain"],["🚿","shower plumbing"],["🛁","bathtub bath tub"],["🚽","toilet plumbing wc"],["🔗","link chain"],["🧲","magnet"],["🪜","ladder"],["🧯","fire extinguisher safety"],["💧","water drop leak"],["🌊","water wave flood"],["🧊","ice cold frozen"],["🌡️","thermometer temperature heat"],["☀️","sun sunny hot"],["🌧️","rain weather"],["❄️","snow cold winter freeze"],
+["☕","coffee break"],["🍕","pizza food lunch"],["🍔","burger food"],["🥤","drink cup soda"],["🎂","cake birthday"],["🍀","clover luck lucky"],["🌹","rose flower"],["🎁","gift present"],["👀","eyes looking watch see"],["🧠","brain smart think"],["🫶","heart hands love thanks"],["🤲","open palms give"],["💤","zzz sleep"],["🐢","turtle slow"],["🐇","rabbit fast quick"],["🦺","safety vest work"],["⛑️","helmet safety rescue"],["👷","construction worker builder"],["🧑‍🔧","mechanic plumber technician"]
+];
+var epMode="insert",epMid=null; // insert into the composer, or react to a message
+function emojiFreq(){try{return JSON.parse(localStorage.getItem("omsEmojiFreq")||"{}");}catch(e){return{};}}
+function bumpEmoji(ch){try{var f=emojiFreq();f[ch]=(f[ch]||0)+1;localStorage.setItem("omsEmojiFreq",JSON.stringify(f));}catch(e){}}
+function egridHtml(list){return list.map(function(p2){return '<button type="button" data-emo="'+p2[0]+'" title="'+esc(p2[1])+'">'+p2[0]+'</button>';}).join("");}
+function renderEgrid(q){
+  var g=el("egrid");
+  q=String(q||"").toLowerCase().trim();
+  if(q){
+    // Word-prefix match: "fir" finds fire, but "truck" must not find "star sTRUCK".
+    var hit=EMO.filter(function(p2){
+      if(p2[0]===q)return true;
+      var words=p2[1].split(" ");
+      for(var w=0;w<words.length;w++)if(words[w].indexOf(q)===0)return true;
+      return false;
+    });
+    g.innerHTML=hit.length?egridHtml(hit):'<div class="enone">No emoji found for that.</div>';
+    return;
+  }
+  // No search: the emojis THIS person uses most float to the top automatically.
+  var f=emojiFreq();
+  var used=EMO.filter(function(p2){return f[p2[0]];}).sort(function(a,b){return f[b[0]]-f[a[0]];}).slice(0,10);
+  var h="";
+  if(used.length)h+='<div class="ehead">Most used</div>'+egridHtml(used)+'<div class="ehead">All</div>';
+  g.innerHTML=h+egridHtml(EMO);
+}
+function openEmojiPanel(mode,mid){
+  epMode=mode;epMid=mid||null;
+  el("esearch").value="";renderEgrid("");
+  el("epanel").classList.add("on");
+  el("esearch").focus();
+}
 (function(){
   var p=el("epanel");
-  p.innerHTML=EMOJIS.map(function(e2){return '<button type="button" data-emo="'+e2+'">'+e2+'</button>';}).join("");
-  el("emojibtn").addEventListener("click",function(ev){ev.stopPropagation();p.classList.toggle("on");});
+  p.innerHTML='<div class="esearchwrap"><input id="esearch" placeholder="search emoji… (fire, thanks, truck)" autocomplete="off"></div><div id="egrid"></div>';
+  el("esearch").addEventListener("input",function(){renderEgrid(this.value);});
+  el("emojibtn").addEventListener("click",function(ev){ev.stopPropagation();
+    if(p.classList.contains("on")){p.classList.remove("on");return;}
+    openEmojiPanel("insert",null);
+  });
   p.addEventListener("click",function(ev){
     var b=ev.target.closest("[data-emo]");if(!b)return;
+    bumpEmoji(b.dataset.emo);
+    if(epMode==="react"&&epMid){
+      var rmid=epMid;p.classList.remove("on");
+      fetch("/api/messages/react",{method:"POST",headers:{"content-type":"application/json"},
+        body:JSON.stringify({messageId:rmid,emoji:b.dataset.emo})}).then(function(r){return r.json();}).then(function(d){
+          if(d.ok){toast("Reacted "+b.dataset.emo);lastSig="";setTimeout(refreshThread,900);}
+          else toast(d.error||"Could not react",true);
+        }).catch(function(){toast("Network error",true);});
+      return;
+    }
     var t=el("cinput"),s=t.selectionStart||0,e2=t.selectionEnd||0;
     t.value=t.value.slice(0,s)+b.dataset.emo+t.value.slice(e2);
     var pos=s+b.dataset.emo.length;
@@ -2848,8 +2924,9 @@ var QUICK_REACTS=["👍","❤️","😂","😮","😢","🙏"];
 function showMenu(mid,x,y){
   var m=msgIndex[mid];if(!m)return;
   var mine=isOut(m)&&m._sby&&String(m._sby).toLowerCase()===meUser.toLowerCase();
-  // WhatsApp's quick-react strip sits on top of the menu; ✕ takes a reaction back.
-  var h='<div class="rstrip">'+QUICK_REACTS.map(function(e2){return '<button data-react="'+e2+'">'+e2+'</button>';}).join("")+'<button data-react="" title="Remove my reaction">&#10005;</button></div>'
+  // WhatsApp's quick-react strip sits on top of the menu; + opens the FULL searchable picker
+  // (any emoji), ✕ takes a reaction back.
+  var h='<div class="rstrip">'+QUICK_REACTS.map(function(e2){return '<button data-react="'+e2+'">'+e2+'</button>';}).join("")+'<button data-reactmore="1" title="All emojis — with search">&#65291;</button><button data-react="" title="Remove my reaction">&#10005;</button></div>'
        +'<button data-act="reply">&#8617;&nbsp; Reply</button>'
        +'<button data-act="copy">&#128203;&nbsp; Copy</button>'
        +'<button data-act="forward">&#10150;&nbsp; Forward</button>'
@@ -2881,9 +2958,14 @@ function downloadMedia(mid){
   document.body.appendChild(a);a.click();a.remove();
 }
 el("ctxmenu").addEventListener("click",function(e){
+  var rm2=e.target.closest("[data-reactmore]");
+  // stopPropagation: this same click would bubble to the document listener that closes the emoji
+  // panel — the panel opened and shut again in the same instant.
+  if(rm2){e.stopPropagation();var mmid=menuMid;hideMenu();openEmojiPanel("react",mmid);return;}
   var rb=e.target.closest("[data-react]");
   if(rb){
     var rmid=menuMid;hideMenu();
+    if(rb.dataset.react)bumpEmoji(rb.dataset.react); // quick reactions count toward "most used" too
     fetch("/api/messages/react",{method:"POST",headers:{"content-type":"application/json"},
       body:JSON.stringify({messageId:rmid,emoji:rb.dataset.react})}).then(function(r){return r.json();}).then(function(d){
         if(d.ok){toast(rb.dataset.react?("Reacted "+rb.dataset.react):"Reaction removed");lastSig="";setTimeout(refreshThread,900);}
