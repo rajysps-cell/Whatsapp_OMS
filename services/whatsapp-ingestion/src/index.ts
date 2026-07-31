@@ -218,7 +218,8 @@ function main(): void {
   },
   (messageId, everyone) => client.del(messageId, everyone),
   (messageId, on) => client.star(messageId, on),
-  (messageId, on) => client.pin(messageId, on));
+  (messageId, on) => client.pin(messageId, on),
+  (messageId, emoji) => client.react(messageId, emoji));
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 

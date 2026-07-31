@@ -40,7 +40,17 @@ import {
   type Role,
   type User,
 } from './auth';
-import { sendMail } from './mailer';
+import {
+  mailConf,
+  resetMailCache,
+  sendMail,
+  senderAddress,
+  tplAdminNewDevice,
+  tplCode,
+  tplPasswordChanged,
+  tplTest,
+  tplWelcome,
+} from './mailer';
 import type { ChatStore } from './chat-store';
 import { config } from './config';
 import { logger } from './logger';
@@ -56,17 +66,21 @@ import {
   deleteAlias,
   getAliasRow,
   getMessage,
+  getSetting,
   chatParticipants,
   isProcessed,
   markDeleted,
   markRevoked,
   mentionNames,
+  orderNoOf,
   pinnedMessage,
   recordSentBy,
   saveExtraction,
   sentByOf,
   setChatName,
+  setOrderNo,
   setPinned,
+  setSetting,
   setStarred,
   updateAliasText,
 } from './store';
@@ -97,6 +111,8 @@ let deleteFn: ((messageId: string, everyone: boolean) => Promise<{ ok: boolean; 
 /** Injected by index.ts: star/unstar and pin/unpin in the real WhatsApp. */
 let starFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 let pinFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+/** Injected by index.ts: react to a message with an emoji ('' removes it). */
+let reactFn: ((messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -289,6 +305,67 @@ async function handleAdmin(
     html(res, adminPage(me));
     return true;
   }
+  if (path === '/settings') {
+    html(res, settingsPage(me));
+    return true;
+  }
+  // Settings read: secrets never leave the server — the UI only learns whether one is set.
+  if (path === '/api/settings' && req.method !== 'POST') {
+    const m = mailConf();
+    json(res, 200, {
+      provider: m.provider,
+      from: m.from,
+      smtp: { host: m.smtp.host, port: m.smtp.port, user: m.smtp.user, hasPass: !!m.smtp.pass },
+      ms365: { tenant: m.ms365.tenant, clientId: m.ms365.clientId, hasSecret: !!m.ms365.clientSecret, sender: m.ms365.sender },
+      adminNewDevice: getSetting('notify.adminNewDevice', '0') === '1',
+      sender: senderAddress(),
+    });
+    return true;
+  }
+  if (path === '/api/settings' && req.method === 'POST') {
+    const body = await readBody(req);
+    const str = (k: string): string | null => (typeof body[k] === 'string' ? (body[k] as string).trim() : null);
+    const provider = str('provider');
+    if (provider !== null) setSetting('mail.provider', provider === 'ms365' ? 'ms365' : 'smtp');
+    for (const [field, key] of [
+      ['from', 'mail.from'],
+      ['smtpHost', 'mail.smtp.host'],
+      ['smtpPort', 'mail.smtp.port'],
+      ['smtpUser', 'mail.smtp.user'],
+      ['ms365Tenant', 'mail.ms365.tenant'],
+      ['ms365ClientId', 'mail.ms365.clientId'],
+      ['ms365Sender', 'mail.ms365.sender'],
+    ] as const) {
+      const v = str(field);
+      if (v !== null) setSetting(key, v);
+    }
+    // Secrets: an empty field means "keep what is stored", never "clear it" — the UI shows a
+    // placeholder instead of the value, so an untouched field must not wipe the secret.
+    const smtpPass = str('smtpPass');
+    if (smtpPass) setSetting('mail.smtp.pass', smtpPass);
+    const secret = str('ms365ClientSecret');
+    if (secret) setSetting('mail.ms365.clientSecret', secret);
+    if (body['adminNewDevice'] !== undefined) setSetting('notify.adminNewDevice', body['adminNewDevice'] ? '1' : '0');
+    resetMailCache(); // a cached MS365 token for the old app registration must not survive a change
+    logger.info({ user: me.username }, 'settings updated');
+    json(res, 200, { ok: true, sender: senderAddress() });
+    return true;
+  }
+  // "Send a test email to me" — proves the configuration without waiting for a real sign-in.
+  if (path === '/api/settings/test-mail' && req.method === 'POST') {
+    if (!me.email) {
+      json(res, 200, { ok: false, error: 'Your own account has no email address — add one on the Users page first.' });
+      return true;
+    }
+    try {
+      const t = tplTest();
+      await sendMail(me.email, t.subject, t.text, t.html);
+      json(res, 200, { ok: true, to: me.email });
+    } catch (err) {
+      json(res, 200, { ok: false, error: (err as Error).message.slice(0, 300) });
+    }
+    return true;
+  }
   if (path === '/api/users' && req.method !== 'POST') {
     json(res, 200, { users: listUsers(), meId: me.id });
     return true;
@@ -315,8 +392,20 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: em.error });
       return true;
     }
-    createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value);
-    json(res, 200, { ok: true, users: listUsers() });
+    const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value);
+    // Welcome mail with the temporary password — it stops working at first sign-in, when the
+    // user must choose their own. Best-effort: a mail outage must not block creating accounts.
+    let mailed = false;
+    if (em.value) {
+      const t = tplWelcome(created.name || created.username, created.username, p.value, 'https://oms.ysps.shop');
+      try {
+        await sendMail(em.value, t.subject, t.text, t.html);
+        mailed = true;
+      } catch (err) {
+        logger.warn({ err, to: em.value }, 'welcome email failed — give the user their password by hand');
+      }
+    }
+    json(res, 200, { ok: true, mailed, users: listUsers() });
     return true;
   }
   if (path === '/api/users/edit' && req.method === 'POST') {
@@ -441,6 +530,7 @@ export function startWebServer(
   del?: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>,
   star?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
   pin?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
+  react?: (messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
@@ -450,6 +540,7 @@ export function startWebServer(
   deleteFn = del ?? null;
   starFn = star ?? null;
   pinFn = pin ?? null;
+  reactFn = react ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -536,14 +627,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (r.user.email && !deviceTrusted(r.user.id, devTok)) {
         const pend = createPendingLogin(r.user.id);
         try {
-          await sendMail(
-            r.user.email,
-            `${pend.code} is your WhatsApp OMS sign-in code`,
-            `Hi ${r.user.name || r.user.username},\n\n` +
-              `Your sign-in code is: ${pend.code}\n\n` +
-              `It expires in 10 minutes. You are asked because this browser has not been used for\n` +
-              `WhatsApp OMS before. If this sign-in was not you, change your password.\n`,
-          );
+          const t = tplCode(r.user.name || r.user.username, pend.code);
+          await sendMail(r.user.email, t.subject, t.text, t.html);
         } catch (err) {
           // Escape hatch: mail down must not lock the whole team out of a live order system. The
           // code lands in the server log, where an operator on the box can read it out.
@@ -583,7 +668,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     const secure = isSecureReq(req);
-    const dev = trustDevice(v.user.id, readCookie(req.headers.cookie, DEVICE_COOKIE), String(req.headers['user-agent'] ?? ''));
+    const ua = String(req.headers['user-agent'] ?? '');
+    const dev = trustDevice(v.user.id, readCookie(req.headers.cookie, DEVICE_COOKIE), ua);
     const t = createSession(v.user.id);
     res.writeHead(200, {
       'content-type': 'application/json; charset=utf-8',
@@ -591,6 +677,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     });
     res.end(JSON.stringify({ ok: true, mustChange: v.user.mustChange }));
     logger.info({ user: v.user.username }, 'two-step verification passed — device remembered');
+    // Heads-up to the admins (Settings switch): a verified sign-in from a brand-new device is
+    // exactly the event worth a second pair of eyes. Fire-and-forget — mail must never block login.
+    if (getSetting('notify.adminNewDevice', '0') === '1') {
+      const admins = listUsers().filter((u2) => u2.role === 'admin' && u2.active && u2.email && u2.id !== v.user.id);
+      const alert = tplAdminNewDevice(v.user.username, ua);
+      for (const a of admins) {
+        void sendMail(a.email, alert.subject, alert.text, alert.html).catch((err) =>
+          logger.warn({ err, to: a.email }, 'admin new-device alert failed'),
+        );
+      }
+    }
     return;
   }
   if (path === '/login/resend' && req.method === 'POST') {
@@ -600,7 +697,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     try {
-      await sendMail(rs.user.email, `${rs.code} is your WhatsApp OMS sign-in code`, `Your new sign-in code is: ${rs.code}\n\nIt expires in 10 minutes.\n`);
+      const t = tplCode(rs.user.name || rs.user.username, rs.code);
+      await sendMail(rs.user.email, t.subject, t.text, t.html);
     } catch (err) {
       logger.warn({ err, user: rs.user.username, code: rs.code }, 'OTP email failed — code in this log line is the fallback');
     }
@@ -660,6 +758,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return;
       }
       changePassword(me.id, v.value, token ?? undefined);
+      // "Your password was changed" — the mail that matters when it WASN'T them. Best-effort.
+      if (me.email) {
+        const t = tplPasswordChanged(me.name || me.username);
+        void sendMail(me.email, t.subject, t.text, t.html).catch((err) =>
+          logger.warn({ err, to: me.email }, 'password-changed email failed'),
+        );
+      }
       json(res, 200, { ok: true });
       return;
     }
@@ -670,7 +775,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // --- admin-only surface ---------------------------------------------------
   // /qr shows the WhatsApp device-linking QR: scanning it links a phone to the business account
   // with full read+send, outside this app and unaffected by disabling the OMS user. Admins only.
-  if (path === '/admin' || path === '/qr' || path.startsWith('/api/users')) {
+  if (path === '/admin' || path === '/qr' || path === '/settings' || path.startsWith('/api/users') || path.startsWith('/api/settings')) {
     if (me.role !== 'admin') {
       if (path.startsWith('/api/')) {
         json(res, 403, { error: 'admin only' });
@@ -870,11 +975,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
+    const orderNos = orderNoOf(id); // DDI order numbers typed after Copy, keyed by message
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
     });
     return;
   }
@@ -1047,6 +1153,46 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     else setPinned(messageId, on);
     logger.info({ user: me.username, messageId, action: (on ? '' : 'un') + (isStar ? 'star' : 'pin') }, 'message action');
     json(res, 200, { ok: true });
+    return;
+  }
+  // React with an emoji, like tapping a message in WhatsApp. Empty emoji removes the reaction.
+  // The reaction lands in the real chat; our own message_reaction event then stores + renders it.
+  if (path === '/api/messages/react' && req.method === 'POST') {
+    if (!reactFn || status !== 'connected') {
+      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+      return;
+    }
+    const body = await readBody(req);
+    const messageId = typeof body['messageId'] === 'string' ? (body['messageId'] as string) : '';
+    const emoji = typeof body['emoji'] === 'string' ? (body['emoji'] as string).slice(0, 8) : '';
+    if (!messageId || !getMessage(messageId)) {
+      json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    const r = await reactFn(messageId, emoji);
+    if (!r.ok) {
+      json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused the reaction.' });
+      return;
+    }
+    logger.info({ user: me.username, messageId, emoji }, 'reaction sent');
+    json(res, 200, { ok: true });
+    return;
+  }
+  // The DDI order number a sales rep types after Copy — stamped onto every processed message of
+  // that order, so the thread badge can show "Processed by Nate · DDI #12345".
+  if (path === '/api/processed/order-no' && req.method === 'POST') {
+    const body = await readBody(req);
+    const ids = Array.isArray(body['messageIds'])
+      ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 50)
+      : [];
+    const orderNo = typeof body['orderNo'] === 'string' ? (body['orderNo'] as string).trim().slice(0, 40) : '';
+    if (!ids.length) {
+      json(res, 400, { ok: false, error: 'No processed messages given.' });
+      return;
+    }
+    const n = setOrderNo(ids, orderNo);
+    logger.info({ user: me.username, orderNo, messages: n }, 'DDI order number saved');
+    json(res, 200, { ok: true, updated: n });
     return;
   }
   // Forward a message to another chat. Implemented as copy-and-send through the normal signed
@@ -1415,7 +1561,7 @@ function adminPage(me: User): string {
 </style></head><body>
 <header><h1>User Management</h1><span class="who">signed in as <b>${esc(me.username)}</b></span>
   <div class="spacer"></div>
-  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/settings">Settings</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="wrap">
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
@@ -1515,6 +1661,140 @@ el("tb").addEventListener("click",function(e){
   var rs=e.target.closest("[data-reset]");if(rs){resetDevices(+rs.dataset.reset);return;}
   var dl=e.target.closest("[data-del]");if(dl&&!dl.disabled){del(+dl.dataset.del);return;}});
 el("mFields").addEventListener("keydown",function(e){if(e.key==="Enter")save();});
+load();
+</script></body></html>`;
+}
+
+// --- Settings (admin-only): email sending + notification switches ---
+function settingsPage(me: User): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings · WhatsApp OMS</title>
+<style>
+  :root{color-scheme:light;--bg:#f0f2f5;--panel:#fff;--line:#e5e7eb;--tx:#111b21;--mut:#667781;--em:#10b981;--em2:#059669;--blue:#2563eb;--red:#dc2626}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+  header{display:flex;align-items:center;gap:12px;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 18px;position:sticky;top:0;z-index:5}
+  header h1{font-size:15.5px;margin:0}
+  .who{color:var(--mut);font-size:12.5px}.spacer{flex:1}
+  .navlink{color:var(--em2);text-decoration:none;font-size:13px;font-weight:600;margin-left:14px}
+  .wrap{max-width:640px;margin:22px auto;padding:0 16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px 22px;margin-bottom:16px}
+  .card h2{font-size:14.5px;margin:0 0 4px}
+  .card .sub{color:var(--mut);font-size:12.5px;margin:0 0 14px}
+  label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:12px 0 5px}
+  input,select{width:100%;padding:9px 11px;font-size:13.5px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--tx);outline:none}
+  input:focus,select:focus{border-color:var(--em2)}
+  .row2{display:flex;gap:10px}.row2>div{flex:1}
+  .prov{display:flex;gap:10px;margin-top:4px}
+  .prov label{flex:1;display:flex;align-items:center;gap:9px;margin:0;padding:11px 13px;border:1.5px solid var(--line);border-radius:10px;cursor:pointer;font-size:13px;font-weight:600;color:var(--tx)}
+  .prov label.on{border-color:var(--em2);background:#e7f8f2}
+  .prov input{width:auto}
+  .switch{display:flex;align-items:center;gap:12px;justify-content:space-between}
+  .switch .txt{font-size:13.5px}
+  .switch .txt small{display:block;color:var(--mut);font-size:12px;margin-top:2px}
+  .tgl{position:relative;width:44px;height:24px;flex:none}
+  .tgl input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:2}
+  .tgl .tr{position:absolute;inset:0;background:#cbd5e1;border-radius:12px;transition:background .15s}
+  .tgl .th{position:absolute;top:2px;left:2px;width:20px;height:20px;background:#fff;border-radius:50%;box-shadow:0 1px 3px #0003;transition:left .15s}
+  .tgl input:checked ~ .tr{background:var(--em)}
+  .tgl input:checked ~ .th{left:22px}
+  .acts{display:flex;gap:10px;align-items:center;margin-top:6px}
+  .btn{padding:9px 18px;font-size:13px;font-weight:600;border-radius:8px;border:1px solid var(--em2);background:var(--em);color:#fff;cursor:pointer}
+  .btn.ghost{background:#fff;color:var(--tx);border-color:var(--line)}
+  .btn:disabled{opacity:.6;cursor:default}
+  .sender{font-size:12.5px;color:var(--mut)}
+  .sender b{color:var(--em2)}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(70px);background:#111b21;color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:30}
+  .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.bad{background:var(--red)}
+  .hint{font-size:11.5px;color:var(--mut);margin-top:4px}
+</style></head><body>
+<header><h1>Settings</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
+  <a class="navlink" href="/">← Order Matching</a><a class="navlink" href="/admin">Users</a><a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<div class="wrap">
+  <div class="card">
+    <h2>Email sending</h2>
+    <p class="sub">Used for sign-in verification codes, new-user welcome emails and alerts.
+      Currently sending as <span class="sender" id="senderline"><b>…</b></span></p>
+    <div class="prov" id="prov">
+      <label id="lSmtp"><input type="radio" name="prov" value="smtp"> SMTP <span style="font-weight:400;color:var(--mut)">(Gmail, any mail server)</span></label>
+      <label id="lMs"><input type="radio" name="prov" value="ms365"> Microsoft&nbsp;365 <span style="font-weight:400;color:var(--mut)">(Graph API)</span></label>
+    </div>
+    <div id="fSmtp">
+      <div class="row2">
+        <div><label for="sHost">SMTP server</label><input id="sHost" placeholder="smtp.gmail.com"></div>
+        <div style="max-width:110px"><label for="sPort">Port</label><input id="sPort" inputmode="numeric" placeholder="587"></div>
+      </div>
+      <label for="sUser">Sign-in email (username)</label><input id="sUser" placeholder="e.g. ysddiexport@gmail.com">
+      <label for="sPass">Password / app password</label><input id="sPass" type="password" autocomplete="new-password">
+      <div class="hint" id="sPassHint"></div>
+      <label for="sFrom">Send as (optional)</label><input id="sFrom" placeholder="leave empty to send as the sign-in email">
+    </div>
+    <div id="fMs" style="display:none">
+      <label for="mTenant">Tenant ID</label><input id="mTenant" placeholder="00000000-0000-0000-0000-000000000000">
+      <label for="mClient">Client ID (application ID)</label><input id="mClient" placeholder="00000000-0000-0000-0000-000000000000">
+      <label for="mSecret">Client secret</label><input id="mSecret" type="password" autocomplete="new-password">
+      <div class="hint" id="mSecretHint"></div>
+      <label for="mSender">Send from mailbox</label><input id="mSender" placeholder="e.g. orders@ysps.shop">
+      <div class="hint">Needs an Azure app registration with the <b>Mail.Send</b> application permission (admin consent granted).</div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Notifications</h2>
+    <p class="sub">Emails the system sends on its own.</p>
+    <div class="switch">
+      <div class="txt">Email administrators when someone signs in from a new device
+        <small>Sent after the person passes their verification code. Goes to every admin with an email address.</small></div>
+      <span class="tgl"><input type="checkbox" id="swNewDev"><span class="tr"></span><span class="th"></span></span>
+    </div>
+  </div>
+  <div class="acts">
+    <button class="btn" id="save">Save settings</button>
+    <button class="btn ghost" id="test">Send a test email to me</button>
+    <span class="sender" id="saved"></span>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+function el(id){return document.getElementById(id);}
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},3200);}
+function provider(){var r=document.querySelector('input[name="prov"]:checked');return r?r.value:"smtp";}
+function syncProv(){var p=provider();el("fSmtp").style.display=p==="smtp"?"":"none";el("fMs").style.display=p==="ms365"?"":"none";
+  el("lSmtp").className=p==="smtp"?"on":"";el("lMs").className=p==="ms365"?"on":"";}
+document.querySelectorAll('input[name="prov"]').forEach(function(r){r.addEventListener("change",syncProv);});
+async function load(){
+  var d=await(await fetch("/api/settings")).json();
+  document.querySelector('input[name="prov"][value="'+d.provider+'"]').checked=true;
+  el("sHost").value=d.smtp.host||"";el("sPort").value=d.smtp.port||"";el("sUser").value=d.smtp.user||"";
+  el("sPassHint").textContent=d.smtp.hasPass?"A password is saved. Leave empty to keep it.":"No password saved yet.";
+  el("sFrom").value=d.from||"";
+  el("mTenant").value=d.ms365.tenant||"";el("mClient").value=d.ms365.clientId||"";el("mSender").value=d.ms365.sender||"";
+  el("mSecretHint").textContent=d.ms365.hasSecret?"A secret is saved. Leave empty to keep it.":"No secret saved yet.";
+  el("swNewDev").checked=!!d.adminNewDevice;
+  el("senderline").innerHTML="<b>"+(d.sender||"not configured")+"</b>";
+  syncProv();
+}
+el("save").addEventListener("click",async function(){
+  var b=el("save");b.disabled=true;b.textContent="Saving…";
+  try{
+    var d=await(await fetch("/api/settings",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
+      provider:provider(),from:el("sFrom").value,
+      smtpHost:el("sHost").value,smtpPort:el("sPort").value,smtpUser:el("sUser").value,smtpPass:el("sPass").value,
+      ms365Tenant:el("mTenant").value,ms365ClientId:el("mClient").value,ms365ClientSecret:el("mSecret").value,ms365Sender:el("mSender").value,
+      adminNewDevice:el("swNewDev").checked})})).json();
+    if(d.ok){toast("Settings saved");el("sPass").value="";el("mSecret").value="";el("senderline").innerHTML="<b>"+(d.sender||"?")+"</b>";load();}
+    else toast(d.error||"Could not save",true);
+  }catch(e){toast("Network error",true);}
+  b.disabled=false;b.textContent="Save settings";
+});
+el("test").addEventListener("click",async function(){
+  var b=el("test");b.disabled=true;b.textContent="Sending…";
+  try{
+    var d=await(await fetch("/api/settings/test-mail",{method:"POST"})).json();
+    toast(d.ok?("Test email sent to "+d.to):(d.error||"Send failed"),!d.ok);
+  }catch(e){toast("Network error",true);}
+  b.disabled=false;b.textContent="Send a test email to me";
+});
 load();
 </script></body></html>`;
 }
@@ -1784,7 +2064,9 @@ function matchPage(me: User): string {
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes flash{0%,100%{box-shadow:0 1px .5px rgba(11,20,26,.13)}30%{box-shadow:0 0 0 3px var(--em2),0 0 16px var(--em)}}
   .flash{animation:flash 1s ease}
-  .right{width:clamp(340px,32%,520px);flex-shrink:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:16px;background:var(--bg)}
+  /* A little wider than before (the client's ask): full product + customer text must fit without
+     cutting off; the conversation column gives up the difference. */
+  .right{width:clamp(380px,37%,600px);flex-shrink:0;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:16px;background:var(--bg)}
   /* Narrow desktop / tablet: give the thread even more of the remaining width. */
   @media (max-width:1100px){
     .chatcol{width:240px}
@@ -1825,9 +2107,28 @@ function matchPage(me: User): string {
   .sect h2{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut);margin:0 0 8px;display:flex;align-items:baseline;gap:8px}
   .cnt{text-transform:none;letter-spacing:0;font-weight:600;color:var(--em2)}
   .row{border:1px solid var(--line);border-radius:9px;margin-bottom:5px;background:var(--panel);border-left:3px solid var(--line);transition:border-color .15s,box-shadow .15s;box-shadow:0 1px 2px #0000000f;overflow:hidden}
-  .row.matched{border-left-color:var(--em)}.row.unmatched{border-left-color:var(--amber)}.row.resolved{border-left-color:var(--em)}
+  /* Matched rows get a light-green FILL, not just a colored edge: Yanky is colorblind and could
+     not tell the green border from the amber one — a filled vs white row survives that. */
+  .row.matched{border-left-color:var(--em);background:#e4f6e8}
+  .row.resolved{border-left-color:var(--em);background:#e4f6e8}
+  .row.unmatched{border-left-color:var(--amber)}
   .row.open{box-shadow:0 2px 8px #00000014}
-  .row .top{display:flex;align-items:center;gap:8px;padding:6px 9px;cursor:pointer}
+  .row .top{display:flex;align-items:flex-start;gap:8px;padding:6px 9px;cursor:pointer}
+  .row .top .qty,.row .top .lno,.row .top .exp{margin-top:1px}
+  .addbtnrow{width:100%;border:1.5px dashed var(--line);background:none;border-radius:9px;color:var(--em2);font-weight:600;font-size:12.5px;padding:8px;cursor:pointer;margin-bottom:5px}
+  .addbtnrow:hover{border-color:var(--em2);background:#f2fbf5}
+  .ddirow{display:flex;align-items:center;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+  .ddirow label{font-size:12px;font-weight:700;color:var(--mut);white-space:nowrap}
+  .ddirow input{flex:1;min-width:0;padding:8px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none}
+  .ddirow input:focus{border-color:var(--em2)}
+  /* Quick-react strip on top of the message menu, and the composer emoji panel. */
+  .rstrip{display:flex;gap:1px;padding:5px 8px;border-bottom:1px solid var(--line)}
+  .rstrip button{font-size:17px;background:none;border:0;cursor:pointer;padding:4px 6px;border-radius:7px;line-height:1;width:auto}
+  .rstrip button:hover{background:var(--bg);transform:scale(1.15)}
+  .epanel{display:none;grid-template-columns:repeat(10,1fr);gap:2px;background:var(--panel);border-top:1px solid var(--line);padding:8px 12px;max-height:168px;overflow-y:auto}
+  .epanel.on{display:grid}
+  .epanel button{font-size:19px;background:none;border:0;cursor:pointer;padding:5px 0;border-radius:7px;line-height:1.2}
+  .epanel button:hover{background:var(--bg)}
   .row .top:hover{background:#f9fbfd}
   .qty{width:44px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:4px 3px;font-size:13px;font-weight:600;text-align:center;outline:none;flex-shrink:0}
   .qty:focus{border-color:var(--blue)}
@@ -1837,12 +2138,12 @@ function matchPage(me: User): string {
   .lno{flex:none;min-width:18px;height:18px;line-height:18px;text-align:center;border-radius:9px;background:var(--bg);border:1px solid var(--line);color:var(--mut);font-size:10px;font-weight:600}
   .unitchip{background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
   .matchip{background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
-  /* One physical line per order line: product and the customer's wording sit side by side rather
-     than stacked. Both children need min-width:0 or flex refuses to shrink them; .cust shrinks
-     first (flex:1 1 auto against .pmain's flex:0 1 auto) so the SKU is the last thing to be cut. */
-  .pinfo{flex:1;min-width:0;display:flex;align-items:baseline;gap:7px}
-  .pmain{flex:0 1 auto;min-width:0;font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .cust{flex:1 1 auto;min-width:0;font-size:10.5px;color:var(--mut);margin-top:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}
+  /* Product and the customer's wording side by side, but NOTHING gets cut off — the client was
+     clear: "I want to be able to see everything." Long text wraps to more lines instead of
+     ellipsising, so a row grows taller when it needs to. */
+  .pinfo{flex:1;min-width:0;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 7px}
+  .pmain{flex:0 1 auto;min-width:0;font-size:13px;line-height:1.35;overflow-wrap:anywhere}
+  .cust{flex:1 1 auto;min-width:0;font-size:10.5px;color:var(--mut);margin-top:0;line-height:1.3;overflow-wrap:anywhere}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
@@ -1871,7 +2172,7 @@ function matchPage(me: User): string {
   .rmfinal:hover{background:#fee2e2;color:#dc2626}
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
-<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
+<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${me.role === 'admin' ? '<a class="navlink" href="/admin">Users</a><a class="navlink" href="/settings">Settings</a>' : ''}<a class="navlink" href="#" onclick="omsLogout();return false">Sign out</a></header>
 <div class="offline" id="offline">
   <div class="offbox">
     <div class="officon" id="officon">⏳</div>
@@ -1890,8 +2191,10 @@ function matchPage(me: User): string {
       <div class="mentionbox" id="mbox"></div>
       <div class="filechip" id="filechip"></div>
       <div class="replybar" id="replybar"><div class="rq"><div class="rqn" id="rqn"></div><div class="rqt" id="rqt"></div></div><button class="rx" id="rx" title="Cancel reply" aria-label="Cancel reply">&#10005;</button></div>
+      <div class="epanel" id="epanel"></div>
       <div class="composer" id="composer">
         <input type="file" id="cfile" hidden accept="image/*,video/*,audio/*,.pdf,.csv,.xlsx,.xls,.doc,.docx,.txt">
+        <button class="attachbtn" id="emojibtn" title="Emoji" aria-label="Insert an emoji" disabled>&#128578;</button>
         <button class="attachbtn" id="attachbtn" title="Attach a file" aria-label="Attach a file" disabled>&#128206;</button>
         <textarea id="cinput" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter for a new line)" disabled></textarea>
         <button class="sendbtn" id="sendbtn" disabled title="Send">➤</button>
@@ -1915,6 +2218,7 @@ function matchPage(me: User): string {
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
 var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},appUsers=[];
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
+var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
 function showChat(){document.body.classList.add("inchat");}
@@ -2030,7 +2334,7 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
@@ -2084,7 +2388,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+async function selectChat(id){curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -2098,7 +2402,7 @@ function applyStates(){
     // The button already reads "Extracted ✓", so no badge in that state — showing both said
     // "Extracted" twice on the same bubble. The badge is only for the persistent Processed state,
     // where it also names who completed the order.
-    if(sb){if(done&&!on){var by=procBy[mid];sb.className="sb d";sb.textContent=by?("✓ Processed by "+by):"✓ Processed";sb.style.display="";}
+    if(sb){if(done&&!on){var by=procBy[mid];var dno=orderNos[mid];sb.className="sb d";sb.textContent=(by?("✓ Processed by "+by):"✓ Processed")+(dno?(" · DDI #"+dno):"");sb.style.display="";}
       else{sb.style.display="none";sb.textContent="";}}
     var btn=b.querySelector(".xbtn");
     if(btn&&!busy){btn.disabled=false;btn.classList.toggle("on",on);btn.classList.toggle("done",done&&!on);
@@ -2175,10 +2479,13 @@ function renderRight(){
   var src=sources.length>1?' &nbsp;<span class="cnt">from '+sources.length+' messages</span>':'';
   h+='<div class="sect"><h2>Order lines &nbsp;<span class="cnt">'+done+' of '+items.length+' matched</span>'+src+'</h2>';
   h+=items.map(function(_,i){return rowHtml(i);}).join("");
+  h+='<button class="addbtnrow" id="additem">+ Add item &nbsp;<span style="font-weight:400;color:var(--mut)">(a product the customer did not write)</span></button>';
   h+='</div>';
-  h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table></div>';
+  h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table>'
+   +'<div class="ddirow" id="ddirow" style="display:none"><label for="ddino">DDI order #</label><input id="ddino" placeholder="order number from DDI" maxlength="40"><button class="btn green" id="ddisave">Save</button></div></div>';
   el("right").innerHTML=h;
   updateFinal();
+  syncDdiRow();
 }
 // Accordion: expand one row's inline search, fade/slide in, auto-focus, collapse any other.
 // The initial suggestion list (before typing) stays short — these are the matcher's own guesses,
@@ -2193,9 +2500,41 @@ function expandRow(i){
   var ex=row.querySelector(".expand");void ex.offsetWidth;ex.classList.add("show"); // reflow → transition = fade/slide in
   renderResults(i,items[i].suggestions||[]);
   var ps=row.querySelector(".psearch");if(ps)ps.focus();
+  phraseSuggest(i); // widen the quick suggestions into the full ranked list for this phrase
+}
+// The client's ask: the suggestion list should be as broad as the search, ranked the same way
+// (product number first). The matcher's own 8 quick guesses show instantly; this replaces them
+// with the full ranked list for the customer's phrase — unless the user already started typing,
+// in which case their search owns the box.
+async function phraseSuggest(i){
+  var it=items[i];if(!it||it.manual||!it.phrase||it.phrase.length<2)return;
+  try{
+    var d=await(await fetch("/api/products/search?limit=200&q="+encodeURIComponent(it.phrase))).json();
+    if(openIdx!==i)return;
+    var row=el("right").querySelector('.row[data-row="'+i+'"]');if(!row)return;
+    var ps=row.querySelector(".psearch");if(ps&&ps.value)return; // they are typing — leave their results alone
+    var list=d.results||[];if(!list.length)return;               // keep the quick guesses over an empty answer
+    items[i].results=list;
+    var box=row.querySelector('.results[data-res="'+i+'"]');if(!box)return;
+    var tot=d.total||list.length;
+    var cnt=(tot>list.length?('showing '+list.length+' of '+tot+' — type to narrow'):(tot+(tot===1?' match':' matches')));
+    box.innerHTML='<div class="rescount">'+cnt+'</div>'+list.map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join("");
+  }catch(e){}
 }
 function findProduct(i,code){var it=items[i];var pool=(it.results||[]).concat(it.suggestions||[]);for(var k=0;k<pool.length;k++)if(pool[k].code===code)return pool[k];return null;}
-function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[i].matched;items[i].chosen=p;items[i].learned=learn;if(learn){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:items[i].phrase,code:p.code,description:p.description})}).then(function(){loadCat();}).catch(function(){});}openIdx=null;renderRight();}
+// Manual rows never teach the matcher: their "phrase" is a placeholder, not customer wording,
+// and learning it would poison future matching.
+function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[i].matched&&!items[i].manual;items[i].chosen=p;items[i].learned=learn;if(learn){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:items[i].phrase,code:p.code,description:p.description})}).then(function(){loadCat();}).catch(function(){});}openIdx=null;renderRight();}
+// "+ Add item": an extra product on the order that was never in the message — e.g. the customer
+// wants a 1/2" pump we only have in 3/4", so the 3/4" pump goes on the order plus the reducer
+// that makes it fit. Opens straight into the product search.
+function addItem(){
+  items.push({mid:"",manual:true,phrase:"added by you",quantity:"1",line:0,raw:"",unit:"",material:"",matched:null,chosen:null,guess:false,suggestions:[],results:[]});
+  renderRight();
+  expandRow(items.length-1);
+  var row=el("right").querySelector('.row[data-row="'+(items.length-1)+'"]');
+  if(row){var ps=row.querySelector(".psearch");if(ps)ps.placeholder="search the product to add…";}
+}
 function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
 
 // Typing in a row's search: <2 chars falls back to its suggestions; else live catalog search into .results.
@@ -2206,8 +2545,10 @@ var doSearch=debounce(async function(i,q){if(!q||q.length<2){renderResults(i,ite
 el("right").addEventListener("input",function(e){var t=e.target;if(t.classList.contains("qty")){items[t.dataset.idx].quantity=t.value;updateFinal();}else if(t.classList.contains("psearch")){doSearch(t.dataset.idx,t.value);}});
 el("right").addEventListener("click",function(e){
   var o=e.target.closest(".opt");if(o){choose(o.dataset.idx,o.dataset.code);return;}
-  var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){items[ri].chosen=null;items[ri].learned=false;}renderRight();return;}
+  var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){if(items[ri].manual){items.splice(ri,1);}else{items[ri].chosen=null;items[ri].learned=false;}}renderRight();return;}
   if(e.target.closest("#backchat")){closePanel();return;}
+  if(e.target.closest("#additem")){addItem();return;}
+  if(e.target.closest("#ddisave")){saveDdiNo();return;}
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
   if(e.target.closest(".psearch")||e.target.closest(".expand"))return; // don't toggle when interacting inside the open panel
@@ -2253,6 +2594,25 @@ async function copyCsv(){
   // Keep the panel exactly as-is — just flash the button. The copy + "mark Processed" still happen (above);
   // we only skip the reset so the extracted order stays visible after copying.
   var cb=el("copybtn");if(cb){cb.textContent="Copied ✓";setTimeout(function(){var b=el("copybtn");if(b)b.textContent="Copy";},1600);}
+  // The sales rep now pastes into DDI and gets an order number back — give them the box for it.
+  lastCopied=mids;syncDdiRow();
+  var di=el("ddino");if(di)di.focus();
+  applyStates();
+}
+// The "DDI order #" box shows only once an order has been copied (that is when DDI hands out
+// the number). Saving stamps it on every message of that copy, so the thread badge reads
+// "Processed by Nate · DDI #12345".
+function syncDdiRow(){var r=el("ddirow");if(!r)return;r.style.display=lastCopied.length?"flex":"none";}
+async function saveDdiNo(){
+  var no=(el("ddino")?el("ddino").value:"").trim();
+  if(!lastCopied.length)return;
+  if(!no){toast("Type the order number from DDI first.",true);return;}
+  try{
+    var d=await(await fetch("/api/processed/order-no",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({messageIds:lastCopied,orderNo:no})})).json();
+    if(d.ok){lastCopied.forEach(function(m){orderNos[m]=no;});toast("DDI order #"+no+" saved");applyStates();}
+    else toast(d.error||"Could not save",true);
+  }catch(e){toast("Network error — not saved",true);}
 }
 
 // --- @mention autocomplete -------------------------------------------------------------
@@ -2352,6 +2712,8 @@ function syncComposer(){
   var on=!!curChat&&!sending;
   el("cinput").disabled=!on;
   el("attachbtn").disabled=!on;
+  el("emojibtn").disabled=!on;
+  if(!on)el("epanel").classList.remove("on");
   el("sendbtn").disabled=!on||(!el("cinput").value.trim()&&!pendingFile); // a file alone is sendable
 }
 async function sendMsg(){
@@ -2385,6 +2747,23 @@ async function sendFile(caption){
   sending=false;el("sendbtn").textContent="➤";syncComposer();
 }
 el("sendbtn").addEventListener("click",sendMsg);
+
+// --- composer emoji picker: a plain grid, click inserts at the caret ---
+var EMOJIS=["😀","😁","😂","🤣","😊","😍","🥰","😘","😉","😎","🤔","🙄","😅","😬","😭","😢","😡","🥳","🤯","😴","🤝","👍","👎","👌","🙏","💪","🙌","👏","✌️","🤞","👊","🫡","❤️","💚","💙","💛","🔥","⭐","✨","✅","❌","⚠️","❓","❗","🎉","🎯","📦","🚚","🕐","📞","📋","💰","🧾","🔧","🔩","🪛","🚿","🛁","🧰","⏳"];
+(function(){
+  var p=el("epanel");
+  p.innerHTML=EMOJIS.map(function(e2){return '<button type="button" data-emo="'+e2+'">'+e2+'</button>';}).join("");
+  el("emojibtn").addEventListener("click",function(ev){ev.stopPropagation();p.classList.toggle("on");});
+  p.addEventListener("click",function(ev){
+    var b=ev.target.closest("[data-emo]");if(!b)return;
+    var t=el("cinput"),s=t.selectionStart||0,e2=t.selectionEnd||0;
+    t.value=t.value.slice(0,s)+b.dataset.emo+t.value.slice(e2);
+    var pos=s+b.dataset.emo.length;
+    t.focus();t.setSelectionRange(pos,pos);
+    autoGrow();syncComposer();
+  });
+  document.addEventListener("click",function(ev){if(!ev.target.closest("#epanel")&&!ev.target.closest("#emojibtn"))p.classList.remove("on");});
+})();
 
 // --- WhatsApp-style message menu: right-click a bubble on desktop, long-press on phones ---
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},2600);}
@@ -2465,10 +2844,13 @@ function doDelete(everyone){
 el("delme").addEventListener("click",function(){doDelete(false);});
 el("deleveryone").addEventListener("click",function(){doDelete(true);});
 var MEDIA_KINDS=["image","video","audio","voice","document","sticker","ptv"];
+var QUICK_REACTS=["👍","❤️","😂","😮","😢","🙏"];
 function showMenu(mid,x,y){
   var m=msgIndex[mid];if(!m)return;
   var mine=isOut(m)&&m._sby&&String(m._sby).toLowerCase()===meUser.toLowerCase();
-  var h='<button data-act="reply">&#8617;&nbsp; Reply</button>'
+  // WhatsApp's quick-react strip sits on top of the menu; ✕ takes a reaction back.
+  var h='<div class="rstrip">'+QUICK_REACTS.map(function(e2){return '<button data-react="'+e2+'">'+e2+'</button>';}).join("")+'<button data-react="" title="Remove my reaction">&#10005;</button></div>'
+       +'<button data-act="reply">&#8617;&nbsp; Reply</button>'
        +'<button data-act="copy">&#128203;&nbsp; Copy</button>'
        +'<button data-act="forward">&#10150;&nbsp; Forward</button>'
        +'<button data-act="star">'+(m.starred?'&#9734;&nbsp; Unstar':'&#9733;&nbsp; Star')+'</button>'
@@ -2499,6 +2881,16 @@ function downloadMedia(mid){
   document.body.appendChild(a);a.click();a.remove();
 }
 el("ctxmenu").addEventListener("click",function(e){
+  var rb=e.target.closest("[data-react]");
+  if(rb){
+    var rmid=menuMid;hideMenu();
+    fetch("/api/messages/react",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({messageId:rmid,emoji:rb.dataset.react})}).then(function(r){return r.json();}).then(function(d){
+        if(d.ok){toast(rb.dataset.react?("Reacted "+rb.dataset.react):"Reaction removed");lastSig="";setTimeout(refreshThread,900);}
+        else toast(d.error||"Could not react",true);
+      }).catch(function(){toast("Network error",true);});
+    return;
+  }
   var b=e.target.closest("[data-act]");if(!b)return;
   var mid=menuMid;hideMenu();
   if(b.dataset.act==="reply")startReply(mid);

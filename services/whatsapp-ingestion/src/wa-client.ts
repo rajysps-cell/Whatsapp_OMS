@@ -29,6 +29,8 @@ export interface WaClient {
   star: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
   /** Pin/unpin a message in the chat — visible to everyone in it, like WhatsApp's own pin. */
   pin: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
+  /** React to a message with an emoji ('' removes the reaction), like tapping it in WhatsApp. */
+  react: (messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Send a file (image / document / etc.) with an optional caption. Human-initiated only. */
   sendMedia: (
     chatId: string,
@@ -442,13 +444,15 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
   async function msgAction(
     c: InstanceType<typeof Client>,
     messageId: string,
-    action: 'star' | 'unstar' | 'pin' | 'unpin',
+    action: 'star' | 'unstar' | 'pin' | 'unpin' | 'react',
+    extra = '',
   ): Promise<{ ok: boolean; reason?: string }> {
     const page = c.pupPage;
     if (!page) return { ok: false, reason: 'browser page not available' };
     const res = (await page.evaluate(`(async () => {
       const ID = ${JSON.stringify(messageId)};
       const ACTION = ${JSON.stringify(action)};
+      const EXTRA = ${JSON.stringify(extra)};
       const coll = window.require('WAWebCollections');
       const rebuilt = (m) => {
         if (!m.id) return '';
@@ -466,6 +470,10 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
         const { Cmd } = window.require('WAWebCmd');
         if (ACTION === 'star') await Cmd.sendStarMsgs(chat, [msg], false);
         else await Cmd.sendUnstarMsgs(chat, [msg], false);
+        return { done: true };
+      }
+      if (ACTION === 'react') {
+        await window.require('WAWebSendReactionMsgAction').sendReactionToMsg(msg, EXTRA);
         return { done: true };
       }
       // Pin: WhatsApp pins carry an expiry; 7 days is WhatsApp's own default choice. The constant
@@ -563,6 +571,7 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     del: (messageId: string, everyone: boolean) => deleteMsg(client, messageId, everyone),
     star: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'star' : 'unstar'),
     pin: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'pin' : 'unpin'),
+    react: (messageId: string, emoji: string) => msgAction(client, messageId, 'react', emoji),
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions): Promise<string> => {
       const media = new MessageMedia(file.mimetype, file.data, file.filename);

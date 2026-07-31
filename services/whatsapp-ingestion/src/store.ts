@@ -61,6 +61,11 @@ db.exec(`
     unread   INTEGER NOT NULL DEFAULT 0,
     alt_id   TEXT
   );
+  CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
 `);
 
 // Added columns on existing tables (idempotent-by-catch: they already exist after one run).
@@ -70,6 +75,7 @@ for (const [table, col] of [
   ['processed', 'message_text TEXT'],
   ['processed', 'items TEXT'],
   ['processed', 'processed_by TEXT'], // display name of the user who completed the order
+  ['processed', 'order_no TEXT'], // the DDI order number the sales rep typed after Copy
   ['aliases', 'alias_text TEXT'],
   ['messages', 'reply_to TEXT'],
   ['messages', 'reply_text TEXT'],
@@ -147,6 +153,33 @@ export function setStarred(msgId: string, on: boolean): void {
 
 export function setPinned(msgId: string, on: boolean): void {
   db.prepare('UPDATE messages SET pinned = ? WHERE msg_id = ?').run(on ? Date.now() : 0, msgId);
+}
+
+// --- app settings (admin-editable at /settings; DB so they survive restarts and stay off git) ---
+export function getSetting(key: string, fallback = ''): string {
+  const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+  return r?.value ?? fallback;
+}
+export function setSetting(key: string, value: string): void {
+  db.prepare(
+    'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+  ).run(key, value, Date.now());
+}
+
+/** The DDI order number a sales rep typed after Copy — one number can cover several messages. */
+export function setOrderNo(messageIds: string[], orderNo: string): number {
+  const upd = db.prepare('UPDATE processed SET order_no = ? WHERE message_id = ?');
+  let n = 0;
+  for (const id of messageIds) n += Number(upd.run(orderNo, id).changes);
+  return n;
+}
+export function orderNoOf(chatId: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const rows = db
+    .prepare('SELECT p.message_id AS id, p.order_no AS no FROM processed p JOIN messages m ON m.msg_id = p.message_id WHERE m.chat_id = ? AND COALESCE(p.order_no, \'\') <> \'\'')
+    .all(chatId) as Array<{ id: string; no: string }>;
+  for (const r of rows) out.set(r.id, r.no);
+  return out;
 }
 
 /** The most recently pinned, still-visible message of a chat — drives the banner above the thread. */

@@ -239,6 +239,26 @@ def build():
     ])
 
     s += [Spacer(1, 4),
+          callout("Matched rows are filled light green",
+                  "A matched line has a light-green background; a line that still needs you stays "
+                  "white with an orange edge — visible even to colorblind users. Nothing is cut "
+                  "off: long product names and long customer wording wrap onto extra lines.")]
+
+    s += [Spacer(1, 4),
+          callout("Adding an item the customer did not write",
+                  "Click <b>+ Add item</b> under the order lines to put an extra product on the "
+                  "order — for example the customer wants a 1/2\" pump you only stock in 3/4\", so "
+                  "you send the 3/4\" pump plus the reducer that makes it fit. Search, pick, done. "
+                  "Added items go into the Final Order like any other line.")]
+
+    s += [Spacer(1, 4),
+          callout("The DDI order number",
+                  "After you press <b>Copy</b> and enter the order into DDI, a <b>DDI order #</b> "
+                  "box appears under the Final Order. Type the number DDI gave you and press Save "
+                  "— the message then shows “Processed by you · DDI #12345” for "
+                  "everyone.")]
+
+    s += [Spacer(1, 4),
           callout("One order spread over several messages",
                   "Customers often send an order in pieces — \"send me this\", then \"and also "
                   "this\". You do not have to do them one at a time. Click <b>Extract</b> on each "
@@ -304,6 +324,11 @@ def build():
                               "<b>Delete for me</b> hides it in this system only."],
           ], [30 * mm, 135 * mm]),
           Spacer(1, 3),
+          para("The emoji row on top of the menu <b>reacts</b> to the message, exactly like "
+               "tapping it in WhatsApp — the customer sees your reaction. The &#10005; takes your "
+               "reaction back. To put emojis inside a message you are typing, click the smiley "
+               "button next to the paperclip.", BODY),
+          Spacer(1, 3),
           para("Nobody can delete a message someone else sent — not even an administrator.", SMALL)]
 
     s += [para("How replies are marked", H2),
@@ -341,15 +366,34 @@ def build():
 
     # ---------------- admin ----------------
     s += [para("4. Administrator tasks", H1),
-          para("Only administrators see the <b>Users</b> link in the header.", LEAD)]
+          para("Only administrators see the <b>Users</b> and <b>Settings</b> links in the header.", LEAD)]
 
     s += [para("Adding a user", H2)]
     s += steps([
         "Click <b>Users</b> in the top-right, then <b>+ Add user</b>.",
         "Enter a username — letters and numbers only, no spaces or symbols.",
-        "Enter their full name, choose <b>User</b> or <b>Admin</b>, and set a temporary password.",
-        "Give them the temporary password. They must change it when they first sign in.",
+        "Enter their full name, <b>email address</b>, choose <b>User</b> or <b>Admin</b>, and set "
+        "a temporary password.",
+        "If an email is filled in, the person automatically receives a welcome email with the "
+        "website address, their username and the temporary password. They must change it when "
+        "they first sign in.",
     ])
+
+    s += [para("The Settings page", H2),
+          para("Everything the system does on its own is configured here.", BODY),
+          table([
+            ["Setting", "What it does"],
+            ["<b>Email sending</b>", "Which account sends the sign-in codes, welcome emails and "
+                                     "alerts. Choose <b>SMTP</b> (Gmail or any mail server) or "
+                                     "<b>Microsoft&nbsp;365</b> (Graph API — needs an Azure app "
+                                     "registration with the Mail.Send permission: Tenant ID, "
+                                     "Client ID, Client Secret and the sending mailbox)."],
+            ["<b>Send a test email</b>", "Sends a test message to your own email address, so you "
+                                         "know the configuration works before anyone needs a code."],
+            ["<b>New-device alerts</b>", "When switched on, every administrator with an email "
+                                         "address gets a message whenever someone signs in from a "
+                                         "device they have not used before."],
+          ], [40 * mm, 125 * mm])]
 
     s += [Spacer(1, 3),
           callout("Why usernames have no spaces",
@@ -546,11 +590,13 @@ def build_user():
     s += steps([
         "Click a chat on the left.",
         "Click the customer's order message. Products appear on the right, in the order the "
-        "customer wrote them.",
-        "<b>Green</b> lines were recognised. <b>Orange</b> lines need you: click one, search for "
-        "the right product, and pick it.",
+        "customer wrote them, each with the line number it came from.",
+        "Rows with a <b>light-green background</b> were recognised. <b>White</b> rows with an "
+        "orange edge need you: click one, search for the right product, and pick it.",
+        "Need something the customer did not write (a reducer, a fitting)? Click <b>+ Add item</b>.",
         "Check the quantities in the small boxes.",
-        "Click <b>Copy</b> — the order is on your clipboard, ready to paste.",
+        "Click <b>Copy</b> — the order is on your clipboard, ready to paste into DDI.",
+        "Type the order number DDI gives you into the <b>DDI order #</b> box and press Save.",
     ])
 
     s += [Spacer(1, 3),
@@ -578,10 +624,12 @@ def build_user():
                "a new line. To tag someone, type <font face='Courier-Bold'>@</font> and pick their "
                "name from the list — they get a notification.", BODY),
           para("Click the small <b>&#9662;</b> arrow on any message (or right-click / press and "
-               "hold) to <b>Reply</b>, <b>Copy</b>, <b>Forward</b>, <b>Star</b>, <b>Pin</b>, "
+               "hold) to <b>React with an emoji</b> (the row on top — the customer sees it, like "
+               "WhatsApp), <b>Reply</b>, <b>Copy</b>, <b>Forward</b>, <b>Star</b>, <b>Pin</b>, "
                "<b>Download</b> a photo or file, or <b>Delete</b> — Delete only appears on "
                "messages you sent yourself, and “for everyone” also removes it from the real "
-               "WhatsApp chat.", BODY),
+               "WhatsApp chat. The smiley button next to the paperclip puts emojis into your own "
+               "message.", BODY),
           para("Your replies are signed with your username automatically, so everyone can see who "
                "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
 
