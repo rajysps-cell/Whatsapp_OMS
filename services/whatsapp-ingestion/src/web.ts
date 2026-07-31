@@ -271,6 +271,13 @@ export function writeMediaCache(messageId: string, data: string, mimetype: strin
   }
   return buf.length;
 }
+/** "2026-07-31" -> LOCAL midnight, not UTC: Date.parse on a bare date assumes UTC, which shifted
+ *  every date filter by the timezone offset — "today" quietly included yesterday evening. */
+function parseLocalDate(s: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s.trim());
+  if (!m) return 0;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+}
 /** "jj***@gmail.com" — enough for "check that inbox", nothing for an attacker who guessed a password. */
 function maskEmail(e: string): string {
   const [user = '', domain = ''] = e.split('@');
@@ -507,9 +514,9 @@ async function handleAdmin(
     const beforeId = Math.max(0, Number(q.get('before') ?? 0) || 0);
     const user = (q.get('user') ?? '').slice(0, 32);
     const action = (q.get('action') ?? '').slice(0, 32);
-    const fromTs = Date.parse(q.get('from') ?? '') || 0;
-    const toRaw = Date.parse(q.get('to') ?? '') || 0;
-    const toTs = toRaw ? toRaw + 86_400_000 - 1 : 0; // "to" is an inclusive DATE
+    const fromTs = parseLocalDate(q.get('from') ?? '');
+    const toRaw = parseLocalDate(q.get('to') ?? '');
+    const toTs = toRaw ? toRaw + 86_400_000 - 1 : 0; // "to" is an inclusive DATE, local time
     json(res, 200, { ...listActivity(limit, beforeId, user, action, fromTs, toTs), users: allUsernames() });
     return true;
   }
@@ -1335,9 +1342,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // words, date-filterable. Feeds the /report page and its export.
   if (path === '/api/report') {
     const q = (u.searchParams.get('q') ?? '').slice(0, 100);
-    const from = Date.parse(u.searchParams.get('from') ?? '') || 0;
+    const from = parseLocalDate(u.searchParams.get('from') ?? '');
     // "to" is a DATE (inclusive): add a day so 31-07 includes everything ON the 31st.
-    const toRaw = Date.parse(u.searchParams.get('to') ?? '') || 0;
+    const toRaw = parseLocalDate(u.searchParams.get('to') ?? '');
     const to = toRaw ? toRaw + 86_400_000 - 1 : 0;
     json(res, 200, reportRows(q, from, to));
     return;
@@ -1923,7 +1930,9 @@ function reportPage(me: User): string {
   td{padding:8px 12px;border-bottom:1px solid #f1f5f9;vertical-align:top}
   tr:last-child td{border-bottom:0}
   .code{font-family:ui-monospace,Consolas,monospace;font-weight:700;color:var(--blue);white-space:nowrap}
+  .times{background:#e7f8f2;border:1px solid #b7ebd9;color:var(--em2);border-radius:8px;padding:0 6px;font-size:11px;font-family:'Segoe UI',sans-serif}
   .ph{color:var(--mut);overflow-wrap:anywhere}
+  tr.grp td{border-top:2px solid var(--line)}
   .empty{padding:22px;text-align:center;color:var(--mut)}
 </style></head><body>
 <header><h1>Match Report</h1><span class="who">signed in as <b>${esc(me.username)}</b></span><div class="spacer"></div>
@@ -1936,8 +1945,8 @@ function reportPage(me: User): string {
   </div>
   <div class="bar"><span class="muted" id="count"></span></div>
   <div class="card"><div class="scroll"><table><thead><tr>
-    <th style="width:34px"><input type="checkbox" id="all" title="Select everything shown"></th>
-    <th style="width:120px">SKU</th><th>Our product</th><th>Customer wrote</th>
+    <th style="width:34px"><input type="checkbox" id="all" title="Select every product shown"></th>
+    <th style="width:130px">SKU</th><th style="width:26%">Our product</th><th>Customer wrote</th>
     <th style="width:50px">Qty</th><th style="width:110px">Date</th><th style="width:90px">Saved by</th><th style="width:100px">DDI #</th>
   </tr></thead><tbody id="tb"></tbody></table></div></div>
 </div>
@@ -1946,16 +1955,40 @@ function el(id){return document.getElementById(id);}
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
-var rows=[];
+var rows=[],groups={},gorder=[];
 function when(ts){var d=new Date(ts);return d.toLocaleDateString([],{year:"2-digit",month:"short",day:"numeric"});}
-function syncExport(){var n=document.querySelectorAll(".pick:checked").length;var b=el("exportbtn");b.disabled=!n;b.textContent="Export selected ("+n+")";}
+function syncExport(){
+  var picked=document.querySelectorAll(".pick:checked"),lines=0;
+  picked.forEach(function(c){var g=groups[c.dataset.code];if(g)lines+=g.lines.length;});
+  var b=el("exportbtn");b.disabled=!picked.length;
+  b.textContent="Export selected ("+picked.length+" product"+(picked.length===1?"":"s")+", "+lines+" line"+(lines===1?"":"s")+")";
+}
+// GROUPED BY PRODUCT: a popular SKU that matched many different customer wordings shows ONCE,
+// with every wording as a sub-row under it — not repeated down the page. Most-matched first.
+// The date range is applied by the server, so a group only ever contains in-range lines.
 function render(){
-  el("tb").innerHTML=rows.length?rows.map(function(r,i){
-    return '<tr><td><input type="checkbox" class="pick" data-i="'+i+'"></td>'+
-      '<td class="code">'+esc(r.code)+'</td><td>'+esc(r.description)+'</td>'+
-      '<td class="ph">'+esc(r.phrase||"—")+'</td><td>'+esc(r.qty)+'</td>'+
-      '<td class="muted">'+when(r.ts)+'</td><td>'+esc(r.by||"—")+'</td><td>'+esc(r.orderNo||"—")+'</td></tr>';
-  }).join(""):'<tr><td colspan="8" class="empty">No saved order lines match. Try a broader search or a wider date range.</td></tr>';
+  groups={};gorder=[];
+  rows.forEach(function(r){
+    var k=r.code||"(no code)";
+    if(!groups[k]){groups[k]={desc:r.description,lines:[]};gorder.push(k);}
+    groups[k].lines.push(r);
+  });
+  gorder.sort(function(a,b){return groups[b].lines.length-groups[a].lines.length||(groups[b].lines[0].ts-groups[a].lines[0].ts);});
+  var h="";
+  gorder.forEach(function(k){
+    var g=groups[k],n=g.lines.length;
+    g.lines.forEach(function(l,j){
+      h+='<tr'+(j===0?' class="grp"':'')+'>';
+      if(j===0){
+        h+='<td rowspan="'+n+'"><input type="checkbox" class="pick" data-code="'+esc(k)+'"></td>'
+          +'<td rowspan="'+n+'" class="code">'+esc(k)+(n>1?' <span class="times">&times;'+n+'</span>':'')+'</td>'
+          +'<td rowspan="'+n+'">'+esc(g.desc)+'</td>';
+      }
+      h+='<td class="ph">'+esc(l.phrase||"—")+'</td><td>'+esc(l.qty)+'</td>'
+        +'<td class="muted">'+when(l.ts)+'</td><td>'+esc(l.by||"—")+'</td><td>'+esc(l.orderNo||"—")+'</td></tr>';
+    });
+  });
+  el("tb").innerHTML=h||'<tr><td colspan="8" class="empty">No saved order lines match. Try a broader search or a wider date range.</td></tr>';
   el("all").checked=false;syncExport();
 }
 var loadSeq=0;
@@ -1965,17 +1998,17 @@ var load=debounce(async function(){
   var d=await(await fetch("/api/report?"+q)).json();
   if(seq!==loadSeq)return;
   rows=d.rows||[];
-  el("count").textContent=d.total+" matched line"+(d.total===1?"":"s")+(d.total>rows.length?(" — showing the newest "+rows.length):"");
   render();
+  el("count").textContent=gorder.length+" product"+(gorder.length===1?"":"s")+" · "+d.total+" matched line"+(d.total===1?"":"s")+(d.total>rows.length?(" — showing the newest "+rows.length):"");
 },250);
 el("q").addEventListener("input",load);
 el("from").addEventListener("change",load);
 el("to").addEventListener("change",load);
 el("all").addEventListener("change",function(){var on=this.checked;document.querySelectorAll(".pick").forEach?document.querySelectorAll(".pick").forEach(function(c){c.checked=on;}):null;syncExport();});
 el("tb").addEventListener("change",function(e){if(e.target.classList.contains("pick"))syncExport();});
-// Export = a CSV of exactly the ticked rows, straight from the browser.
+// Export = a CSV of every line of the ticked PRODUCTS, straight from the browser.
 el("exportbtn").addEventListener("click",function(){
-  var picked=[];document.querySelectorAll(".pick:checked").forEach(function(c){picked.push(rows[+c.dataset.i]);});
+  var picked=[];document.querySelectorAll(".pick:checked").forEach(function(c){var g=groups[c.dataset.code];if(g)picked=picked.concat(g.lines);});
   if(!picked.length)return;
   var NL=String.fromCharCode(10);
   var csvq=function(s){s=String(s==null?"":s);return '"'+s.replace(/"/g,'""')+'"';};
