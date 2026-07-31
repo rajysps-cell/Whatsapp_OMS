@@ -1929,6 +1929,11 @@ function matchPage(me: User): string {
   .mln{display:none;flex:none;min-width:16px;text-align:right;color:var(--mut);font-size:10px;font-variant-numeric:tabular-nums;user-select:none}
   .mlt{min-width:0;flex:1}
   .bubble.ext .mln,.bubble.done .mln{display:inline-block}
+  /* While an extraction is OPEN, message lines whose products are all matched turn the same light
+     green as their rows — staff skip them and go straight to what still needs work. Scoped to
+     .ext on purpose: Copy or Clear drops that class and the bubble goes back to normal. */
+  .bubble.ext .ml.mlok{background:#d1efd7;border-radius:5px;padding:0 4px;margin:0 -4px}
+  .bubble.ext .ml.mlok .mln{color:var(--em2);font-weight:700}
   /* Media in the thread. Fetched lazily, so a chat with hundreds of photos stays fast. */
   .mediaimg{display:block;margin:0 0 3px}
   .mediaimg img{display:block;max-width:100%;max-height:320px;border-radius:6px;background:#00000008}
@@ -2154,6 +2159,9 @@ function matchPage(me: User): string {
   .addinline{flex:none;width:20px;height:20px;margin-top:1px;border:1px solid var(--line);border-radius:6px;background:#fff;
     color:var(--em2);font-size:14px;line-height:1;font-weight:700;cursor:pointer;padding:0}
   .addinline:hover{border-color:var(--em2);background:#f2fbf5}
+  .rmrow{flex:none;width:20px;height:20px;margin-top:1px;border:1px solid var(--line);border-radius:6px;background:#fff;
+    color:var(--mut);font-size:11px;line-height:1;font-weight:700;cursor:pointer;padding:0}
+  .rmrow:hover{border-color:#fca5a5;background:#fef2f2;color:var(--red)}
   .cust b{color:var(--em2);font-weight:600}
   .code{color:var(--blue);font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;font-weight:600}
   .sep{color:var(--mut);margin:0 3px}
@@ -2420,6 +2428,7 @@ function applyStates(){
   }
   var any=document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done").length;
   el("navlabel").style.display=any?"":"none";
+  highlightLines(); // thread re-renders rebuild the bubbles, so the green lines must be re-applied
 }
 // Toggle one message: OFF removes only that message's items; ON appends its items (others untouched).
 async function toggleExtract(mid){
@@ -2472,15 +2481,43 @@ function rowHtml(i){
   var custText=it.manual?"":(it.raw||it.phrase);
   var cust=custText?'<div class="cust"><span class="creq">Customer Require</span> &#10132; '+esc(custText)+chips+'</div>':(chips?'<div class="cust">'+chips+'</div>':'');
   var head='<div class="pinfo">'+prod+cust+'</div>';
-  var top='<div class="top" data-idx="'+i+'">'+lno+'<input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<button class="addinline" data-add="'+i+'" title="Add an item below this line (e.g. split into two products)">+</button><span class="exp">&#9656;</span></div>';
+  var top='<div class="top" data-idx="'+i+'">'+lno+'<input class="qty" data-idx="'+i+'" value="'+esc(it.quantity)+'">'+head+'<button class="addinline" data-add="'+i+'" title="Add an item below this line (e.g. split into two products)">+</button><span class="exp">&#9656;</span><button class="rmrow" data-rm="'+i+'" title="Remove this line — use when a text word was wrongly treated as a product">&#10005;</button></div>';
   var body='<div class="expand"><div class="inner"><input class="psearch" data-idx="'+i+'" placeholder="search products…" autocomplete="off"><div class="results" data-res="'+i+'"></div></div></div>';
   return '<div class="row '+cls+'" data-row="'+i+'">'+top+body+'</div>';
 }
 // Panel header (phone only): a way back to the chat. Included in the empty state too, so an
 // order panel opened with nothing in it is never a dead end.
 function panelHeadHtml(){return '<div class="panelclose"><button type="button" id="backchat">&#8592; Chat</button><span class="hint">swipe right to close</span></div>';}
+// Mirror the row state onto the message itself: a line whose extracted items are ALL matched is
+// tinted the same green inside the bubble, so staff can see at a glance what is already handled.
+// Only while that message's extraction is open — the CSS is scoped to .bubble.ext, and Copy/Clear
+// remove that class, which returns the bubble to normal exactly as asked.
+function highlightLines(){
+  var old=document.querySelectorAll(".msgs .ml.mlok");
+  for(var i2=0;i2<old.length;i2++)old[i2].classList.remove("mlok");
+  var mids=Object.keys(active);
+  for(var k=0;k<mids.length;k++){
+    var mid=mids[k];
+    var byLine={}; // line -> true while every item from that line has a chosen product
+    for(var j=0;j<items.length;j++){
+      var it=items[j];
+      if(it.mid!==mid||!it.line)continue;
+      var ok=!!it.chosen;
+      byLine[it.line]=(byLine[it.line]===undefined)?ok:(byLine[it.line]&&ok);
+    }
+    var bubble=document.querySelector('.msgs .bubble[data-mid="'+cssq(mid)+'"]');
+    if(!bubble)continue;
+    var mls=bubble.querySelectorAll(".ml");
+    for(var ln in byLine){
+      if(!byLine[ln])continue;
+      var elLn=mls[+ln-1];
+      if(elLn)elLn.classList.add("mlok");
+    }
+  }
+}
 function renderRight(){
   openIdx=null;
+  highlightLines();
   if(!items.length){el("right").innerHTML=panelHeadHtml()+'<div class="placeholder">'+(sources.length?"No products found in the selected message(s).":"Click Extract on a customer message to begin.")+'</div>';return;}
   // ONE list, in the order the customer wrote the items — splitting into Matched/Unmatched
   // reordered the order lines and made them impossible to check against the message.
@@ -2568,6 +2605,8 @@ el("right").addEventListener("click",function(e){
   if(e.target.closest("#backchat")){closePanel();return;}
   if(e.target.closest("#additem")){addItem();return;}
   var ai=e.target.closest(".addinline");if(ai){addItemAt(+ai.dataset.add);return;}
+  // ✕ removes the whole row — the fix for a piece of formal text wrongly treated as a product.
+  var rr=e.target.closest(".rmrow");if(rr){items.splice(+rr.dataset.rm,1);renderRight();return;}
   if(e.target.closest("#ddisave")){saveDdiNo();return;}
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
