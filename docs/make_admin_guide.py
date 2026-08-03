@@ -409,9 +409,10 @@ def build():
                "range. Kept for 90 days. Reading chats is not logged — only actions are.", BODY)]
 
     s += [para("The Report page", H2),
-          para("Available to every user (tab in the header): search any SKU or description and see "
-               "every saved order line grouped by product — each product once, every customer "
-               "wording under it, with date, who saved it and the DDI number. Date-range filter, "
+          para("Administrators only, like every page beyond Order Matching. Search any SKU or "
+               "description and see every match record grouped by product — saved order lines "
+               "(with date, who saved it and the DDI number) and <b>learned</b> wordings taught by "
+               "hand, each marked with a chip and deletable if wrong. Date-range filter, "
                "tick-boxes and a CSV export of exactly the ticked products.", BODY)]
 
     s += [Spacer(1, 3),
@@ -512,7 +513,7 @@ def build():
           table([
             ["Address", "Who can open it"],
             ["<font face='Courier-Bold'>oms.ysps.shop</font>", "Order matching — everyone"],
-            ["<font face='Courier-Bold'>oms.ysps.shop/report</font>", "Match report + learned product names — everyone"],
+            ["<font face='Courier-Bold'>oms.ysps.shop/report</font>", "Match report + learned product names — administrators"],
             ["<font face='Courier-Bold'>oms.ysps.shop/admin</font>", "User management — administrators"],
             ["<font face='Courier-Bold'>localhost:3009/qr</font>", "Re-link WhatsApp — administrators, on the server"],
           ], [62 * mm, 103 * mm])]
@@ -670,12 +671,6 @@ def build_user():
           para("Your replies are signed with your username automatically, so everyone can see who "
                "sent them. Messages typed in WhatsApp on a phone are not signed.", BODY)]
 
-    s += [para("The Match Report", H2),
-          para("The <b>Report</b> tab answers “how did this product match customer orders?” Type "
-               "part of a SKU or description (even just <font face='Courier-Bold'>ac</font>) and "
-               "every saved order line appears, grouped by product — each product once, with every "
-               "customer wording under it. Filter by date range, tick the products you want, and "
-               "<b>Export</b> downloads them as a spreadsheet file.", BODY)]
 
     s += [Spacer(1, 3),
           callout("There is no undo",

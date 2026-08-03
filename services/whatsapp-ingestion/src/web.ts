@@ -165,9 +165,11 @@ function html(res: http.ServerResponse, body: string): void {
  * render for normal users. Every page pastes NAV_CSS into its stylesheet so the bar cannot drift.
  */
 function navHtml(me: User, current: string): string {
+  // Everything except Order Matching itself is admin-only — normal users work the chats and
+  // nothing else.
   const tabs: Array<[href: string, label: string, show: boolean]> = [
     ['/', 'Order Matching', true],
-    ['/report', 'Report', true],
+    ['/report', 'Report', me.role === 'admin'],
     ['/admin', 'Users', me.role === 'admin'],
     ['/settings', 'Settings', me.role === 'admin'],
     ['/activity', 'Activity', me.role === 'admin'],
@@ -841,7 +843,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // --- admin-only surface ---------------------------------------------------
   // /qr shows the WhatsApp device-linking QR: scanning it links a phone to the business account
   // with full read+send, outside this app and unaffected by disabling the OMS user. Admins only.
-  if (path === '/admin' || path === '/qr' || path === '/settings' || path === '/activity' || path.startsWith('/api/users') || path.startsWith('/api/settings') || path.startsWith('/api/activity')) {
+  if (path === '/admin' || path === '/qr' || path === '/settings' || path === '/activity' || path === '/report' || path === '/aliases' || path.startsWith('/api/users') || path.startsWith('/api/settings') || path.startsWith('/api/activity') || path.startsWith('/api/report') || path.startsWith('/api/aliases')) {
     if (me.role !== 'admin') {
       if (path.startsWith('/api/')) {
         json(res, 403, { error: 'admin only' });
