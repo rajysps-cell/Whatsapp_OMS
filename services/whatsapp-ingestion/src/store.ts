@@ -198,8 +198,11 @@ export function isIgnoredPhrase(norm: string): boolean {
 }
 
 // --- match report ------------------------------------------------------------------------
-// "Show me how our products matched customer requirements": every line of every SAVED order,
-// flattened, searchable by SKU / description / the customer's own words, date-filterable.
+// "Show me how our products matched customer requirements" — BOTH kinds of record in one list:
+//   'order'   — a line of a saved order (qty, who saved it, the DDI number when there is one)
+//   'learned' — a wording somebody taught by hand that was never part of a saved order
+// This absorbed the old Aliases page: one report, searchable by SKU / description / the
+// customer's own words, date-filterable across both kinds.
 export interface ReportRow {
   code: string;
   description: string;
@@ -209,19 +212,30 @@ export interface ReportRow {
   by: string;
   orderNo: string;
   chatId: string;
+  kind: 'order' | 'learned';
+  /** aliases' primary key, only on learned rows — lets the report delete a bad lesson. */
+  norm?: string;
 }
 export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { rows: ReportRow[]; total: number } {
+  const ql = q.toLowerCase().trim();
+  const qq = ql.replace(/\s+/g, '');
+  // Space-insensitive on top of substring: customers write "nohub", the catalog writes
+  // "NO HUB" — both must find each other.
+  const matches = (code: string, desc: string, phrase: string): boolean => {
+    if (!ql) return true;
+    const hay = `${code} ${desc} ${phrase}`.toLowerCase();
+    return hay.includes(ql) || hay.replace(/\s+/g, '').includes(qq);
+  };
   const conds: string[] = [];
   const args: number[] = [];
   if (fromTs > 0) { conds.push('processed_at >= ?'); args.push(fromTs); }
   if (toTs > 0) { conds.push('processed_at <= ?'); args.push(toTs); }
   const where = conds.length ? ' WHERE ' + conds.join(' AND ') : '';
   const saved = db
-    .prepare(`SELECT items, processed_at, processed_by, order_no, chat_id FROM processed${where} ORDER BY processed_at DESC`)
+    .prepare(`SELECT items, processed_at, processed_by, order_no, chat_id FROM processed${where}`)
     .all(...args) as Array<{ items: string | null; processed_at: number; processed_by: string | null; order_no: string | null; chat_id: string | null }>;
-  const ql = q.toLowerCase().trim();
-  const out: ReportRow[] = [];
-  let total = 0;
+  const all: ReportRow[] = [];
+  const seen = new Set<string>(); // code|wording pairs already covered by an order row
   for (const s of saved) {
     if (!s.items) continue;
     let lines: Array<{ qty?: string; code?: string; description?: string; phrase?: string }>;
@@ -234,27 +248,51 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { row
       const code = l.code ?? '';
       const desc = l.description ?? '';
       const phrase = l.phrase ?? '';
-      // Space-insensitive on top of substring: customers write "nohub", the catalog writes
-      // "NO HUB" — both must find each other.
-      const hay = `${code} ${desc} ${phrase}`.toLowerCase();
-      const qq = ql.replace(/\s+/g, '');
-      if (ql && !(hay.includes(ql) || hay.replace(/\s+/g, '').includes(qq))) continue;
-      total++;
-      if (out.length < limit) {
-        out.push({
-          code,
-          description: desc,
-          phrase,
-          qty: l.qty ?? '1',
-          ts: s.processed_at,
-          by: s.processed_by ?? '',
-          orderNo: s.order_no ?? '',
-          chatId: s.chat_id ?? '',
-        });
-      }
+      seen.add(`${code}|${phrase.toLowerCase().trim()}`);
+      if (!matches(code, desc, phrase)) continue;
+      all.push({
+        code,
+        description: desc,
+        phrase,
+        qty: l.qty ?? '1',
+        ts: s.processed_at,
+        by: s.processed_by ?? '',
+        orderNo: s.order_no ?? '',
+        chatId: s.chat_id ?? '',
+        kind: 'order',
+      });
     }
   }
-  return { rows: out, total };
+  // Learned wordings. A lesson whose exact wording already shows as an order line of the same
+  // product would be pure duplication — skip those; everything else is a record the old Aliases
+  // page had and the report was missing.
+  const aConds: string[] = [];
+  const aArgs: number[] = [];
+  if (fromTs > 0) { aConds.push('created_at >= ?'); aArgs.push(fromTs); }
+  if (toTs > 0) { aConds.push('created_at <= ?'); aArgs.push(toTs); }
+  const aWhere = aConds.length ? ' WHERE ' + aConds.join(' AND ') : '';
+  const learned = db
+    .prepare(`SELECT phrase_norm, alias_text, product_code, product_desc, created_at FROM aliases${aWhere}`)
+    .all(...aArgs) as Array<{ phrase_norm: string; alias_text: string | null; product_code: string; product_desc: string; created_at: number }>;
+  for (const a of learned) {
+    const phrase = a.alias_text || a.phrase_norm;
+    if (seen.has(`${a.product_code}|${phrase.toLowerCase().trim()}`)) continue;
+    if (!matches(a.product_code, a.product_desc, phrase)) continue;
+    all.push({
+      code: a.product_code,
+      description: a.product_desc,
+      phrase,
+      qty: '',
+      ts: a.created_at,
+      by: '',
+      orderNo: '',
+      chatId: '',
+      kind: 'learned',
+      norm: a.phrase_norm,
+    });
+  }
+  all.sort((x, y) => y.ts - x.ts);
+  return { rows: all.slice(0, limit), total: all.length };
 }
 
 // --- user activity log -------------------------------------------------------------------
@@ -513,6 +551,7 @@ export interface MsgRow {
   /** Emoji reactions applied to this message (one entry per reactor). */
   reactions: string[];
   /** Quoted-reply context, when this message replies to another. */
+  replyTo?: string;
   replyText?: string;
   replySender?: string;
   /** Display name of the user who marked this message processed (Copy), if any. */
@@ -760,6 +799,7 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     ts: r.ts,
     isGroup: !!r.is_group,
     reactions: reMap.get(r.msg_id) ?? [],
+    replyTo: r.reply_to ?? undefined,
     replyText: r.reply_text ?? undefined,
     replySender: r.reply_sender ?? undefined,
     processedBy: byMap.get(r.msg_id),

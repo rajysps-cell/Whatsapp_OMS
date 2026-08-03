@@ -512,7 +512,7 @@ def build():
           table([
             ["Address", "Who can open it"],
             ["<font face='Courier-Bold'>oms.ysps.shop</font>", "Order matching — everyone"],
-            ["<font face='Courier-Bold'>oms.ysps.shop/aliases</font>", "Learned product names — everyone"],
+            ["<font face='Courier-Bold'>oms.ysps.shop/report</font>", "Match report + learned product names — everyone"],
             ["<font face='Courier-Bold'>oms.ysps.shop/admin</font>", "User management — administrators"],
             ["<font face='Courier-Bold'>localhost:3009/qr</font>", "Re-link WhatsApp — administrators, on the server"],
           ], [62 * mm, 103 * mm])]

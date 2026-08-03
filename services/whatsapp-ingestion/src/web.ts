@@ -168,7 +168,6 @@ function navHtml(me: User, current: string): string {
   const tabs: Array<[href: string, label: string, show: boolean]> = [
     ['/', 'Order Matching', true],
     ['/report', 'Report', true],
-    ['/aliases', 'Aliases', true],
     ['/admin', 'Users', me.role === 'admin'],
     ['/settings', 'Settings', me.role === 'admin'],
     ['/activity', 'Activity', me.role === 'admin'],
@@ -205,7 +204,6 @@ function checkInlineScripts(): void {
   const pages: Array<[string, string]> = [
     ['/match', matchPage(fake)],
     ['/admin', adminPage(fake)],
-    ['/aliases', aliasPage(fake)],
     ['/board', dashboardPage()],
     ['/login', loginPage()],
     ['/change-password', changePasswordPage(fake)],
@@ -1055,7 +1053,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       mentions: mentionNames(), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
     });
     return;
   }
@@ -1487,8 +1485,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, { ok, aliases: aliasesForProduct(code) });
     return;
   }
+  // The Aliases page merged into the Report ('learned' rows) — keep old bookmarks working.
   if (path === '/aliases') {
-    html(res, aliasPage(me));
+    redirect(res, '/report');
     return;
   }
   if (path === '/match') {
@@ -1957,6 +1956,9 @@ function reportPage(me: User): string {
   tr:last-child td{border-bottom:0}
   .code{font-family:ui-monospace,Consolas,monospace;font-weight:700;color:var(--blue);white-space:nowrap}
   .times{background:#e7f8f2;border:1px solid #b7ebd9;color:var(--em2);border-radius:8px;padding:0 6px;font-size:11px;font-family:'Segoe UI',sans-serif}
+  .lrn{background:#eef2f6;border:1px solid var(--line);color:#475569;border-radius:7px;padding:0 6px;font-size:10.5px;font-weight:700;white-space:nowrap}
+  .delrn{border:0;background:none;color:#cbd5e1;cursor:pointer;font-size:11px;padding:1px 4px;border-radius:5px}
+  .delrn:hover{color:#dc2626;background:#fef2f2}
   .ph{color:var(--mut);overflow-wrap:anywhere}
   tr.grp td{border-top:2px solid var(--line)}
   .empty{padding:22px;text-align:center;color:var(--mut)}
@@ -2010,8 +2012,16 @@ function render(){
           +'<td rowspan="'+n+'" class="code">'+esc(k)+(n>1?' <span class="times">&times;'+n+'</span>':'')+'</td>'
           +'<td rowspan="'+n+'">'+esc(g.desc)+'</td>';
       }
-      h+='<td class="ph">'+esc(l.phrase||"—")+'</td><td>'+esc(l.qty)+'</td>'
-        +'<td class="muted">'+when(l.ts)+'</td><td>'+esc(l.by||"—")+'</td><td>'+esc(l.orderNo||"—")+'</td></tr>';
+      // 'learned' = a wording somebody taught by hand, never part of a saved order (the old
+      // Aliases page). It has no qty/by/DDI, and it can be deleted right here if it was wrong.
+      if(l.kind==="learned"){
+        h+='<td class="ph">'+esc(l.phrase||"—")+' <span class="lrn" title="taught by hand — not from a saved order">learned</span>'
+          +' <button class="delrn" data-norm="'+esc(l.norm||"")+'" data-code="'+esc(l.code)+'" title="Delete this learned wording">&#10005;</button></td>'
+          +'<td class="muted">—</td><td class="muted">'+when(l.ts)+'</td><td class="muted">—</td><td class="muted">—</td></tr>';
+      }else{
+        h+='<td class="ph">'+esc(l.phrase||"—")+'</td><td>'+esc(l.qty)+'</td>'
+          +'<td class="muted">'+when(l.ts)+'</td><td>'+esc(l.by||"—")+'</td><td>'+esc(l.orderNo||"—")+'</td></tr>';
+      }
     });
   });
   el("tb").innerHTML=h||'<tr><td colspan="8" class="empty">No saved order lines match. Try a broader search or a wider date range.</td></tr>';
@@ -2032,14 +2042,21 @@ el("from").addEventListener("change",load);
 el("to").addEventListener("change",load);
 el("all").addEventListener("change",function(){var on=this.checked;document.querySelectorAll(".pick").forEach?document.querySelectorAll(".pick").forEach(function(c){c.checked=on;}):null;syncExport();});
 el("tb").addEventListener("change",function(e){if(e.target.classList.contains("pick"))syncExport();});
+// Deleting a bad learned wording, straight from the report (this replaced the Aliases page).
+el("tb").addEventListener("click",function(e){
+  var b=e.target.closest(".delrn");if(!b)return;
+  if(!window.confirm('Delete the learned wording? "'+(b.closest("td").textContent.replace(/learned.*$/,"").trim())+'" will no longer auto-match '+b.dataset.code+"."))return;
+  fetch("/api/aliases/delete",{method:"POST",headers:{"content-type":"application/json"},
+    body:JSON.stringify({norm:b.dataset.norm,code:b.dataset.code})}).then(function(r){return r.json();}).then(function(){load();}).catch(function(){});
+});
 // Export = a CSV of every line of the ticked PRODUCTS, straight from the browser.
 el("exportbtn").addEventListener("click",function(){
   var picked=[];document.querySelectorAll(".pick:checked").forEach(function(c){var g=groups[c.dataset.code];if(g)picked=picked.concat(g.lines);});
   if(!picked.length)return;
   var NL=String.fromCharCode(10);
   var csvq=function(s){s=String(s==null?"":s);return '"'+s.replace(/"/g,'""')+'"';};
-  var csv="SKU,Product,Customer wrote,Qty,Date,Saved by,DDI order"+NL+picked.map(function(r){
-    return [r.code,r.description,r.phrase,r.qty,new Date(r.ts).toLocaleString(),r.by,r.orderNo].map(csvq).join(",");
+  var csv="SKU,Product,Customer wrote,Type,Qty,Date,Saved by,DDI order"+NL+picked.map(function(r){
+    return [r.code,r.description,r.phrase,r.kind==="learned"?"Learned":"Order",r.qty,new Date(r.ts).toLocaleString(),r.by,r.orderNo].map(csvq).join(",");
   }).join(NL);
   var a=document.createElement("a");
   a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
@@ -2156,7 +2173,7 @@ function dashboardPage(): string {
   .card .foot{display:flex;justify-content:space-between;margin-top:8px;font-size:11px;color:#667781}
   .empty{color:#94a3b8;font-size:12px;text-align:center;padding:18px 0}a{color:#2563eb}
 </style></head><body>
-<header><div class="dot" id="dot"></div><h1>Order Command Center</h1><span class="conn" id="conn">connecting…</span><div class="spacer"></div><span class="meta" id="meta"></span><a class="navlink" href="/aliases">Aliases</a><a class="navlink" href="/match">Order Matching →</a></header>
+<header><div class="dot" id="dot"></div><h1>Order Command Center</h1><span class="conn" id="conn">connecting…</span><div class="spacer"></div><span class="meta" id="meta"></span><a class="navlink" href="/report">Report</a><a class="navlink" href="/match">Order Matching →</a></header>
 <div class="board" id="board"></div>
 <script>
 const COLS=[["new","New Orders","#3b82f6"],["discussion","Discussion","#f59e0b"],["waiting_customer","Waiting Customer","#fb923c"],["waiting_warehouse","Waiting Warehouse","#a78bfa"],["finalized","Finalized","#22c55e"]];
@@ -2332,6 +2349,8 @@ function matchPage(me: User): string {
   .mn{color:#027eb5;font-weight:500}
   /* Quoted reply block, shown above the text inside the same bubble (WhatsApp layout). */
   .q{display:flex;background:rgba(0,0,0,.055);border-radius:6px;overflow:hidden;margin-bottom:4px}
+  .q[data-goto]{cursor:pointer}
+  .q[data-goto]:hover{background:rgba(0,0,0,.09)}
   .out .q{background:rgba(0,0,0,.05)}
   .q .qbar{width:4px;background:#06cf9c;flex-shrink:0}
   .q .qin{padding:5px 9px;min-width:0;flex:1}
@@ -2684,7 +2703,9 @@ function quoteHtml(m){
   if(!m.replyText&&!m.replySender)return"";
   var who=jidName(m.replySender)||"Message";
   var body=m.replyText?fmtBody(m.replyText):'<span class="qm">Media</span>';
-  return '<div class="q"><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
+  // data-goto: clicking the quote jumps to the original message, like WhatsApp.
+  var go=m.replyTo?' data-goto="'+esc(m.replyTo)+'" title="Go to the original message"':'';
+  return '<div class="q"'+go+'><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
 }
 function renderThread(ms){var pk=null,pd=null,o=[];for(var i=0;i<ms.length;i++){var m=ms[i];var out=isOut(m);var sk=out?"~out~":(m.sender||m.pushName||"?");var day=m.ts?dayKeyOf(m.ts):"";var nd=day!==pd;var grp=!nd&&sk===pk;if(nd&&m.ts)o.push('<div class="daysep"><span>'+esc(dayLabel(m.ts))+'</span></div>');pd=day;pk=sk;// Attribution: the server's sent_by record is authoritative; the text signature is only a
 // fallback for messages sent before attribution moved into the database.
@@ -2794,6 +2815,14 @@ el("msgs").addEventListener("click",function(e){
   // The ⌄ arrow opens the message menu — the visible way in; right-click/long-press still work.
   var mb=e.target.closest(".mbtn");
   if(mb){e.stopPropagation();var r=mb.getBoundingClientRect();showMenu(mb.closest(".bubble").dataset.mid,r.left,r.bottom+4);return;}
+  // Clicking a quoted reply jumps to the original message, like WhatsApp.
+  var q=e.target.closest(".q[data-goto]");
+  if(q){
+    var t=document.querySelector('.msgs .bubble[data-mid="'+cssq(q.dataset.goto)+'"]');
+    if(t){t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.add("flash");setTimeout(function(){t.classList.remove("flash");},1200);}
+    else toast("That message is further back than this view loads.",true);
+    return;
+  }
   var b=e.target.closest(".xable");if(b&&!b.classList.contains("busy"))toggleExtract(b.dataset.mid);});
 // Jump between extracted/processed messages in a long thread.
 var navIdx=-1;
@@ -3533,170 +3562,3 @@ loadCat();loadChats();setInterval(loadChats,6000);setInterval(refreshThread,4000
 </script></body></html>`;
 }
 
-// --- Product Alias Management page (at /aliases) ---
-function aliasPage(me: User): string {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Product Alias Management</title>
-<style>
-  :root{color-scheme:light;
-    --bg:#f0f2f5;--panel:#ffffff;--line:#e5e7eb;
-    --em:#10b981;--em2:#059669;--emdim:#d1fae5;--blue:#2563eb;--amber:#d97706;--red:#dc2626;
-    --tx:#111b21;--mut:#667781}
-  *{box-sizing:border-box}
-  body{margin:0;min-height:100vh;font-family:'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
-  ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#00000026;border-radius:6px}
-  header{display:flex;align-items:center;gap:12px;padding:13px 20px;background:var(--panel);border-bottom:1px solid var(--line);box-shadow:0 1px 3px #0000001a;position:sticky;top:0;z-index:5}
-  header h1{font-size:16px;margin:0;font-weight:700}
-  .spacer{flex:1}
-  ${NAV_CSS}
-  .muted{color:var(--mut);font-size:12px}
-  .wrap{max-width:1000px;margin:0 auto;padding:20px 18px}
-  .toolbar{display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-  .search{flex:1;min-width:220px;position:relative}
-  .search input{width:100%;padding:11px 13px 11px 34px;background:var(--panel);border:1px solid var(--line);color:var(--tx);border-radius:10px;font-size:14px;outline:none;transition:border-color .15s,box-shadow .15s}
-  .search input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #2563eb1f}
-  .search .ic{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--mut);font-size:15px}
-  .count{font-size:13px;color:var(--mut);white-space:nowrap}
-  .cardbox{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:0 2px 8px #0000000f}
-  table{width:100%;border-collapse:collapse;font-size:14px}
-  thead th{text-align:left;padding:11px 14px;background:#f8fafc;border-bottom:1px solid var(--line);color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px;font-weight:700}
-  tbody td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
-  tbody tr:last-child td{border-bottom:0}tbody tr{transition:background .12s}tbody tr:hover{background:#f7f9fc}
-  .sku{font-family:ui-monospace,SFMono-Regular,monospace;color:var(--blue);font-weight:600;font-size:13px}
-  .pill{display:inline-block;min-width:26px;text-align:center;background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0;border-radius:20px;padding:2px 10px;font-size:12px;font-weight:700}
-  .pill.zero{background:#f1f5f9;color:var(--mut);border-color:var(--line)}
-  .tright{text-align:right}
-  .btn{background:var(--blue);color:#fff;border:0;border-radius:9px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s,transform .05s;display:inline-flex;align-items:center;gap:6px}
-  .btn:hover{filter:brightness(1.08)}.btn:active{transform:translateY(1px)}.btn:disabled{opacity:.5;cursor:default;filter:none}
-  .btn.sm{padding:6px 12px;font-size:12px}
-  .btn.green{background:var(--em)}.btn.ghost{background:#0000;border:1px solid var(--line);color:var(--mut)}.btn.ghost:hover{border-color:var(--blue);color:var(--blue)}
-  .btn.danger{background:var(--red)}
-  .pager{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 4px;font-size:13px;color:var(--mut)}
-  .pager .pg{display:flex;gap:8px;align-items:center}
-  .empty{padding:40px 16px;text-align:center;color:var(--mut);font-size:14px;line-height:1.6}
-  .spinner{width:22px;height:22px;border:3px solid #0000001a;border-top-color:var(--blue);border-radius:50%;display:inline-block;animation:spin .7s linear infinite}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .loadrow{padding:34px;text-align:center}
-  .prow{cursor:pointer}
-  .prow .chev{display:inline-block;color:var(--mut);font-size:12px;transition:transform .22s,color .22s}
-  .prow.open{background:#eef4fb}.prow.open:hover{background:#eef4fb}.prow.open .chev{transform:rotate(90deg);color:var(--blue)}
-  .drow>td{padding:0;border-bottom:1px solid var(--line);background:#f8fafc}
-  .detail{opacity:0;transform:translateY(-6px);transition:opacity .3s ease,transform .3s ease}
-  .detail.show{opacity:1;transform:translateY(0)}
-  .detail .inner{padding:14px 16px}
-  .detail h3{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);margin:0 0 10px}
-  .chips{display:flex;flex-wrap:wrap;gap:8px;min-height:22px;align-items:center}
-  .chip{display:inline-flex;align-items:center;gap:5px;background:#f8fafc;border:1px solid var(--line);border-radius:20px;padding:5px 6px 5px 12px;font-size:13px;transition:border-color .12s,box-shadow .12s}
-  .chip:hover{border-color:#c9d3e0;box-shadow:0 1px 3px #0000000f}
-  .chip .txt{color:var(--tx)}
-  .chip .ib{background:#0000;border:0;cursor:pointer;font-size:12px;line-height:1;padding:3px 4px;border-radius:50%;color:var(--mut)}
-  .chip .ib:hover{background:#e8eef7;color:var(--blue)}
-  .chip .ib.del:hover{background:#fde8e8;color:var(--red)}
-  .chip input{border:1px solid var(--blue);border-radius:14px;padding:3px 8px;font-size:13px;outline:none;width:130px}
-  .padd{margin-top:16px;display:flex;gap:8px}
-  .padd input{flex:1;padding:9px 11px;background:#f8fafc;border:1px solid var(--line);color:var(--tx);border-radius:9px;font-size:13px;outline:none}
-  .padd input:focus{border-color:var(--blue)}
-  .pempty{color:var(--mut);font-size:13px;padding:8px 0}
-  .toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:40}
-  .toast{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--em);border-radius:10px;padding:11px 14px;font-size:13px;box-shadow:0 4px 14px #00000022;min-width:220px;max-width:340px;animation:slidein .2s ease}
-  .toast.err{border-left-color:var(--red)}
-  @keyframes slidein{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
-  .modal{position:fixed;inset:0;background:#0f172a66;display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
-  .modal.on{display:flex}
-  .modal .box{background:var(--panel);border-radius:14px;padding:20px;max-width:360px;width:100%;box-shadow:0 12px 40px #00000033}
-  .modal h4{margin:0 0 8px;font-size:16px}
-  .modal p{margin:0 0 18px;color:var(--mut);font-size:14px;line-height:1.5;word-break:break-word}
-  .modal .r{display:flex;justify-content:flex-end;gap:10px}
-</style></head><body>
-<header><h1>Product Alias Management</h1><span class="muted" id="stat"></span><div class="spacer"></div>${navHtml(me, '/aliases')}</header>
-<div class="wrap">
-  <div class="toolbar">
-    <div class="search"><span class="ic">&#9906;</span><input id="q" placeholder="Search by SKU, product name, or alias…" autocomplete="off"></div>
-    <span class="count" id="count"></span>
-  </div>
-  <div class="cardbox"><table><thead><tr><th style="width:150px">SKU</th><th>Product Name</th><th style="width:96px">Aliases</th><th style="width:104px" class="tright">Actions</th></tr></thead><tbody id="tbody"></tbody></table></div>
-  <div class="pager"><span id="pinfo"></span><span class="pg"><button class="btn ghost sm" id="prev">&#8249; Prev</button><button class="btn ghost sm" id="next">Next &#8250;</button></span></div>
-</div>
-<div class="toasts" id="toasts"></div>
-<div class="modal" id="modal"><div class="box"><h4>Delete alias?</h4><p id="mText"></p><div class="r"><button class="btn ghost" id="mCancel">Cancel</button><button class="btn danger" id="mOk">Delete</button></div></div></div>
-<script>
-var q="",page=1,limit=25,total=0,curCode=null,curAliases=[],curDetail=null;
-function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
-function el(id){return document.getElementById(id);}
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
-function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
-function toast(msg,type){var t=document.createElement('div');t.className='toast'+(type==='err'?' err':'');t.textContent=msg;el('toasts').appendChild(t);setTimeout(function(){t.style.transition='opacity .3s';t.style.opacity='0';setTimeout(function(){t.remove();},300);},2600);}
-async function post(url,body){try{return await(await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})).json();}catch(e){return {ok:false,error:'Network error'};}}
-
-async function loadList(){
-  curCode=null;curDetail=null; // any expanded row is destroyed when tbody re-renders
-  el('tbody').innerHTML='<tr><td colspan="4" class="loadrow"><span class="spinner"></span></td></tr>';
-  try{
-    var d=await(await fetch('/api/aliases?q='+encodeURIComponent(q)+'&page='+page+'&limit='+limit)).json();
-    total=d.total||0;var rows=d.rows||[];
-    if(!rows.length){el('tbody').innerHTML='<tr><td colspan="4"><div class="empty">'+(q?'No products match &ldquo;'+esc(q)+'&rdquo;.':'No products have aliases yet.<br>Search for a product above to add its first alias.')+'</div></td></tr>';}
-    else{el('tbody').innerHTML=rows.map(function(r){var z=r.count?'':' zero';return '<tr class="prow" data-code="'+esc(r.code)+'" data-name="'+esc(r.description||'')+'"><td><span class="sku">'+esc(r.code||'—')+'</span></td><td>'+esc(r.description||'')+'</td><td><span class="pill'+z+'">'+r.count+'</span></td><td class="tright"><span class="chev">&#9656;</span></td></tr>';}).join('');}
-    var pages=Math.max(1,Math.ceil(total/limit));
-    el('pinfo').textContent=total?('Page '+page+' of '+pages+' · '+total+' product'+(total===1?'':'s')):'';
-    el('count').textContent=total?(total+' result'+(total===1?'':'s')):'';
-    el('prev').disabled=page<=1;el('next').disabled=page>=pages;
-  }catch(e){el('tbody').innerHTML='<tr><td colspan="4"><div class="empty">Failed to load. Is the service running?</div></td></tr>';}
-}
-async function loadStat(){try{var d=await(await fetch('/api/products/count')).json();el('stat').textContent=(d.count||0).toLocaleString()+' products · '+(d.aliases||0)+' aliases';}catch(e){}}
-function updateRowCount(code,n){var rows=el('tbody').querySelectorAll('tr[data-code]');for(var i=0;i<rows.length;i++){if(rows[i].getAttribute('data-code')===code){var p=rows[i].querySelector('.pill');if(p){p.textContent=n;p.className='pill'+(n?'':' zero');}return;}}}
-
-el('q').addEventListener('input',debounce(function(){q=el('q').value.trim();page=1;loadList();},250));
-el('prev').addEventListener('click',function(){if(page>1){page--;loadList();}});
-el('next').addEventListener('click',function(){page++;loadList();});
-// Click a product row to expand its aliases inline (accordion: one open at a time, fade in/out).
-el('tbody').addEventListener('click',function(e){var tr=e.target.closest('.prow');if(tr)toggleRow(tr);});
-
-function collapse(){
-  if(!curDetail)return;
-  var d=curDetail,dt=d.querySelector('.detail');
-  var openTr=el('tbody').querySelector('.prow.open');if(openTr)openTr.classList.remove('open');
-  if(dt)dt.classList.remove('show');               // fade out
-  setTimeout(function(){if(d.parentNode)d.parentNode.removeChild(d);},300);
-  curDetail=null;curCode=null;curAliases=[];
-}
-function toggleRow(tr){
-  var code=tr.getAttribute('data-code');
-  if(curCode===code){collapse();return;}           // clicking the open row closes it
-  collapse();                                        // close any other open row
-  curCode=code;curAliases=[];tr.classList.add('open');
-  var drow=document.createElement('tr');drow.className='drow';
-  drow.innerHTML='<td colspan="4"><div class="detail"><div class="inner"><h3>Aliases (<span class="pCount">0</span>)</h3><div class="chips"><span class="spinner"></span></div><div class="pempty" style="display:none">No aliases yet — add the first one below.</div><div class="padd"><input class="newAlias" placeholder="Enter new alias…" maxlength="255" autocomplete="off"><button class="btn green addBtn">Add Alias</button></div></div></div></td>';
-  tr.after(drow);curDetail=drow;
-  var dt=drow.querySelector('.detail');void dt.offsetWidth;dt.classList.add('show'); // reflow commits opacity:0, then transition to 1 = fade in
-  drow.querySelector('.chips').addEventListener('click',chipClick);
-  drow.querySelector('.addBtn').addEventListener('click',addAlias);
-  drow.querySelector('.newAlias').addEventListener('keydown',function(e){if(e.key==='Enter')addAlias();});
-  loadAliases(code);
-}
-async function loadAliases(code){try{var d=await(await fetch('/api/aliases/product?code='+encodeURIComponent(code))).json();if(curCode!==code)return;curAliases=d.aliases||[];renderChips();}catch(e){if(curDetail)curDetail.querySelector('.chips').innerHTML='';toast('Failed to load aliases','err');}}
-function renderChips(){
-  if(!curDetail)return;
-  curDetail.querySelector('.pCount').textContent=curAliases.length;
-  curDetail.querySelector('.pempty').style.display=curAliases.length?'none':'block';
-  curDetail.querySelector('.chips').innerHTML=curAliases.map(function(a,i){return '<span class="chip" data-i="'+i+'"><span class="txt">'+esc(a.text)+'</span><button class="ib edit" title="Edit" data-i="'+i+'">&#9998;</button><button class="ib del" title="Delete" data-i="'+i+'">&#128465;</button></span>';}).join('');
-  updateRowCount(curCode,curAliases.length);
-}
-function chipClick(e){var ed=e.target.closest('.edit');if(ed){startEdit(+ed.dataset.i);return;}var dl=e.target.closest('.del');if(dl){askDelete(+dl.dataset.i);return;}}
-function startEdit(i){
-  if(!curDetail)return;var chip=curDetail.querySelector('.chip[data-i="'+i+'"]');if(!chip)return;var a=curAliases[i];
-  chip.innerHTML='<input value="'+esc(a.text)+'" maxlength="255"><button class="ib save" title="Save">&#10003;</button><button class="ib cancel" title="Cancel">&#10005;</button>';
-  var inp=chip.querySelector('input');inp.focus();inp.select();
-  function done(save){if(save){commitEdit(i,inp.value);}else{renderChips();}}
-  chip.querySelector('.save').addEventListener('click',function(){done(true);});
-  chip.querySelector('.cancel').addEventListener('click',function(){done(false);});
-  inp.addEventListener('keydown',function(ev){if(ev.key==='Enter'){done(true);}else if(ev.key==='Escape'){done(false);}});
-}
-async function commitEdit(i,val){var a=curAliases[i],code=curCode;var text=val.trim();if(text===a.text){renderChips();return;}var d=await post('/api/aliases/edit',{code:code,oldNorm:a.norm,alias:text});if(d.ok){curAliases=d.aliases;renderChips();toast('Alias updated');}else{toast(d.error||'Edit failed','err');renderChips();}}
-function askDelete(i){var a=curAliases[i],code=curCode;el('mText').textContent='Delete alias “'+a.text+'”?';el('modal').classList.add('on');el('mOk').onclick=async function(){el('modal').classList.remove('on');var d=await post('/api/aliases/delete',{code:code,norm:a.norm});if(d.ok){curAliases=d.aliases;renderChips();loadStat();toast('Alias deleted');}else{toast('Delete failed','err');}};}
-el('mCancel').addEventListener('click',function(){el('modal').classList.remove('on');});
-el('modal').addEventListener('click',function(e){if(e.target===el('modal'))el('modal').classList.remove('on');});
-
-async function addAlias(){if(!curDetail)return;var inp=curDetail.querySelector('.newAlias');var btn=curDetail.querySelector('.addBtn');var text=inp.value.trim();if(!text){toast('Alias cannot be empty','err');return;}btn.disabled=true;var d=await post('/api/aliases/add',{code:curCode,alias:text});btn.disabled=false;if(d.ok){curAliases=d.aliases;renderChips();inp.value='';inp.focus();loadStat();toast('Alias added');}else{toast(d.error||'Add failed','err');}}
-
-loadStat();loadList();
-</script></body></html>`;
-}
