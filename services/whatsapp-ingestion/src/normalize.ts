@@ -53,6 +53,11 @@ export async function toMessageEvent(msg: Message): Promise<WaEvent | null> {
     media = describeMedia(msg, kind);
   }
 
+  // 60+ chars of pure base64 alphabet with no spaces is never human text — it is a thumbnail.
+  const looksLikeBase64 = (s: string): boolean => {
+    const head = s.trim().slice(0, 80);
+    return head.length >= 60 && /^[A-Za-z0-9+/=]+$/.test(head);
+  };
   // Read the quoted reference straight from _data. msg.getQuotedMessage() does a
   // Puppeteer eval that throws ("could not load quoted message") whenever the quoted
   // message isn't in the local store — common in busy groups. _data avoids that.
@@ -60,10 +65,15 @@ export async function toMessageEvent(msg: Message): Promise<WaEvent | null> {
   if (msg.hasQuotedMsg) {
     const d = (msg as { _data?: QuotedData })._data;
     if (d?.quotedStanzaID) {
+      // A quoted PHOTO carries its JPEG thumbnail as base64 in quotedMsg.body — image bytes, not
+      // words, and they rendered as a wall of "/9j/4AAQSkZJRg…" gibberish in the quote preview.
+      // Prefer real text (conversation, then the photo's caption); take body only when it reads
+      // like something a human typed.
+      const raw = d.quotedMsg?.conversation ?? d.quotedMsg?.caption ?? d.quotedMsg?.body;
       replyTo = {
         messageId: d.quotedStanzaID,
         participant: d.quotedParticipant ?? undefined,
-        text: d.quotedMsg?.conversation ?? d.quotedMsg?.body ?? d.quotedMsg?.caption ?? undefined,
+        text: raw && !looksLikeBase64(raw) ? raw : undefined,
       };
     }
   }

@@ -2701,10 +2701,13 @@ function splitSignature(text,out){
   return{body:s.slice(0,nl).replace(/\\s+$/,""),by:known};
 }
 // WhatsApp-style quoted reply block shown above the message text, inside the same bubble.
+// 60+ chars of pure base64 with no spaces is a photo thumbnail, not words — old rows in the DB
+// still carry these (stored before ingestion learned to drop them), so the guard lives here too.
+function isB64Blob(s){var h=String(s||"").replace(/^\s+/,"").slice(0,80);return h.length>=60&&/^[A-Za-z0-9+\/=]+$/.test(h);}
 function quoteHtml(m){
   if(!m.replyText&&!m.replySender)return"";
   var who=jidName(m.replySender)||"Message";
-  var body=m.replyText?fmtBody(m.replyText):'<span class="qm">Media</span>';
+  var body=(m.replyText&&!isB64Blob(m.replyText))?fmtBody(m.replyText):'<span class="qm">'+(m.replyText?'&#128247; Photo':'Media')+'</span>';
   // data-goto: clicking the quote jumps to the original message, like WhatsApp.
   var go=m.replyTo?' data-goto="'+esc(m.replyTo)+'" title="Go to the original message"':'';
   return '<div class="q"'+go+'><div class="qbar"></div><div class="qin"><div class="qn">'+esc(who)+'</div><div class="qt">'+body+'</div></div></div>';
