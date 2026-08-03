@@ -2818,9 +2818,14 @@ el("msgs").addEventListener("click",function(e){
   var mb=e.target.closest(".mbtn");
   if(mb){e.stopPropagation();var r=mb.getBoundingClientRect();showMenu(mb.closest(".bubble").dataset.mid,r.left,r.bottom+4);return;}
   // Clicking a quoted reply jumps to the original message, like WhatsApp.
+  // WhatsApp's reply reference is a BARE stanza id ("3A92DD…") while our bubbles carry the full
+  // rebuilt id ("true_<chat>_<id>") — an exact compare matches 0 of 549 replies in the DB, so the
+  // original is found by id TAIL (547 of 549 match; the rest are genuinely older than the view).
   var q=e.target.closest(".q[data-goto]");
   if(q){
-    var t=document.querySelector('.msgs .bubble[data-mid="'+cssq(q.dataset.goto)+'"]');
+    var g=q.dataset.goto;
+    var t=document.querySelector('.msgs .bubble[data-mid="'+cssq(g)+'"]')
+        ||document.querySelector('.msgs .bubble[data-mid$="'+cssq("_"+g)+'"]');
     if(t){t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.add("flash");setTimeout(function(){t.classList.remove("flash");},1200);}
     else toast("That message is further back than this view loads.",true);
     return;
