@@ -167,6 +167,9 @@ export function searchCatalog(q: string, limit = 200): { results: Scored[]; tota
   const qCode = raw.toLowerCase().replace(/\s+/g, '');
   const qTri = trigrams(qn);
   const qTokens = qn.split(' ').filter((t) => t.length >= 2);
+  // Space-insensitive fallback: staff type "nohub", the catalog writes "NO HUB". Same rule the
+  // report search already has; ≥4 chars so tiny fragments don't match everything.
+  const qFlat = qn.replace(/\s+/g, '');
   const products = all();
   const idx = ensureIndex();
 
@@ -193,10 +196,12 @@ export function searchCatalog(q: string, limit = 200): { results: Scored[]; tota
         ? qTokens.filter((t) => p.norm.includes(t)).length / qTokens.length
         : 0;
       const sub = qn.length >= 3 && p.norm.includes(qn) ? 0.15 : 0;
+      const flatHit = qFlat.length >= 4 && p.norm.replace(/\s+/g, '').includes(qFlat);
       s = Math.min(0.98, 0.55 * d + 0.35 * overlap + sub);
+      if (flatHit) s = Math.max(s, 0.3); // "nohub" must find "NO HUB …" even with weak trigrams
       // Every word typed appears in the description — keep it however the trigrams scored, so a
       // deliberate multi-word search cannot be filtered out by a similarity threshold.
-      if (s <= 0.2 && !(overlap === 1 && qTokens.length > 0)) continue;
+      if (s <= 0.2 && !(overlap === 1 && qTokens.length > 0) && !flatHit) continue;
       tier = 3;
     }
     hits.push({ product: p, score: s, tier });

@@ -1,7 +1,7 @@
 // Verify extraction + fuzzy matching against the REAL catalog. No browser/WhatsApp/key.
 // Run: npm run demo:match
 import { strict as assert } from 'node:assert';
-import { extractAndMatch, extractItems } from './matcher';
+import { extractAndMatch, extractItems, searchCatalog } from './matcher';
 import { count, load } from './products';
 
 load();
@@ -143,5 +143,12 @@ assert.ok(
   assert.equal(extractItems('PABCFA15').length, 1, 'exact SKU wins over the ignore list');
   removeIgnoredPhrase(normalize('PABCFA15'));
 }
+
+// The catalog search must be space-insensitive both ways: staff type "nohub", the catalog
+// writes "NO HUB". Caught by the 03-08 regression sweep — the report search had this rule, the
+// product search did not.
+assert.ok(searchCatalog('nohub').total > 0, '"nohub" finds "NO HUB" products');
+assert.ok(searchCatalog('NBK').total >= 300, 'SKU prefix search');
+assert.equal(searchCatalog('NHC50').results[0]?.product.code, 'NHC50', 'exact SKU ranks first');
 
 console.log('✓ non-product extraction filter checks passed');
