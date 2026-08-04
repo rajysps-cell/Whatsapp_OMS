@@ -1055,7 +1055,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       mentions: mentionNames(), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
     });
     return;
   }
@@ -2360,10 +2360,7 @@ function matchPage(me: User): string {
   .qt{font-size:13px;line-height:18px;color:rgba(11,20,26,.6);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
   .qm{font-style:italic;opacity:.85}
   /* "Sent by <user>" — marks a message as sent from this app rather than typed in WhatsApp. */
-  .sentby{display:inline-block;margin-top:6px;font-size:11px;letter-spacing:.2px;
-    color:#3f6b57;background:#eafaf0;border:1px solid #a7f3d0;border-radius:20px;
-    padding:3px 11px;line-height:1.45}
-  .sentby b{color:var(--em2);font-weight:700}
+  .whoout{color:#075e54}
   /* Composer — the only write surface in the app; one message per explicit send. */
   .composer{display:flex;align-items:flex-end;gap:9px;padding:9px 14px;background:#f0f2f5;border-top:1px solid var(--line)}
   .composer textarea{flex:1;resize:none;max-height:120px;padding:9px 13px;font:inherit;font-size:14px;line-height:20px;
@@ -2402,18 +2399,30 @@ function matchPage(me: User): string {
   .metarow{display:flex;align-items:center;gap:6px;justify-content:flex-end;margin-top:1px}
   .meta{font-size:11px;color:rgba(11,20,26,.45);white-space:nowrap;user-select:none;line-height:1}
   .ck{margin-left:3px;color:#53bdeb}
-  .react{position:absolute;bottom:-13px;background:#fff;border-radius:12px;padding:2px 6px;font-size:13px;box-shadow:0 1px 1.5px rgba(11,20,26,.16);display:inline-flex;align-items:center;line-height:1;white-space:nowrap}
+  .react{position:absolute;bottom:-13px;background:#fff;border-radius:12px;padding:2px 6px;font-size:13px;box-shadow:0 1px 1.5px rgba(11,20,26,.16);display:inline-flex;align-items:center;line-height:1;white-space:nowrap;cursor:pointer}
+  .react:hover{box-shadow:0 1px 3px rgba(11,20,26,.3)}
+  /* "Reacted by" popup — one group per emoji, like WhatsApp. */
+  .rpop{position:fixed;z-index:60;background:#fff;border-radius:10px;box-shadow:0 4px 18px rgba(11,20,26,.28);padding:8px 0;min-width:190px;max-width:280px;max-height:300px;overflow-y:auto;display:none}
+  .rpop.on{display:block}
+  .rpop .rghead{display:flex;align-items:center;gap:7px;padding:5px 14px 3px;font-weight:700;font-size:13px;color:#111b21}
+  .rpop .rghead .rgn{color:var(--mut);font-weight:600;font-size:11.5px}
+  .rpop .rgwho{padding:2px 14px 2px 34px;font-size:12.5px;color:#3b4a54;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .rpop .rgsep{border-top:1px solid var(--line);margin:6px 0}
   .in .react{left:10px}.out .react{right:10px}
   .rc{font-size:11px;color:#54656f;margin-left:2px;font-weight:500}
   .bubble.hasreact{margin-bottom:15px}
-  .xable{cursor:pointer}
-  .xable:hover{box-shadow:0 1px .5px rgba(11,20,26,.13),0 0 0 2px #2563eb55}
+  /* The bubble body is a normal page now — select text, copy, click links. Extraction happens
+     ONLY on the Extract button, so no pointer cursor and no click-me glow on the bubble. */
+  .xable .tx{user-select:text;cursor:text}
   .bubble.ext{box-shadow:0 0 0 2px var(--em),0 2px 9px rgba(16,185,129,.3)}
   .bubble.done{box-shadow:0 0 0 1.5px #8ce3b5}
   .sb{margin-right:auto;display:inline-block;font-size:10px;font-weight:700;border-radius:7px;padding:1px 6px;vertical-align:middle}
   .sb.e{background:var(--em);color:#04210f}.sb.d{background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0}
   .xrow{margin-top:5px;display:none}
-  .xable:hover .xrow,.bubble.ext .xrow,.bubble.busy .xrow{display:block}
+  .xable:hover .xrow,.bubble.ext .xrow,.bubble.busy .xrow,.bubble.done .xrow{display:block}
+  /* No hover on touch devices — the Extract button must simply always be there, or phones
+     would have no way to extract at all now that tapping the bubble no longer does it. */
+  @media (hover:none){.xable .xrow{display:block}}
   .xbtn{background:#eafaf0;border:1px solid #a7f3d0;color:var(--em2);font-size:11px;font-weight:600;border-radius:8px;padding:3px 11px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:background .15s,border-color .15s,color .15s}
   .xbtn:hover{background:#d1fae5;border-color:var(--em)}
   .xbtn.on{background:var(--em);border-color:var(--em);color:#04210f}
@@ -2587,6 +2596,7 @@ function matchPage(me: User): string {
   <div class="right" id="right"><div class="placeholder">Click <b>Extract</b> on any customer message to add its products here.</div></div>
 </div>
 <div class="ctxmenu" id="ctxmenu"></div>
+<div class="rpop" id="rpop"></div>
 <div class="mmodal" id="fwdmodal"><div class="msheet"><h3>Forward to…</h3>
   <input class="fwdsearch" id="fwdsearch" placeholder="search chats…" autocomplete="off">
   <div class="fwdlist" id="fwdlist"></div>
@@ -2722,11 +2732,14 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react">'+reactSummary(m.reactions)+'</div>':"";var sentTag=sentBy?'<div class="sentby">Sent by <b>'+esc(sentBy)+'</b></div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(m.reactions)+'</div>':"";
+// The sender of an app-sent message reads like a WhatsApp group sender: small, bold, ABOVE the
+// text — not a pill under it.
+var sentTag=sentBy?'<div class="who whoout">'+esc(sentBy)+'</div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
-var inner=arrow+nm+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+sentTag+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
@@ -2816,10 +2829,31 @@ async function toggleExtract(mid){
   finally{if(b)b.classList.remove("busy");applyStates();}
 }
 // Whole bubble is the extract trigger (button included, since it lives inside .xable).
+// "Reacted by" popup: one group per emoji, names under each — like tapping a reaction in WhatsApp.
+function showReactors(mid,x,y){
+  var m=msgIndex[mid];if(!m||!m.reactors||!m.reactors.length)return;
+  var groups={},order=[];
+  m.reactors.forEach(function(r){if(!groups[r.emoji]){groups[r.emoji]=[];order.push(r.emoji);}groups[r.emoji].push(jidName(r.sender)||"Someone");});
+  var h="";
+  order.forEach(function(em,i){
+    if(i)h+='<div class="rgsep"></div>';
+    h+='<div class="rghead">'+esc(em)+' <span class="rgn">'+groups[em].length+'</span></div>';
+    groups[em].forEach(function(n){h+='<div class="rgwho">'+esc(n)+'</div>';});
+  });
+  var p=el("rpop");p.innerHTML=h;p.className="rpop on";
+  var pw=p.offsetWidth,ph=p.offsetHeight;
+  p.style.left=Math.min(x,window.innerWidth-pw-8)+"px";
+  p.style.top=Math.min(y,window.innerHeight-ph-8)+"px";
+}
+function hideReactors(){el("rpop").className="rpop";}
+document.addEventListener("click",function(e){if(!e.target.closest("#rpop")&&!e.target.closest(".react"))hideReactors();});
 el("msgs").addEventListener("click",function(e){
   // The ⌄ arrow opens the message menu — the visible way in; right-click/long-press still work.
   var mb=e.target.closest(".mbtn");
   if(mb){e.stopPropagation();var r=mb.getBoundingClientRect();showMenu(mb.closest(".bubble").dataset.mid,r.left,r.bottom+4);return;}
+  // A reaction pill opens "who reacted".
+  var rp=e.target.closest(".react");
+  if(rp){var rr=rp.getBoundingClientRect();showReactors(rp.closest(".bubble").dataset.mid,rr.left,rr.bottom+6);return;}
   // Clicking a quoted reply jumps to the original message, like WhatsApp.
   // WhatsApp's reply reference is a BARE stanza id ("3A92DD…") while our bubbles carry the full
   // rebuilt id ("true_<chat>_<id>") — an exact compare matches 0 of 549 replies in the DB, so the
@@ -2833,7 +2867,11 @@ el("msgs").addEventListener("click",function(e){
     else toast("That message is further back than this view loads.",true);
     return;
   }
-  var b=e.target.closest(".xable");if(b&&!b.classList.contains("busy"))toggleExtract(b.dataset.mid);});
+  // Extraction ONLY via the Extract button. Clicking the message body selects/copies text like a
+  // normal page — staff kept triggering extraction while trying to copy an address.
+  var xb=e.target.closest(".xbtn");
+  if(xb){var bb=xb.closest(".xable");if(bb&&!bb.classList.contains("busy"))toggleExtract(bb.dataset.mid);}
+});
 // Jump between extracted/processed messages in a long thread.
 var navIdx=-1;
 function navExtracted(dir){var list=Array.prototype.slice.call(document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done"));if(!list.length)return;navIdx+=dir;if(navIdx<0)navIdx=list.length-1;if(navIdx>=list.length)navIdx=0;var t=list[navIdx];t.scrollIntoView({behavior:"smooth",block:"center"});t.classList.remove("flash");void t.offsetWidth;t.classList.add("flash");}
@@ -3089,7 +3127,17 @@ async function saveDdiNo(){
   try{
     var d=await(await fetch("/api/processed/order-no",{method:"POST",headers:{"content-type":"application/json"},
       body:JSON.stringify({messageIds:lastCopied,orderNo:no})})).json();
-    if(d.ok){lastCopied.forEach(function(m){orderNos[m]=no;});toast("DDI order #"+no+" saved");syncDdiRow();applyStates();}
+    if(d.ok){
+      // Save COMPLETES the workflow: the saved messages flip to "Processed by … · DDI #…" right
+      // now — no extra click anywhere. Their lines leave the working panel (hand-added rows
+      // belonged to this order too); anything extracted after Copy stays untouched.
+      var saved=lastCopied.slice();
+      saved.forEach(function(m){orderNos[m]=no;delete active[m];});
+      items=items.filter(function(it){return it.mid&&saved.indexOf(it.mid)<0;});
+      lastCopied=[];
+      rebuildSources();renderRight();applyStates();
+      toast("DDI order #"+no+" saved — order complete");
+    }
     else toast(d.error||"Could not save",true);
   }catch(e){toast("Network error — not saved",true);}
 }

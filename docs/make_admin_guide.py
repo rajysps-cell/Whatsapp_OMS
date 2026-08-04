@@ -275,7 +275,7 @@ def build():
     s += [para("What the labels mean", H2),
           table([
             ["Label", "Meaning"],
-            ["<b>Extract</b>", "Click a message to pull products out of it."],
+            ["<b>Extract</b>", "The button on a message that pulls its products out. Clicking the message text just selects it, like any page."],
             ["<b>Extracted</b>", "This message's products are in the panel on the right."],
             ["<b>Processed</b>", "The order was copied. Shows who completed it."],
             ["<b>Re-Extract</b>", "Already processed — click to load it again."],
@@ -609,7 +609,7 @@ def build_user():
     s += [para("Processing an order", H2)]
     s += steps([
         "Click a chat on the left.",
-        "Click the customer's order message. Products appear on the right, in the order the "
+        "Press <b>Extract</b> on the customer's order message. Products appear on the right, in the order the "
         "customer wrote them, each with the <b>line number</b> it came from. Lines that are fully "
         "matched also turn green inside the message itself, so you see what is left to do.",
         "Rows with a <b>light-green background</b> were recognised. <b>White</b> rows with an "
@@ -647,7 +647,7 @@ def build_user():
     s += [para("What the labels mean", H2),
           table([
             ["Label", "Meaning"],
-            ["<b>Extract</b>", "Click a message to pull the products out of it"],
+            ["<b>Extract</b>", "The button on a message that pulls its products out"],
             ["<b>Extracted</b>", "Its products are showing on the right"],
             ["<b>Processed</b>", "Already copied — shows who did it"],
             ["<b>Re-Extract</b>", "Load it again"],

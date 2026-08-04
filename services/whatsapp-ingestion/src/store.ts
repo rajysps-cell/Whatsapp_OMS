@@ -433,7 +433,7 @@ const upsertReactionStmt = db.prepare(
 );
 const delReactionStmt = db.prepare('DELETE FROM reactions WHERE msg_id = ? AND sender = ?');
 const chatReactionsStmt = db.prepare(
-  "SELECT r.msg_id AS msg_id, r.emoji AS emoji FROM reactions r " +
+  "SELECT r.msg_id AS msg_id, r.emoji AS emoji, r.sender AS sender FROM reactions r " +
     "JOIN messages m ON m.msg_id = r.msg_id WHERE m.chat_id = ? AND r.emoji <> '' ORDER BY r.ts ASC",
 );
 
@@ -550,6 +550,8 @@ export interface MsgRow {
   isGroup: boolean;
   /** Emoji reactions applied to this message (one entry per reactor). */
   reactions: string[];
+  /** Same reactions with WHO reacted — drives the "reacted by" popup. */
+  reactors: Array<{ emoji: string; sender: string }>;
   /** Quoted-reply context, when this message replies to another. */
   replyTo?: string;
   replyText?: string;
@@ -776,10 +778,15 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     reply_sender: string | null;
   }>;
   const reMap = new Map<string, string[]>();
-  for (const rr of chatReactionsStmt.all(chatId) as Array<{ msg_id: string; emoji: string }>) {
+  const reWho = new Map<string, Array<{ emoji: string; sender: string }>>();
+  for (const rr of chatReactionsStmt.all(chatId) as Array<{ msg_id: string; emoji: string; sender: string }>) {
     const arr = reMap.get(rr.msg_id);
     if (arr) arr.push(rr.emoji);
     else reMap.set(rr.msg_id, [rr.emoji]);
+    const who = reWho.get(rr.msg_id);
+    const entry = { emoji: rr.emoji, sender: rr.sender };
+    if (who) who.push(entry);
+    else reWho.set(rr.msg_id, [entry]);
   }
   const byMap = new Map<string, string>();
   for (const pr of chatProcessedStmt.all(chatId) as Array<{ id: string; who: string | null }>) {
@@ -799,6 +806,7 @@ export function chatMessages(chatId: string, limit: number): MsgRow[] {
     ts: r.ts,
     isGroup: !!r.is_group,
     reactions: reMap.get(r.msg_id) ?? [],
+    reactors: reWho.get(r.msg_id) ?? [],
     replyTo: r.reply_to ?? undefined,
     replyText: r.reply_text ?? undefined,
     replySender: r.reply_sender ?? undefined,
