@@ -1090,7 +1090,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // writing-hand emoji and the username in WhatsApp's bold markup. (Escaped rather than a
     // literal emoji so the source stays plain ASCII.)
     // Uppercase is display-only — the parser matches the name case-insensitively against accounts.
-    const signed = `${trimmed}\n\n✍🏼 BY *${me.username.toUpperCase()}*`;
+    const signed = `✍🏼 BY *${me.username.toUpperCase()}*\n\n${trimmed}`;
     // A real WhatsApp mention needs BOTH the id in the text ('@8355…') and the full JID here,
     // otherwise it renders as plain text and the person is never notified.
     const mentions = Array.isArray(body['mentions'])
@@ -1151,7 +1151,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { ok: false, error: 'File is too large (max about 16 MB).' });
       return;
     }
-    const signed = caption ? `${caption}\n\n✍🏼 BY *${me.username.toUpperCase()}*` : '';
+    const signed = caption ? `✍🏼 BY *${me.username.toUpperCase()}*\n\n${caption}` : '';
     // voice:true = a recorded voice note, sent as WhatsApp's push-to-talk bubble.
     const asVoice = !!body['voice'] && /^audio\//.test(mimetype);
     try {
@@ -1345,14 +1345,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           json(res, 404, { ok: false, error: 'The file could not be retrieved from WhatsApp any more.' });
           return;
         }
-        const caption = text ? `${text}\n\n✍🏼 BY *${me.username.toUpperCase()}*` : undefined;
+        const caption = text ? `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}` : undefined;
         sentId = await sendMediaFn(toChat, { data: file.data, mimetype: file.mimetype, filename: file.filename ?? 'file' }, caption, undefined, me.username);
       } else {
         if (!sendMessageFn || !text) {
           json(res, 400, { ok: false, error: 'There is no text to forward.' });
           return;
         }
-        sentId = await sendMessageFn(toChat, `${text}\n\n✍🏼 BY *${me.username.toUpperCase()}*`, undefined, me.username);
+        sentId = await sendMessageFn(toChat, `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}`, undefined, me.username);
       }
       if (sentId) recordSentBy(sentId, me.username);
       logger.info({ user: me.username, from: msg.chatId, to: toChat, messageId }, 'message forwarded');
@@ -2681,34 +2681,51 @@ function mediaBlock(m){
   return "";
 }
 // Chat-list preview: drop a trailing signature line so the sidebar shows the message, not "hi -- admin".
-function stripSig(t){return String(t||"").replace(/\\s*(?:\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?|sent by\\s*-\\s*|--\\s+)\\*?[A-Za-z0-9]{3,32}\\*?\\s*$/i,"").trim();}
+function stripSig(t){
+  var s=String(t||"");
+  // New form: the signature LEADS the message (emoji form only — a leading "-- x" could be text).
+  s=s.replace(/^\\s*\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?\\*?[A-Za-z0-9]{3,32}\\*?\\s*\\n+/i,"");
+  // Old form: signature on the last line.
+  s=s.replace(/\\s*(?:\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?|sent by\\s*-\\s*|--\\s+)\\*?[A-Za-z0-9]{3,32}\\*?\\s*$/i,"");
+  return s.trim();
+}
 // Messages sent from this app end with a final line of "-- username". Split that off so the bubble
 // shows clean text plus a "Sent by" badge. Only OUTGOING messages are checked and the name must be
 // a real account, so a customer typing the same thing can never fake it.
 // (No backslash-n in this comment on purpose: the page is a TS template literal and it would
 //  become a real newline, breaking the comment across two lines and killing the whole script.)
-function splitSignature(text,out){
-  if(!out)return{body:text,by:null};
-  var s=String(text||"");
-  var nl=s.lastIndexOf("\\n");
-  if(nl<0)return{body:s,by:null};
-  var last=s.slice(nl+1).trim();
-  // Current form: "<writing-hand emoji> *name*". The older "sent by - *name*" and "-- name"
-  // forms are still recognised so messages already sent keep their attribution.
+// Parse one line as a signature; returns the known username or null. emojiOnly restricts to the
+// "<writing-hand> BY *name*" form — used for the FIRST line, where a plain "-- something" could
+// be genuine message text.
+function sigName(line,emojiOnly){
+  var s2=String(line||"").trim(),m=null;
   var EMO=String.fromCodePoint(0x270D);   // matches the emoji with or without a skin-tone modifier
-  var m=null;
-  if(last.indexOf(EMO)===0){
-    var rest=last.slice(1).replace(String.fromCodePoint(0x1F3FB),"").replace(String.fromCodePoint(0x1F3FC),"")
+  if(s2.indexOf(EMO)===0){
+    var rest=s2.slice(1).replace(String.fromCodePoint(0x1F3FB),"").replace(String.fromCodePoint(0x1F3FC),"")
                  .replace(String.fromCodePoint(0x1F3FD),"").replace(String.fromCodePoint(0x1F3FE),"")
                  .replace(String.fromCodePoint(0x1F3FF),"").replace(String.fromCodePoint(0xFE0F),"").trim();
     m=/^(?:by\\s+)?\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(rest);
   }
-  if(!m)m=/^sent by\\s*-\\s*\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(last)||/^--\\s+\\*?([A-Za-z0-9]{3,32})\\*?$/.exec(last);
-  if(!m)return{body:s,by:null};
-  var typed=m[1],known=null;
-  for(var i=0;i<appUsers.length;i++){if(String(appUsers[i]).toLowerCase()===typed.toLowerCase())known=appUsers[i];}
-  if(!known)return{body:s,by:null};                            // not one of our accounts = not ours
-  return{body:s.slice(0,nl).replace(/\\s+$/,""),by:known};
+  if(!m&&!emojiOnly)m=/^sent by\\s*-\\s*\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(s2)||/^--\\s+\\*?([A-Za-z0-9]{3,32})\\*?$/.exec(s2);
+  if(!m)return null;
+  for(var i=0;i<appUsers.length;i++){if(String(appUsers[i]).toLowerCase()===m[1].toLowerCase())return appUsers[i];}
+  return null;                                                 // not one of our accounts = not ours
+}
+function splitSignature(text,out){
+  if(!out)return{body:text,by:null};
+  var s=String(text||"");
+  // New form first: the signature is the FIRST line, above the text (like a group sender name).
+  var fn=s.indexOf("\\n");
+  if(fn>0){
+    var byTop=sigName(s.slice(0,fn),true);
+    if(byTop)return{body:s.slice(fn+1).replace(/^\\s+/,""),by:byTop};
+  }
+  // Old form: signature on the last line — messages sent before the move keep their attribution.
+  var nl=s.lastIndexOf("\\n");
+  if(nl<0)return{body:s,by:null};
+  var byEnd=sigName(s.slice(nl+1),false);
+  if(!byEnd)return{body:s,by:null};
+  return{body:s.slice(0,nl).replace(/\\s+$/,""),by:byEnd};
 }
 // WhatsApp-style quoted reply block shown above the message text, inside the same bubble.
 // 60+ chars of pure base64 with no spaces is a photo thumbnail, not words — old rows in the DB
