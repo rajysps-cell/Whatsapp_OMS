@@ -78,6 +78,12 @@ db.exec(`
     last_read_ts INTEGER NOT NULL,
     PRIMARY KEY (user_id, chat_id)
   );
+  CREATE TABLE IF NOT EXISTS account_chats (
+    account TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    seen_at INTEGER NOT NULL,
+    PRIMARY KEY (account, chat_id)
+  );
   CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);
   CREATE TABLE IF NOT EXISTS activity_log (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -302,6 +308,23 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { row
   return { rows: all.slice(0, limit), total: all.length };
 }
 
+// --- per-ACCOUNT chat membership ---------------------------------------------------------
+// Which WhatsApp account can see which chat. 'common' is the shared business WhatsApp; a
+// personal account is 'u<userId>'. Messages stay GLOBAL (deduped by msg id, so a group that
+// both accounts are in has one merged timeline) — only the chat LIST is filtered per account.
+const upsertAccountChat = db.prepare(
+  'INSERT INTO account_chats (account, chat_id, seen_at) VALUES (?, ?, ?) ' +
+    'ON CONFLICT(account, chat_id) DO UPDATE SET seen_at = excluded.seen_at',
+);
+export function recordAccountChats(account: string, chatIds: string[]): void {
+  const now = Date.now();
+  for (const id of chatIds) if (id) upsertAccountChat.run(account, id, now);
+}
+const accountChatsStmt = db.prepare('SELECT chat_id FROM account_chats WHERE account = ?');
+export function chatsOfAccount(account: string): Set<string> {
+  return new Set((accountChatsStmt.all(account) as Array<{ chat_id: string }>).map((r) => r.chat_id));
+}
+
 // --- per-user read state -----------------------------------------------------------------
 // Every app user has their OWN read marker per chat: a chat stays "unread" for each user until
 // THEY open it — one user reading does not clear it for the other three. WhatsApp's own unread
@@ -373,6 +396,14 @@ db.prepare('DELETE FROM activity_log WHERE ts < ?').run(Date.now() - 90 * 86_400
 // One-time baseline for per-user unread: everything that existed BEFORE this feature shipped is
 // read for everyone — badges only count messages from this moment on. Set once, kept forever.
 if (!getSetting('unread.epoch')) setSetting('unread.epoch', String(Math.floor(Date.now() / 1000)));
+
+// One-time seed for per-account chat membership: every chat known before the feature belongs to
+// the shared business account. ONE-time on purpose — after this, membership comes only from each
+// session's own catalog sync, so personal chats never leak into the common set.
+if (!getSetting('accountChats.seeded')) {
+  db.exec("INSERT OR IGNORE INTO account_chats (account, chat_id, seen_at) SELECT 'common', chat_id, 0 FROM catalog_chats");
+  setSetting('accountChats.seeded', '1');
+}
 
 // --- app settings (admin-editable at /settings; DB so they survive restarts and stay off git) ---
 export function getSetting(key: string, fallback = ''): string {

@@ -54,6 +54,13 @@ try {
 } catch {
   /* column already exists */
 }
+// Which WhatsApp this user works through: 'common' = the shared business account (default),
+// 'personal' = their own linked WhatsApp — they scan a QR and see ONLY their account's chats.
+try {
+  db.exec("ALTER TABLE users ADD COLUMN wa_mode TEXT NOT NULL DEFAULT 'common'");
+} catch {
+  /* column already exists */
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS pending_logins (
     token_hash TEXT PRIMARY KEY,
@@ -84,6 +91,8 @@ export interface User {
   mustChange: boolean;
   createdAt: number;
   lastLogin: number | null;
+  /** 'common' = shared business WhatsApp; 'personal' = their own linked account. */
+  waMode: 'common' | 'personal';
 }
 
 interface UserRow {
@@ -98,6 +107,7 @@ interface UserRow {
   must_change: number;
   created_at: number;
   last_login: number | null;
+  wa_mode: string | null;
 }
 
 const SESSION_DAYS = 14;
@@ -115,6 +125,7 @@ function toUser(r: UserRow): User {
     mustChange: !!r.must_change,
     createdAt: r.created_at,
     lastLogin: r.last_login,
+    waMode: r.wa_mode === 'personal' ? 'personal' : 'common',
   };
 }
 
@@ -213,11 +224,13 @@ export function createUser(
   role: Role,
   mustChange = false,
   email = '',
+  waMode: 'common' | 'personal' = 'common',
 ): User {
   const salt = randomBytes(16).toString('hex');
   const now = Date.now();
   insUser.run(username, name || username, hashSync(password, salt), salt, role, 1, mustChange ? 1 : 0, now);
   if (email) db.prepare('UPDATE users SET email=? WHERE username=?').run(email, username);
+  if (waMode !== 'common') db.prepare('UPDATE users SET wa_mode=? WHERE username=?').run(waMode, username);
   const r = getByName.get(username) as unknown as UserRow;
   logger.info({ username, role }, 'user created');
   return toUser(r);
@@ -226,7 +239,7 @@ export function createUser(
 /** Partial update. Only provided fields change; password is re-hashed with a fresh salt. */
 export function updateUser(
   id: number,
-  patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string },
+  patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal' },
 ): void {
   const cur = getById.get(id) as UserRow | undefined;
   if (!cur) return;
@@ -234,15 +247,17 @@ export function updateUser(
   const role = patch.role !== undefined ? patch.role : cur.role;
   const active = patch.active !== undefined ? (patch.active ? 1 : 0) : cur.active;
   const email = patch.email !== undefined ? patch.email : (cur.email ?? '');
+  const waMode = patch.waMode !== undefined ? patch.waMode : (cur.wa_mode === 'personal' ? 'personal' : 'common');
   if (patch.password) {
     const salt = randomBytes(16).toString('hex');
     // must_change=1: an admin-set password is known to the admin, so the user must replace it at
     // next sign-in. (The user's own self-service change clears the flag.)
-    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
       name,
       role,
       active,
       email,
+      waMode,
       hashSync(patch.password, salt),
       salt,
       id,
@@ -250,7 +265,7 @@ export function updateUser(
     // A password change invalidates that user's other sessions.
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   } else {
-    db.prepare('UPDATE users SET name=?, role=?, active=?, email=? WHERE id=?').run(name, role, active, email, id);
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=? WHERE id=?').run(name, role, active, email, waMode, id);
   }
   if (patch.active === false) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   logger.info({ id, role, active: !!active, passwordChanged: !!patch.password }, 'user updated');

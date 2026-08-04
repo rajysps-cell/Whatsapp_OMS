@@ -381,6 +381,10 @@ def build():
         "Enter a username — letters and numbers only, no spaces or symbols.",
         "Enter their full name, <b>email address</b>, choose <b>User</b> or <b>Admin</b>, and set "
         "a temporary password.",
+        "Choose their <b>WhatsApp</b>: <b>Common</b> (they work through the shared business "
+        "WhatsApp — the normal choice) or <b>Personal</b> (they link their OWN WhatsApp by "
+        "scanning a QR at the <b>Link WhatsApp</b> tab, and then see only their own chats; "
+        "messages they send go from their own number).",
         "If an email is filled in, the person automatically receives a welcome email with the "
         "website address, their username and the temporary password. They must change it when "
         "they first sign in.",

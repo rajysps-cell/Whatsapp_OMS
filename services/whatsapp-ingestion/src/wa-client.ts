@@ -88,9 +88,18 @@ export interface HistoryMsg {
  * Starts a READ-ONLY whatsapp-web.js connection. We only subscribe to inbound
  * events — no send method is ever called. Returns a { stop } handle.
  */
-export function startWaClient(handlers: WaClientHandlers): WaClient {
+export interface WaSessionOpts {
+  /** Where this session's login lives on disk. Default: the shared business account's dir. */
+  authDir?: string;
+  /** Log tag: 'common' or 'u<userId>' — every line of a personal session says whose it is. */
+  tag?: string;
+}
+
+export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = {}): WaClient {
+  const authDir = opts.authDir ?? config.authDir;
+  const tag = opts.tag ?? 'common';
   const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: config.authDir }),
+    authStrategy: new LocalAuth({ dataPath: authDir }),
     puppeteer: {
       headless: true,
       // --no-sandbox is needed on most Linux servers / containers.
@@ -108,7 +117,7 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
 
   client.on('qr', (qr) => {
     sawQr = true; // a human must scan; restarting the client cannot help and would loop forever
-    logger.info('scan this QR from the phone: WhatsApp → Linked devices → Link a device (or open the web page)');
+    logger.info({ session: tag }, 'scan this QR from the phone: WhatsApp → Linked devices → Link a device (or open the web page)');
     qrcode.generate(qr, { small: true });
     handlers.onQr?.(qr);
     handlers.onStatus?.('waiting for scan');
@@ -127,7 +136,7 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     ready = true;
     sawQr = false;
     stuckRestarts = 0;
-    logger.info({ via }, 'connection open — listening for group events (read-only)');
+    logger.info({ via, session: tag }, 'connection open — listening for group events (read-only)');
     handlers.onStatus?.('connected');
     if (handlers.onCatalog) {
       const sync = (): void => {
@@ -158,7 +167,7 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
     ready = false;
     initAt = Date.now();
     stuckRestarts = 0;
-    logger.warn({ reason }, 'disconnected — reinitializing');
+    logger.warn({ reason, session: tag }, 'disconnected — reinitializing');
     handlers.onStatus?.('disconnected');
     if (String(reason).toUpperCase().includes('LOGOUT')) {
       // The device was unlinked from the phone. whatsapp-web.js wipes the session on this path,
@@ -197,7 +206,7 @@ export function startWaClient(handlers: WaClientHandlers): WaClient {
       if (stuckRestarts >= MAX_STUCK_RESTARTS) return; // give up quietly; the pill says disconnected
       stuckRestarts++;
       logger.warn(
-        { stuckForMs: Date.now() - initAt, attempt: stuckRestarts },
+        { stuckForMs: Date.now() - initAt, attempt: stuckRestarts, session: tag },
         'WhatsApp never became ready and the chat catalog is unreadable — restarting the client',
       );
       initAt = Date.now(); // reset first so a slow restart cannot trigger a second one

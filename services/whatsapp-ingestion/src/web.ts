@@ -69,6 +69,7 @@ import {
   getMessage,
   getSetting,
   chatParticipants,
+  chatsOfAccount,
   isProcessed,
   listActivity,
   logActivity,
@@ -105,22 +106,61 @@ let sendMediaFn:
       mentions?: string[],
       sentBy?: string,
       asVoice?: boolean,
+      via?: unknown,
     ) => Promise<string>)
   | null = null;
 /** Injected by index.ts so the thread can show images, voice notes and documents. */
-let mediaFn: ((messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>) | null =
+let mediaFn: ((messageId: string, via?: unknown) => Promise<{ data: string; mimetype: string; filename?: string } | null>) | null =
   null;
 /** Injected by index.ts so the UI can send a message through the live WhatsApp connection. */
 let sendMessageFn:
-  | ((chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string) => Promise<string>)
+  | ((chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string, via?: unknown) => Promise<string>)
   | null = null;
+/**
+ * The web layer's window into per-user WhatsApp sessions (implemented in index.ts). A user whose
+ * admin set them to "personal" links their OWN WhatsApp at /link and works entirely through it;
+ * `for()` hands back an opaque client that the injected action functions accept as `via`.
+ */
+export interface PersonalWa {
+  ensure(u: User): void;
+  state(u: User): { started: boolean; status: string; qr: string | null };
+  for(u: User): unknown;
+  stop(userId: number): void;
+}
+let personalWaRef: PersonalWa | null = null;
+
+/** The acting user's session state: their own for personal mode, the shared pill otherwise. */
+function waStateFor(me: User): { status: string; qr: string | null } {
+  if (me.waMode === 'personal') {
+    const s = personalWaRef ? personalWaRef.state(me) : { status: 'not linked', qr: null };
+    return { status: s.status === 'starting' ? 'connecting' : s.status, qr: s.qr };
+  }
+  return { status, qr: null };
+}
+/** Which account's chats this user sees. */
+function accountFor(me: User): string {
+  return me.waMode === 'personal' ? `u${me.id}` : 'common';
+}
+/**
+ * Resolve the client an action must go through. Personal users MUST act through their own linked
+ * WhatsApp — never silently fall back to the business account.
+ */
+function viaFor(me: User): { ok: true; via: unknown } | { ok: false; error: string } {
+  if (me.waMode !== 'personal') return { ok: true, via: undefined };
+  const c = personalWaRef?.for(me) ?? null;
+  if (!c || waStateFor(me).status !== 'connected') {
+    return { ok: false, error: 'Your WhatsApp is not linked/connected — open Link WhatsApp in the header.' };
+  }
+  return { ok: true, via: c };
+}
+
 /** Injected by index.ts so a user can delete their own sent messages (for me / for everyone). */
-let deleteFn: ((messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+let deleteFn: ((messageId: string, everyone: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 /** Injected by index.ts: star/unstar and pin/unpin in the real WhatsApp. */
-let starFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
-let pinFn: ((messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+let starFn: ((messageId: string, on: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+let pinFn: ((messageId: string, on: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 /** Injected by index.ts: react to a message with an emoji ('' removes it). */
-let reactFn: ((messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>) | null = null;
+let reactFn: ((messageId: string, emoji: string, via?: unknown) => Promise<{ ok: boolean; reason?: string }>) | null = null;
 
 export async function setQr(qr: string): Promise<void> {
   try {
@@ -171,6 +211,7 @@ function navHtml(me: User, current: string): string {
   // nothing else.
   const tabs: Array<[href: string, label: string, show: boolean]> = [
     ['/', 'Order Matching', true],
+    ['/link', 'Link WhatsApp', me.waMode === 'personal'],
     ['/report', 'Report', me.role === 'admin'],
     ['/admin', 'Users', me.role === 'admin'],
     ['/settings', 'Settings', me.role === 'admin'],
@@ -196,6 +237,7 @@ const NAV_CSS = `
 function checkInlineScripts(): void {
   const fake: User = {
     id: 0,
+    waMode: 'common',
     username: 'selfcheck',
     name: 'selfcheck',
     email: '',
@@ -434,7 +476,8 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: em.error });
       return true;
     }
-    const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value);
+    const waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
+    const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value, waMode);
     // Welcome mail with the temporary password — it stops working at first sign-in, when the
     // user must choose their own. Best-effort: a mail outage must not block creating accounts.
     let mailed = false;
@@ -459,10 +502,11 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: 'User not found.' });
       return true;
     }
-    const patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string } = {};
+    const patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal' } = {};
     if (body['name'] !== undefined) patch.name = String(body['name']).trim().slice(0, 80);
     if (body['role'] !== undefined) patch.role = body['role'] === 'admin' ? 'admin' : 'user';
     if (body['active'] !== undefined) patch.active = !!body['active'];
+    if (body['waMode'] !== undefined) patch.waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
     if (body['email'] !== undefined) {
       const em = validateEmail(body['email']);
       if (!em.ok) {
@@ -491,7 +535,9 @@ async function handleAdmin(
       return true;
     }
     updateUser(id, patch);
-    logActivity(me.username, 'user-edit', `${target.username}${patch.password ? ' (password reset)' : ''}${patch.active === false ? ' (disabled)' : ''}`, clientIp(req));
+    // Switched back to the shared account: their personal session must not keep running.
+    if (patch.waMode === 'common' && target.waMode === 'personal') personalWaRef?.stop(id);
+    logActivity(me.username, 'user-edit', `${target.username}${patch.password ? ' (password reset)' : ''}${patch.active === false ? ' (disabled)' : ''}${patch.waMode && patch.waMode !== target.waMode ? ` (WhatsApp: ${patch.waMode})` : ''}`, clientIp(req));
     json(res, 200, { ok: true, users: listUsers() });
     return true;
   }
@@ -511,6 +557,7 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: 'This is the only administrator — promote another admin first.' });
       return true;
     }
+    personalWaRef?.stop(id); // no-op unless they had a personal session running
     deleteUser(id);
     logActivity(me.username, 'user-delete', target.username, clientIp(req));
     json(res, 200, { ok: true, users: listUsers() });
@@ -582,8 +629,8 @@ function readBody(req: http.IncomingMessage, max = 2_000_000): Promise<Record<st
 export function startWebServer(
   getOrders: () => Order[],
   chatStore: ChatStore,
-  send?: (chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string) => Promise<string>,
-  media?: (messageId: string) => Promise<{ data: string; mimetype: string; filename?: string } | null>,
+  send?: (chatId: string, text: string, mentions?: string[], sentBy?: string, quotedId?: string, via?: unknown) => Promise<string>,
+  media?: (messageId: string, via?: unknown) => Promise<{ data: string; mimetype: string; filename?: string } | null>,
   sendMedia?: (
     chatId: string,
     file: { data: string; mimetype: string; filename: string },
@@ -591,11 +638,13 @@ export function startWebServer(
     mentions?: string[],
     sentBy?: string,
     asVoice?: boolean,
+    via?: unknown,
   ) => Promise<string>,
-  del?: (messageId: string, everyone: boolean) => Promise<{ ok: boolean; reason?: string }>,
-  star?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
-  pin?: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>,
-  react?: (messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>,
+  del?: (messageId: string, everyone: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
+  star?: (messageId: string, on: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
+  pin?: (messageId: string, on: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
+  react?: (messageId: string, emoji: string, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
+  personalWa?: PersonalWa,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
@@ -606,6 +655,7 @@ export function startWebServer(
   starFn = star ?? null;
   pinFn = pin ?? null;
   reactFn = react ?? null;
+  personalWaRef = personalWa ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -954,14 +1004,49 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, { ok: !!(cid && name) });
     return;
   }
+  // Personal-WhatsApp linking: the page shows THIS user's QR; scanning it links their own
+  // account. Common-mode users have nothing to link and are sent home.
+  if (path === '/link') {
+    if (me.waMode !== 'personal') {
+      redirect(res, '/');
+      return;
+    }
+    personalWaRef?.ensure(me);
+    html(res, linkPage(me));
+    return;
+  }
+  if (path === '/api/link/state') {
+    if (me.waMode !== 'personal') {
+      json(res, 200, { status: 'common' });
+      return;
+    }
+    personalWaRef?.ensure(me);
+    const st = waStateFor(me);
+    let qrDataUrlMine: string | null = null;
+    if (st.qr) {
+      try {
+        qrDataUrlMine = await QRCode.toDataURL(st.qr, { margin: 1, width: 300 });
+      } catch {
+        /* QR render failed — the status text still shows */
+      }
+    }
+    json(res, 200, { status: st.status, qr: qrDataUrlMine });
+    return;
+  }
   if (path === '/api/chats') {
-    const list = chatStoreRef ? chatStoreRef.chats() : [];
+    // A personal-mode user's session spins up lazily the first time they land here.
+    if (me.waMode === 'personal') personalWaRef?.ensure(me);
+    // Each user sees ONLY their account's chats: personal users their own linked WhatsApp's,
+    // everyone else the shared business account's. Membership comes from each session's catalog.
+    const visible = chatsOfAccount(accountFor(me));
+    const list = (chatStoreRef ? chatStoreRef.chats() : []).filter((c) => visible.has(c.id));
     // Unread is PER USER: everything since THIS user's own read marker — one user reading a chat
     // does not clear it for anyone else. (WhatsApp's own unread no longer drives the badge.)
     const mine = unreadCountsFor(me.id);
     json(res, 200, {
       source: 'persisted',
-      status, // live-connection state for the header pill (this endpoint is already polled every 6s)
+      status: waStateFor(me).status, // personal users see THEIR session's state in the pill
+      waMode: me.waMode,
       chats: list.map((c) => ({ id: c.id, title: c.title, lastText: c.lastText, lastTs: c.lastTs, unread: mine.get(c.id) ?? 0, isGroup: c.isGroup })),
     });
     return;
@@ -1015,7 +1100,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 503, { error: 'media unavailable' });
       return;
     }
-    const got = await mediaFn(id);
+    const got = await mediaFn(id, me.waMode === 'personal' ? (personalWaRef?.for(me) ?? undefined) : undefined);
     if (!got) {
       json(res, 404, { error: 'media could not be downloaded' });
       return;
@@ -1054,6 +1139,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { error: 'bad chat id' });
       return;
     }
+    // Both directions of privacy: a personal user cannot open the business chats, and nobody on
+    // the business account can open a personal user's chats.
+    if (!chatsOfAccount(accountFor(me)).has(id)) {
+      json(res, 403, { error: 'This chat is not on your WhatsApp account.' });
+      return;
+    }
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     markChatRead(me.id, id); // opening (and keeping open — this polls) marks the chat read for ME only
     const orderNos = orderNoOf(id); // DDI order numbers typed after Copy, keyed by message
@@ -1072,8 +1163,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 503, { ok: false, error: 'Sending is not available.' });
       return;
     }
-    if (status !== 'connected') {
-      json(res, 409, { ok: false, error: 'WhatsApp is not connected — reconnect before sending.' });
+    const vr = viaFor(me);
+    if (!vr.ok || waStateFor(me).status !== 'connected') {
+      json(res, 409, { ok: false, error: vr.ok ? 'WhatsApp is not connected — reconnect before sending.' : vr.error });
       return;
     }
     const body = await readBody(req);
@@ -1112,7 +1204,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (target && target.chatId === chatId) quotedId = body['replyTo'] as string;
     }
     try {
-      const messageId = await sendMessageFn(chatId, signed, mentions, me.username, quotedId);
+      const messageId = await sendMessageFn(chatId, signed, mentions, me.username, quotedId, vr.via);
       if (messageId) recordSentBy(messageId, me.username); // best-effort; index.ts also claims it
       logger.info(
         { user: me.username, chatId, chars: trimmed.length, mentions: mentions.length, messageId },
@@ -1132,8 +1224,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 503, { ok: false, error: 'Sending is not available.' });
       return;
     }
-    if (status !== 'connected') {
-      json(res, 409, { ok: false, error: 'WhatsApp is not connected — reconnect before sending.' });
+    const vr2 = viaFor(me);
+    if (!vr2.ok || waStateFor(me).status !== 'connected') {
+      json(res, 409, { ok: false, error: vr2.ok ? 'WhatsApp is not connected — reconnect before sending.' : vr2.error });
       return;
     }
     const body = await readBody(req, UPLOAD_MAX);
@@ -1161,7 +1254,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // voice:true = a recorded voice note, sent as WhatsApp's push-to-talk bubble.
     const asVoice = !!body['voice'] && /^audio\//.test(mimetype);
     try {
-      const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username, asVoice);
+      const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username, asVoice, vr2.via);
       if (messageId) recordSentBy(messageId, me.username);
       logger.info({ user: me.username, chatId, filename, mimetype, messageId }, 'user sent a file');
       logActivity(me.username, 'send-file', `${filename} -> ${chatId}`, clientIp(req));
@@ -1192,11 +1285,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     if (everyone) {
-      if (!deleteFn || status !== 'connected') {
-        json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+      const vd = viaFor(me);
+      if (!deleteFn || !vd.ok || waStateFor(me).status !== 'connected') {
+        json(res, 409, { ok: false, error: !deleteFn || vd.ok ? 'WhatsApp is not connected — try again when the chat is live.' : vd.error });
         return;
       }
-      const r = await deleteFn(messageId, true);
+      const r = await deleteFn(messageId, true, vd.via);
       if (!r.ok) {
         json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused to delete this message.' });
         return;
@@ -1206,7 +1300,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // Delete-for-me: hidden from the OMS for every user. Deliberate — the OMS is one shared
       // window onto the account, not per-user mailboxes. WhatsApp on phones still shows it.
       // Best-effort mirror into the linked account; the OMS hide must not depend on it.
-      if (deleteFn && status === 'connected') void deleteFn(messageId, false);
+      if (deleteFn) { const vd2 = viaFor(me); if (vd2.ok && waStateFor(me).status === 'connected') void deleteFn(messageId, false, vd2.via); }
       markDeleted(messageId);
     }
     logger.info({ user: me.username, messageId, everyone }, 'message deleted');
@@ -1219,8 +1313,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if ((path === '/api/messages/star' || path === '/api/messages/pin') && req.method === 'POST') {
     const isStar = path.endsWith('/star');
     const fn = isStar ? starFn : pinFn;
-    if (!fn || status !== 'connected') {
-      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+    const vsp = viaFor(me);
+    if (!fn || !vsp.ok || waStateFor(me).status !== 'connected') {
+      json(res, 409, { ok: false, error: !fn || vsp.ok ? 'WhatsApp is not connected — try again when the chat is live.' : vsp.error });
       return;
     }
     const body = await readBody(req);
@@ -1230,7 +1325,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 404, { ok: false, error: 'Message not found.' });
       return;
     }
-    const r = await fn(messageId, on);
+    const r = await fn(messageId, on, vsp.via);
     if (!r.ok) {
       json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused.' });
       return;
@@ -1245,8 +1340,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // React with an emoji, like tapping a message in WhatsApp. Empty emoji removes the reaction.
   // The reaction lands in the real chat; our own message_reaction event then stores + renders it.
   if (path === '/api/messages/react' && req.method === 'POST') {
-    if (!reactFn || status !== 'connected') {
-      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+    const vre = viaFor(me);
+    if (!reactFn || !vre.ok || waStateFor(me).status !== 'connected') {
+      json(res, 409, { ok: false, error: !reactFn || vre.ok ? 'WhatsApp is not connected — try again when the chat is live.' : vre.error });
       return;
     }
     const body = await readBody(req);
@@ -1256,7 +1352,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 404, { ok: false, error: 'Message not found.' });
       return;
     }
-    const r = await reactFn(messageId, emoji);
+    const r = await reactFn(messageId, emoji, vre.via);
     if (!r.ok) {
       json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused the reaction.' });
       return;
@@ -1320,8 +1416,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // Msg.get lookup that breaks on @lid chats, and a signed copy also keeps the audit trail of
   // WHO forwarded it. Recipients see a normal message, not WhatsApp's "Forwarded" label.
   if (path === '/api/messages/forward' && req.method === 'POST') {
-    if (status !== 'connected') {
-      json(res, 409, { ok: false, error: 'WhatsApp is not connected — try again when the chat is live.' });
+    const vf = viaFor(me);
+    if (!vf.ok || waStateFor(me).status !== 'connected') {
+      json(res, 409, { ok: false, error: vf.ok ? 'WhatsApp is not connected — try again when the chat is live.' : vf.error });
       return;
     }
     const body = await readBody(req);
@@ -1346,19 +1443,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           json(res, 503, { ok: false, error: 'Media is not available right now.' });
           return;
         }
-        const file = await mediaFn(messageId);
+        const file = await mediaFn(messageId, vf.via);
         if (!file) {
           json(res, 404, { ok: false, error: 'The file could not be retrieved from WhatsApp any more.' });
           return;
         }
         const caption = text ? `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}` : undefined;
-        sentId = await sendMediaFn(toChat, { data: file.data, mimetype: file.mimetype, filename: file.filename ?? 'file' }, caption, undefined, me.username);
+        sentId = await sendMediaFn(toChat, { data: file.data, mimetype: file.mimetype, filename: file.filename ?? 'file' }, caption, undefined, me.username, undefined, vf.via);
       } else {
         if (!sendMessageFn || !text) {
           json(res, 400, { ok: false, error: 'There is no text to forward.' });
           return;
         }
-        sentId = await sendMessageFn(toChat, `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}`, undefined, me.username);
+        sentId = await sendMessageFn(toChat, `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}`, undefined, me.username, undefined, vf.via);
       }
       if (sentId) recordSentBy(sentId, me.username);
       logger.info({ user: me.username, from: msg.chatId, to: toChat, messageId }, 'message forwarded');
@@ -1703,7 +1800,7 @@ function adminPage(me: User): string {
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
   <div class="card"><table><thead><tr>
-    <th>Username</th><th>Name</th><th>Email</th><th style="width:96px">Role</th><th style="width:96px">Status</th>
+    <th>Username</th><th>Name</th><th>Email</th><th style="width:96px">Role</th><th style="width:100px">WhatsApp</th><th style="width:96px">Status</th>
     <th style="width:150px">Last sign-in</th><th style="width:270px"></th>
   </tr></thead><tbody id="tb"></tbody></table></div>
   <p class="muted" style="margin-top:14px">New users must set their own password at first sign-in. Disabling a user
@@ -1723,6 +1820,7 @@ function adminPage(me: User): string {
       <div><label for="fRole">Role</label><select id="fRole"><option value="user">User</option><option value="admin">Admin</option></select></div>
       <div id="wrapActive"><label for="fActive">Status</label><select id="fActive"><option value="1">Active</option><option value="0">Disabled</option></select></div>
     </div>
+    <label for="fWa">WhatsApp</label><select id="fWa"><option value="common">Common — the shared business WhatsApp</option><option value="personal">Personal — they link their OWN WhatsApp (QR at sign-in)</option></select>
     <label for="fPass" id="lPass">Password</label><input id="fPass" type="password" autocomplete="new-password" placeholder="at least 8 characters">
   </div>
   <div class="err" id="mErr"></div>
@@ -1746,6 +1844,7 @@ function render(){
       '<td>'+esc(u.name||"—")+'</td>'+
       '<td>'+(u.email?esc(u.email):'<span class="pill off" title="No email — this user signs in WITHOUT a verification code. Add one.">no 2FA</span>')+'</td>'+
       '<td><span class="pill '+(u.role==="admin"?"admin":"user")+'">'+(u.role==="admin"?"Admin":"User")+'</span></td>'+
+      '<td><span class="pill '+(u.waMode==="personal"?"admin":"user")+'" title="'+(u.waMode==="personal"?"Links their own WhatsApp":"Uses the shared business WhatsApp")+'">'+(u.waMode==="personal"?"Personal":"Common")+'</span></td>'+
       '<td><span class="pill '+(u.active?"on":"off")+'">'+(u.active?"Active":"Disabled")+'</span></td>'+
       '<td class="muted">'+when(u.lastLogin)+'</td>'+
       '<td><div class="acts">'+
@@ -1757,12 +1856,12 @@ function render(){
 }
 function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
   el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
-  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
   el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
 function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
   el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
   el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
-  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fActive").value=u.active?"1":"0";
+  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fActive").value=u.active?"1":"0";
   el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
   el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
 function closeModal(){el("modal").className="modal";}
@@ -1770,9 +1869,9 @@ async function save(){
   var err=el("mErr"),btn=el("mSave");err.className="err";btn.disabled=true;btn.textContent="Saving…";
   var d;
   if(editId===null){
-    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,password:el("fPass").value});
+    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,password:el("fPass").value});
   }else{
-    var body={id:editId,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,active:el("fActive").value==="1"};
+    var body={id:editId,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,active:el("fActive").value==="1"};
     if(el("fPass").value)body.password=el("fPass").value;
     d=await post("/api/users/edit",body);
   }
@@ -1933,6 +2032,59 @@ el("test").addEventListener("click",async function(){
   b.disabled=false;b.textContent="Send a test email to me";
 });
 load();
+</script></body></html>`;
+}
+
+// --- Personal WhatsApp linking page (personal-mode users only) ---
+function linkPage(me: User): string {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Link WhatsApp · WhatsApp OMS</title>
+<style>
+  :root{color-scheme:light}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#f0f2f5;color:#111b21;font-size:14px;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:18px}
+  .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:28px 30px;max-width:420px;width:100%;text-align:center;box-shadow:0 4px 18px #0000000d}
+  h1{font-size:17px;margin:0 0 6px}
+  .sub{color:#667781;font-size:13px;margin:0 0 18px;line-height:1.5}
+  .qrbox{min-height:300px;display:flex;align-items:center;justify-content:center;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;margin-bottom:14px}
+  .qrbox img{width:280px;height:280px;image-rendering:pixelated}
+  .st{display:inline-block;font-size:12.5px;font-weight:700;border-radius:16px;padding:5px 14px;background:#fef3c7;color:#92400e}
+  .st.ok{background:#d1fae5;color:#065f46}
+  ol{text-align:left;font-size:12.5px;color:#3b4a54;margin:14px 0 0;padding-left:20px;line-height:1.7}
+  a{color:#059669;font-weight:600;text-decoration:none}
+  .back{margin-top:14px;font-size:12.5px}
+</style></head><body>
+<div class="card">
+  <h1>Link your WhatsApp</h1>
+  <p class="sub">Signed in as <b>${esc(me.username)}</b> — this connects <b>your own</b> WhatsApp.
+  You will see only your chats, and messages you send go from your number.</p>
+  <div class="qrbox" id="qrbox">Starting your session…</div>
+  <div><span class="st" id="st">connecting…</span></div>
+  <ol>
+    <li>Open WhatsApp on your phone</li>
+    <li>Tap <b>Settings → Linked devices → Link a device</b></li>
+    <li>Point the phone at the QR code above</li>
+  </ol>
+  <div class="back"><a href="/">&#8592; Back to Order Matching</a></div>
+</div>
+<script>
+function el(id){return document.getElementById(id);}
+async function tick(){
+  try{
+    var d=await(await fetch("/api/link/state")).json();
+    var st=el("st");
+    if(d.status==="connected"){
+      st.textContent="Connected — opening your chats…";st.className="st ok";
+      el("qrbox").innerHTML="&#9989; Linked";
+      setTimeout(function(){location.href="/";},1500);
+      return;
+    }
+    st.textContent=d.status==="waiting for scan"?"Waiting for you to scan…":d.status;
+    st.className="st";
+    if(d.qr)el("qrbox").innerHTML='<img alt="QR code" src="'+d.qr+'">';
+  }catch(e){el("st").textContent="server unreachable";}
+  setTimeout(tick,2500);
+}
+tick();
 </script></body></html>`;
 }
 
@@ -2619,7 +2771,7 @@ function matchPage(me: User): string {
 <div class="toast" id="toast"></div>
 <script>
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
-var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},appUsers=[];
+var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},appUsers=[];
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
@@ -2779,7 +2931,8 @@ async function loadChats(){try{var d=await(await fetch("/api/chats")).json();cha
 // Header pill: green "Live chat" only when WhatsApp is actually linked; red/amber otherwise.
 function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var cls="",label="";
   if(s==="connected"){cls="";label="Live chat";}
-  else if(s==="waiting for scan"){cls="off";label="Disconnected — scan QR";}
+  else if(s==="not linked"){cls="off";label="Link your WhatsApp";}
+  else if(s==="waiting for scan"){cls="off";label=WA_PERSONAL?"Scan your QR — Link WhatsApp":"Disconnected — scan QR";}
   else if(s==="auth failure"){cls="off";label="Disconnected — re-link";}
   else if(s==="disconnected"){cls="off";label="Disconnected — reconnecting…";}
   else if(s==="offline"){cls="off";label="Server unreachable";}
@@ -2794,7 +2947,12 @@ function showOffline(s){
   var icon="⏳",title="Connecting to WhatsApp…",
       msg="Waiting for the WhatsApp connection. This usually takes a few seconds.",
       note="",bad=false,wait=true;
-  if(s==="waiting for scan"||s==="auth failure"){
+  if(WA_PERSONAL&&(s==="not linked"||s==="waiting for scan"||s==="auth failure")){
+    icon="📱";bad=false;wait=false;
+    title="Link your WhatsApp";
+    msg="Your account uses your OWN WhatsApp. Scan a QR once and your chats appear here.";
+    note="Open the Link WhatsApp tab in the header (or go to /link) and scan with your phone.";
+  }else if(s==="waiting for scan"||s==="auth failure"){
     icon="🔌";bad=true;wait=false;
     title="WhatsApp needs to be re-linked";
     msg="The linked device was signed out, so messages cannot be sent or received right now.";
