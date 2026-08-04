@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFile } from 'node:child_process';
 import http from 'node:http';
 import nodePath from 'node:path';
 import QRCode from 'qrcode';
@@ -27,6 +28,7 @@ import {
   resendOtp,
   revokeDevices,
   sessionCookie,
+  signOutUser,
   sessionUser,
   trustDevice,
   updateUser,
@@ -128,6 +130,32 @@ export interface PersonalWa {
   stop(userId: number): void;
 }
 let personalWaRef: PersonalWa | null = null;
+/** Injected by index.ts: unlink the BUSINESS WhatsApp so the Settings page can relink it. */
+let commonUnlinkFn: (() => Promise<void>) | null = null;
+
+/**
+ * Extraction locks: message id -> who is working on it. In memory on purpose (a service restart
+ * clears every lock, which is the safe failure mode); the open page heartbeats its claims and an
+ * idle claim expires after the admin-configured minutes (Settings), so a closed laptop can never
+ * hold an order hostage.
+ */
+/** Fallback save-emojis for users the admin gave none — distinct per user id, stable. */
+const EMOJI_POOL = ['✅', '👍', '🆗', '⭐', '✔️', '🟢', '💚', '🔵', '🟣', '🟠'] as const;
+const extractClaims = new Map<string, { username: string; at: number }>();
+function lockMs(): number {
+  return Math.max(1, Number(getSetting('extract.lockMinutes', '5')) || 5) * 60_000;
+}
+function claimsSweep(): void {
+  const cut = Date.now() - lockMs();
+  for (const [k, v] of extractClaims) if (v.at < cut) extractClaims.delete(k);
+}
+function releaseClaims(username: string, messageIds?: string[]): void {
+  for (const [k, v] of extractClaims) {
+    if (v.username !== username) continue;
+    if (messageIds && !messageIds.includes(k)) continue;
+    extractClaims.delete(k);
+  }
+}
 
 /** The acting user's session state: their own for personal mode, the shared pill otherwise. */
 function waStateFor(me: User): { status: string; qr: string | null } {
@@ -239,6 +267,7 @@ function checkInlineScripts(): void {
   const fake: User = {
     id: 0,
     waMode: 'common',
+    emoji: '',
     username: 'selfcheck',
     name: 'selfcheck',
     email: '',
@@ -342,6 +371,36 @@ export function writeMediaCache(messageId: string, data: string, mimetype: strin
   }
   return buf.length;
 }
+/**
+ * Repackage a browser voice recording (webm/opus) as ogg/opus, which is what WhatsApp's voice
+ * bubble accepts. `-c:a copy` = container swap only, no re-encode — a 2-minute note takes
+ * milliseconds. Returns null on any failure so the caller can decide what to do.
+ */
+async function remuxWebmToOgg(base64: string): Promise<string | null> {
+  try {
+    const ffmpeg = (await import('ffmpeg-static')).default as unknown as string;
+    if (!ffmpeg || !fs.existsSync(ffmpeg)) return null;
+    const dir = nodePath.join(config.storeDir, 'tmp');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const inFile = nodePath.join(dir, `v-${stamp}.webm`);
+    const outFile = nodePath.join(dir, `v-${stamp}.ogg`);
+    fs.writeFileSync(inFile, Buffer.from(base64, 'base64'));
+    await new Promise<void>((resolve, reject) => {
+      execFile(ffmpeg, ['-y', '-i', inFile, '-c:a', 'copy', '-f', 'ogg', outFile], { timeout: 20_000 }, (err) =>
+        err ? reject(err) : resolve(),
+      );
+    });
+    const out = fs.readFileSync(outFile).toString('base64');
+    fs.rmSync(inFile, { force: true });
+    fs.rmSync(outFile, { force: true });
+    return out;
+  } catch (err) {
+    logger.warn({ err }, 'webm->ogg remux failed');
+    return null;
+  }
+}
+
 /** "2026-07-31" -> LOCAL midnight, not UTC: Date.parse on a bare date assumes UTC, which shifted
  *  every date filter by the timezone offset — "today" quietly included yesterday evening. */
 function parseLocalDate(s: string): number {
@@ -402,6 +461,7 @@ async function handleAdmin(
       smtp: { host: m.smtp.host, port: m.smtp.port, user: m.smtp.user, hasPass: !!m.smtp.pass },
       ms365: { tenant: m.ms365.tenant, clientId: m.ms365.clientId, hasSecret: !!m.ms365.clientSecret, sender: m.ms365.sender },
       adminNewDevice: getSetting('notify.adminNewDevice', '0') === '1',
+      lockMinutes: Math.max(1, Number(getSetting('extract.lockMinutes', '5')) || 5),
       sender: senderAddress(),
     });
     return true;
@@ -430,10 +490,36 @@ async function handleAdmin(
     const secret = str('ms365ClientSecret');
     if (secret) setSetting('mail.ms365.clientSecret', secret);
     if (body['adminNewDevice'] !== undefined) setSetting('notify.adminNewDevice', body['adminNewDevice'] ? '1' : '0');
+    if (body['lockMinutes'] !== undefined) {
+      const lm = Math.min(120, Math.max(1, Number(body['lockMinutes']) || 5));
+      setSetting('extract.lockMinutes', String(lm));
+    }
     resetMailCache(); // a cached MS365 token for the old app registration must not survive a change
     logger.info({ user: me.username }, 'settings updated');
     logActivity(me.username, 'settings', 'changed email/notification settings', clientIp(req));
     json(res, 200, { ok: true, sender: senderAddress() });
+    return true;
+  }
+  // Business-WhatsApp management, from the Settings page (meeting 04-08: "I don't want to have
+  // to go to the server"). State shows the shared account's connection + its QR when one is
+  // pending; Unlink logs the device out so a NEW number can scan the fresh QR right there.
+  if (path === '/api/settings/wa-state') {
+    json(res, 200, { status, qr: qrDataUrl });
+    return true;
+  }
+  if (path === '/api/settings/wa-unlink' && req.method === 'POST') {
+    if (!commonUnlinkFn) {
+      json(res, 200, { ok: false, error: 'Not available.' });
+      return true;
+    }
+    logger.warn({ user: me.username }, 'business WhatsApp unlink requested from Settings');
+    logActivity(me.username, 'wa-unlink', 'business WhatsApp unlinked for re-linking', clientIp(req));
+    try {
+      await commonUnlinkFn();
+      json(res, 200, { ok: true });
+    } catch (err) {
+      json(res, 200, { ok: false, error: (err as Error).message.slice(0, 200) });
+    }
     return true;
   }
   // "Send a test email to me" — proves the configuration without waiting for a real sign-in.
@@ -478,7 +564,8 @@ async function handleAdmin(
       return true;
     }
     const waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
-    const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value, waMode);
+    const emoji = typeof body['emoji'] === 'string' ? (body['emoji'] as string).trim().slice(0, 8) : '';
+    const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value, waMode, emoji);
     // Welcome mail with the temporary password — it stops working at first sign-in, when the
     // user must choose their own. Best-effort: a mail outage must not block creating accounts.
     let mailed = false;
@@ -503,11 +590,12 @@ async function handleAdmin(
       json(res, 200, { ok: false, error: 'User not found.' });
       return true;
     }
-    const patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal' } = {};
+    const patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal'; emoji?: string } = {};
     if (body['name'] !== undefined) patch.name = String(body['name']).trim().slice(0, 80);
     if (body['role'] !== undefined) patch.role = body['role'] === 'admin' ? 'admin' : 'user';
     if (body['active'] !== undefined) patch.active = !!body['active'];
     if (body['waMode'] !== undefined) patch.waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
+    if (body['emoji'] !== undefined) patch.emoji = String(body['emoji']).trim().slice(0, 8);
     if (body['email'] !== undefined) {
       const em = validateEmail(body['email']);
       if (!em.ok) {
@@ -538,6 +626,9 @@ async function handleAdmin(
     updateUser(id, patch);
     // Switched back to the shared account: their personal session must not keep running.
     if (patch.waMode === 'common' && target.waMode === 'personal') personalWaRef?.stop(id);
+    // A mode change signs the user out everywhere: next login lands them in the right flow
+    // (common = no QR at all; personal = straight to their QR).
+    if (patch.waMode !== undefined && patch.waMode !== target.waMode && id !== me.id) signOutUser(id);
     logActivity(me.username, 'user-edit', `${target.username}${patch.password ? ' (password reset)' : ''}${patch.active === false ? ' (disabled)' : ''}${patch.waMode && patch.waMode !== target.waMode ? ` (WhatsApp: ${patch.waMode})` : ''}`, clientIp(req));
     json(res, 200, { ok: true, users: listUsers() });
     return true;
@@ -646,6 +737,7 @@ export function startWebServer(
   pin?: (messageId: string, on: boolean, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
   react?: (messageId: string, emoji: string, via?: unknown) => Promise<{ ok: boolean; reason?: string }>,
   personalWa?: PersonalWa,
+  commonUnlink?: () => Promise<void>,
 ): http.Server {
   ordersProvider = getOrders;
   chatStoreRef = chatStore;
@@ -657,6 +749,7 @@ export function startWebServer(
   pinFn = pin ?? null;
   reactFn = react ?? null;
   personalWaRef = personalWa ?? null;
+  commonUnlinkFn = commonUnlink ?? null;
   ensureSeedAdmin(); // first run: create the admin account and write its one-time password
   cleanupAuth(); // drop expired sessions / stale lockout rows
   // ...and keep doing it: login_attempts grows with every failed attempt, and a boot-only sweep
@@ -934,6 +1027,25 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   if (path === '/api/extract' && req.method === 'POST') {
     const body = await readBody(req);
     let text = typeof body['text'] === 'string' ? (body['text'] as string) : '';
+    // The extraction LOCK (meeting 04-08): while one user works an order, nobody else may
+    // extract it — they are told who has it. Claims live in memory (a restart clears them),
+    // heartbeat-refreshed by the open page, and expire after the admin-set idle timeout.
+    {
+      const midsWanted = Array.isArray(body['messageIds'])
+        ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string')
+        : typeof body['messageId'] === 'string'
+          ? [body['messageId'] as string]
+          : [];
+      claimsSweep();
+      for (const m of midsWanted) {
+        const c = extractClaims.get(m);
+        if (c && c.username !== me.username) {
+          json(res, 409, { ok: false, lockedBy: c.username, error: `${c.username} is working on this order — only they can extract it right now.` });
+          return;
+        }
+      }
+      for (const m of midsWanted) extractClaims.set(m, { username: me.username, at: Date.now() });
+    }
     let sources: Array<{ messageId: string; text: string }> = [];
     let newCount = -1;
     if (!text && typeof body['chatId'] === 'string' && chatStoreRef) {
@@ -1149,10 +1261,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
     markChatRead(me.id, id); // opening (and keeping open — this polls) marks the chat read for ME only
     const orderNos = orderNoOf(id); // DDI order numbers typed after Copy, keyed by message
+    // Who is working which message right now — drives the "X is working on this" badge.
+    claimsSweep();
+    const claims: Record<string, string> = {};
+    for (const m of msgs) {
+      const c = extractClaims.get(m.messageId);
+      if (c) claims[m.messageId] = c.username;
+    }
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
+      claims, // messageId -> username currently extracting it (the lock)
       messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
     });
     return;
@@ -1232,9 +1352,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const body = await readBody(req, UPLOAD_MAX);
     const chatId = typeof body['chatId'] === 'string' ? (body['chatId'] as string).trim() : '';
-    const data = typeof body['data'] === 'string' ? (body['data'] as string) : '';
-    const mimetype = typeof body['mimetype'] === 'string' ? (body['mimetype'] as string) : '';
-    const filename = (typeof body['filename'] === 'string' ? (body['filename'] as string) : 'file')
+    let data = typeof body['data'] === 'string' ? (body['data'] as string) : '';
+    let mimetype = typeof body['mimetype'] === 'string' ? (body['mimetype'] as string) : '';
+    let filename = (typeof body['filename'] === 'string' ? (body['filename'] as string) : 'file')
       .replace(/[\\/:*?"<>|]/g, '_')
       .slice(0, 120);
     const caption = typeof body['caption'] === 'string' ? (body['caption'] as string).trim() : '';
@@ -1254,6 +1374,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const signed = caption ? `✍🏼 BY *${me.username.toUpperCase()}*\n\n${caption}` : '';
     // voice:true = a recorded voice note, sent as WhatsApp's push-to-talk bubble.
     const asVoice = !!body['voice'] && /^audio\//.test(mimetype);
+    // WhatsApp refuses webm for voice notes (the opaque page error "t" — three real staff attempts
+    // failed on it). The browser's recording codec is already opus; only the CONTAINER is wrong,
+    // so remux to ogg without re-encoding. If ffmpeg fails we still try the original.
+    if (asVoice && /webm/i.test(mimetype)) {
+      const ogg = await remuxWebmToOgg(data);
+      if (ogg) {
+        data = ogg;
+        mimetype = 'audio/ogg; codecs=opus';
+        filename = filename.replace(/\.webm$/i, '') + '.ogg';
+      } else {
+        logger.warn({ user: me.username }, 'voice remux failed — sending the original webm');
+      }
+    }
     try {
       const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username, asVoice, vr2.via);
       if (messageId) recordSentBy(messageId, me.username);
@@ -1363,6 +1496,29 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, { ok: true });
     return;
   }
+  // Extraction-lock lifecycle: the page heartbeats while an extraction is open (claims stay
+  // fresh), and releases on un-extract / Clear / Save. Release only ever touches YOUR claims.
+  if (path === '/api/extract/heartbeat' && req.method === 'POST') {
+    const body = await readBody(req);
+    const ids = Array.isArray(body['messageIds'])
+      ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 100)
+      : [];
+    for (const m of ids) {
+      const c = extractClaims.get(m);
+      if (!c || c.username === me.username) extractClaims.set(m, { username: me.username, at: Date.now() });
+    }
+    json(res, 200, { ok: true });
+    return;
+  }
+  if (path === '/api/extract/release' && req.method === 'POST') {
+    const body = await readBody(req);
+    const ids = Array.isArray(body['messageIds'])
+      ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string')
+      : undefined;
+    releaseClaims(me.username, ids);
+    json(res, 200, { ok: true });
+    return;
+  }
   // Learned non-products: ✕ on an unmatched extracted row teaches the system to skip that phrase
   // in future extractions. Any signed-in user can teach (the aliases work the same way); the Undo
   // in the toast calls the delete endpoint.
@@ -1409,6 +1565,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const n = setOrderNo(ids, orderNo);
     logger.info({ user: me.username, orderNo, messages: n }, 'DDI order number saved');
     logActivity(me.username, 'ddi-number', `#${orderNo} on ${n} message(s)`, clientIp(req));
+    // Save COMPLETES the order: the extraction lock is released for everyone…
+    releaseClaims(me.username, ids);
+    // …and the saver's emoji lands on the customer's message in real WhatsApp (meeting 04-08).
+    // Best-effort: a reaction failure must never fail the save. On the shared account only one
+    // reaction can exist per message — a later saver's emoji replaces it, as agreed.
+    const saveEmoji = me.emoji || EMOJI_POOL[me.id % EMOJI_POOL.length]!;
+    const vrx = viaFor(me);
+    if (reactFn && vrx.ok && waStateFor(me).status === 'connected') {
+      for (const mid of ids) {
+        void reactFn(mid, saveEmoji, vrx.via).catch((err) =>
+          logger.warn({ err, mid }, 'save-emoji reaction failed'),
+        );
+      }
+    }
     json(res, 200, { ok: true, updated: n });
     return;
   }
@@ -1822,6 +1992,8 @@ function adminPage(me: User): string {
       <div id="wrapActive"><label for="fActive">Status</label><select id="fActive"><option value="1">Active</option><option value="0">Disabled</option></select></div>
     </div>
     <label for="fWa">WhatsApp</label><select id="fWa"><option value="common">Common — the shared business WhatsApp</option><option value="personal">Personal — they link their OWN WhatsApp (QR at sign-in)</option></select>
+    <label for="fEmoji">Save-emoji <span style="font-weight:400">(reacted onto the customer's message when this user saves an order; empty = automatic)</span></label>
+    <input id="fEmoji" autocomplete="off" maxlength="8" placeholder="e.g. ✅" style="width:90px">
     <label for="fPass" id="lPass">Password</label><input id="fPass" type="password" autocomplete="new-password" placeholder="at least 8 characters">
   </div>
   <div class="err" id="mErr"></div>
@@ -1846,7 +2018,7 @@ function render(){
       '<td>'+esc(u.name||"—")+'</td>'+
       '<td>'+(u.email?esc(u.email):'<span class="pill off" title="No email — this user signs in WITHOUT a verification code. Add one.">no 2FA</span>')+'</td>'+
       '<td><span class="pill '+(u.role==="admin"?"admin":"user")+'">'+(u.role==="admin"?"Admin":"User")+'</span></td>'+
-      '<td><span class="pill '+(u.waMode==="personal"?"admin":"user")+'" title="'+(u.waMode==="personal"?"Links their own WhatsApp":"Uses the shared business WhatsApp")+'">'+(u.waMode==="personal"?"Personal":"Common")+'</span></td>'+
+      '<td><span class="pill '+(u.waMode==="personal"?"admin":"user")+'" title="'+(u.waMode==="personal"?"Links their own WhatsApp":"Uses the shared business WhatsApp")+'">'+(u.waMode==="personal"?"Personal":"Common")+'</span>'+(u.emoji?' <span title="save-emoji">'+esc(u.emoji)+'</span>':'')+'</td>'+
       '<td><span class="pill '+(u.active?"on":"off")+'">'+(u.active?"Active":"Disabled")+'</span></td>'+
       '<td class="muted">'+when(u.lastLogin)+'</td>'+
       '<td><div class="acts">'+
@@ -1858,12 +2030,12 @@ function render(){
 }
 function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
   el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
-  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fEmoji").value="";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
   el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
 function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
   el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
   el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
-  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fActive").value=u.active?"1":"0";
+  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fEmoji").value=u.emoji||"";el("fActive").value=u.active?"1":"0";
   el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
   el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
 function closeModal(){el("modal").className="modal";}
@@ -1871,9 +2043,9 @@ async function save(){
   var err=el("mErr"),btn=el("mSave");err.className="err";btn.disabled=true;btn.textContent="Saving…";
   var d;
   if(editId===null){
-    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,password:el("fPass").value});
+    d=await post("/api/users/add",{username:el("fUser").value,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,emoji:el("fEmoji").value,password:el("fPass").value});
   }else{
-    var body={id:editId,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,active:el("fActive").value==="1"};
+    var body={id:editId,name:el("fName").value,email:el("fEmail").value,role:el("fRole").value,waMode:el("fWa").value,emoji:el("fEmoji").value,active:el("fActive").value==="1"};
     if(el("fPass").value)body.password=el("fPass").value;
     d=await post("/api/users/edit",body);
   }
@@ -1984,6 +2156,18 @@ function settingsPage(me: User): string {
         <small>Sent after the person passes their verification code. Goes to every admin with an email address.</small></div>
       <span class="tgl"><input type="checkbox" id="swNewDev"><span class="tr"></span><span class="th"></span></span>
     </div>
+    <div style="margin-top:16px">
+      <label for="lockMin">Order lock timeout (minutes)</label>
+      <input id="lockMin" inputmode="numeric" style="max-width:120px">
+      <div class="hint">While someone is extracting an order, others are locked out. If they walk away, the lock releases by itself after this many minutes.</div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Business WhatsApp</h2>
+    <p class="sub">The shared account everyone on “Common” works through. Unlink it here to connect a different number — the new QR appears below, no server access needed.</p>
+    <p class="sub">Status: <b id="waStatus">…</b></p>
+    <div id="waQrBox" style="display:none;text-align:center;background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin-bottom:12px"><img id="waQr" alt="QR code" style="width:260px;height:260px;image-rendering:pixelated"><div class="hint">Scan with the NEW phone: WhatsApp → Settings → Linked devices → Link a device</div></div>
+    <button class="btn ghost" id="waUnlink">Unlink this WhatsApp…</button>
   </div>
   <div class="acts">
     <button class="btn" id="save">Save settings</button>
@@ -2010,6 +2194,7 @@ async function load(){
   el("mTenant").value=d.ms365.tenant||"";el("mClient").value=d.ms365.clientId||"";el("mSender").value=d.ms365.sender||"";
   el("mSecretHint").textContent=d.ms365.hasSecret?"A secret is saved. Leave empty to keep it.":"No secret saved yet.";
   el("swNewDev").checked=!!d.adminNewDevice;
+  el("lockMin").value=d.lockMinutes||5;
   el("senderline").innerHTML="<b>"+(d.sender||"not configured")+"</b>";
   syncProv();
 }
@@ -2020,11 +2205,32 @@ el("save").addEventListener("click",async function(){
       provider:provider(),from:el("sFrom").value,
       smtpHost:el("sHost").value,smtpPort:el("sPort").value,smtpUser:el("sUser").value,smtpPass:el("sPass").value,
       ms365Tenant:el("mTenant").value,ms365ClientId:el("mClient").value,ms365ClientSecret:el("mSecret").value,ms365Sender:el("mSender").value,
-      adminNewDevice:el("swNewDev").checked})})).json();
+      adminNewDevice:el("swNewDev").checked,lockMinutes:el("lockMin").value})})).json();
     if(d.ok){toast("Settings saved");el("sPass").value="";el("mSecret").value="";el("senderline").innerHTML="<b>"+(d.sender||"?")+"</b>";load();}
     else toast(d.error||"Could not save",true);
   }catch(e){toast("Network error",true);}
   b.disabled=false;b.textContent="Save settings";
+});
+async function waTick(){
+  try{
+    var d=await(await fetch("/api/settings/wa-state")).json();
+    el("waStatus").textContent=d.status||"unknown";
+    var box=el("waQrBox");
+    if(d.qr){el("waQr").src=d.qr;box.style.display="";}else box.style.display="none";
+  }catch(e){}
+  setTimeout(waTick,3000);
+}
+waTick();
+el("waUnlink").addEventListener("click",async function(){
+  if(!window.confirm("Unlink the BUSINESS WhatsApp?
+
+Messages stop until a new phone scans the QR that will appear here. Are you sure?"))return;
+  var b=el("waUnlink");b.disabled=true;b.textContent="Unlinking…";
+  try{
+    var d=await(await fetch("/api/settings/wa-unlink",{method:"POST"})).json();
+    toast(d.ok?"Unlinked — the new QR appears below in a moment":(d.error||"Could not unlink"),!d.ok);
+  }catch(e){toast("Network error",true);}
+  b.disabled=false;b.textContent="Unlink this WhatsApp…";
 });
 el("test").addEventListener("click",async function(){
   var b=el("test");b.disabled=true;b.textContent="Sending…";
@@ -2044,7 +2250,12 @@ function linkPage(me: User): string {
 <style>
   :root{color-scheme:light}
   *{box-sizing:border-box}
-  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#f0f2f5;color:#111b21;font-size:14px;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:18px}
+  body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:#f0f2f5;color:#111b21;font-size:14px}
+  header{display:flex;align-items:center;gap:12px;background:#fff;border-bottom:1px solid #e5e7eb;padding:10px 18px;position:sticky;top:0;z-index:5}
+  header h1{font-size:15.5px;margin:0}
+  .spacer{flex:1}
+  ${NAV_CSS}
+  .wrap{display:flex;min-height:calc(100vh - 70px);align-items:center;justify-content:center;padding:18px}
   .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:28px 30px;max-width:420px;width:100%;text-align:center;box-shadow:0 4px 18px #0000000d}
   h1{font-size:17px;margin:0 0 6px}
   .sub{color:#667781;font-size:13px;margin:0 0 18px;line-height:1.5}
@@ -2056,6 +2267,8 @@ function linkPage(me: User): string {
   a{color:#059669;font-weight:600;text-decoration:none}
   .back{margin-top:14px;font-size:12.5px}
 </style></head><body>
+<header><h1>Link WhatsApp</h1><div class="spacer"></div>${navHtml(me, '/link')}</header>
+<div class="wrap">
 <div class="card">
   <h1>Link your WhatsApp</h1>
   <p class="sub">Signed in as <b>${esc(me.username)}</b> — this connects <b>your own</b> WhatsApp.
@@ -2069,8 +2282,10 @@ function linkPage(me: User): string {
   </ol>
   <div class="back"><a href="/">&#8592; Back to Order Matching</a></div>
 </div>
+</div>
 <script>
 window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
+function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
 async function tick(){
   try{
@@ -2586,6 +2801,7 @@ function matchPage(me: User): string {
   .bubble.done{box-shadow:0 0 0 1.5px #8ce3b5}
   .sb{margin-right:auto;display:inline-block;font-size:10px;font-weight:700;border-radius:7px;padding:1px 6px;vertical-align:middle}
   .sb.e{background:var(--em);color:#04210f}.sb.d{background:var(--emdim);color:var(--em2);border:1px solid #a7f3d0}
+  .sb.lk{background:#fef3c7;border:1px solid #fde68a;color:#92400e}
   .xrow{margin-top:5px;display:none}
   .xable:hover .xrow,.bubble.ext .xrow,.bubble.busy .xrow,.bubble.done .xrow{display:block}
   /* No hover on touch devices — the Extract button must simply always be there, or phones
@@ -2777,9 +2993,10 @@ function matchPage(me: User): string {
 <div class="toast" id="toast"></div>
 <script>
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
-var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},appUsers=[];
+var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},IS_ADMIN=${me.role === 'admin' ? 'true' : 'false'},appUsers=[];
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
+var claims={}; // messageId -> username currently extracting it (the lock)
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
 function showChat(){document.body.classList.add("inchat");}
@@ -2927,7 +3144,9 @@ var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
 var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
-async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
+// While an extraction is open here, keep its lock fresh (the server expires idle locks).
+function heartbeatClaims(){var mids=Object.keys(active);if(!mids.length)return;fetch("/api/extract/heartbeat",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({messageIds:mids})}).catch(function(){});}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};heartbeatClaims();var sig=threadSig(ms);if(sig===lastSig){applyStates();return;}lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
 async function loadChats(){try{var r=await fetch("/api/chats");
@@ -2954,7 +3173,8 @@ function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var c
 // dead connection would silently do nothing, so the app is blocked rather than left half-working.
 function showOffline(s){
   var box=el("offline");if(!box)return;
-  if(s==="connected"){box.className="offline";return;}
+  // Admins are never blocked: they must reach Settings to relink WhatsApp while it is down.
+  if(IS_ADMIN||s==="connected"){box.className="offline";return;}
   var icon="⏳",title="Connecting to WhatsApp…",
       msg="Waiting for the WhatsApp connection. This usually takes a few seconds.",
       note="",bad=false,wait=true;
@@ -2991,7 +3211,7 @@ async function selectChat(id){if(typeof recStop==="function")recStop(false);curC
   // Clear the badge the INSTANT the chat is opened — the server marker is set by the thread
   // fetch below, but the badge must not wait the few seconds until the next list poll.
   for(var ci=0;ci<chats.length;ci++)if(chats[ci].id===id)chats[ci].unread=0;
-  renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+  renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
@@ -3005,11 +3225,13 @@ function applyStates(){
     // The button already reads "Extracted ✓", so no badge in that state — showing both said
     // "Extracted" twice on the same bubble. The badge is only for the persistent Processed state,
     // where it also names who completed the order.
+    var lk=claims[mid]&&claims[mid]!==meUser?claims[mid]:null; // locked by someone ELSE
     if(sb){if(done&&!on){var by=procBy[mid];var dno=orderNos[mid];sb.className="sb d";sb.textContent=(by?("✓ Processed by "+by):"✓ Processed")+(dno?(" · DDI #"+dno):"");sb.style.display="";}
+      else if(lk&&!on){sb.className="sb lk";sb.textContent="⏳ "+lk+" is working on this";sb.style.display="";}
       else{sb.style.display="none";sb.textContent="";}}
     var btn=b.querySelector(".xbtn");
-    if(btn&&!busy){btn.disabled=false;btn.classList.toggle("on",on);btn.classList.toggle("done",done&&!on);
-      btn.textContent=on?"Extracted ✓":(done?"Re-Extract":"Extract");}
+    if(btn&&!busy){btn.disabled=!!lk&&!on;btn.classList.toggle("on",on);btn.classList.toggle("done",done&&!on&&!lk);
+      btn.textContent=on?"Extracted ✓":(lk?"Locked by "+lk:(done?"Re-Extract":"Extract"));}
   }
   var any=document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done").length;
   el("navlabel").style.display=any?"":"none";
@@ -3018,12 +3240,18 @@ function applyStates(){
 // Toggle one message: OFF removes only that message's items; ON appends its items (others untouched).
 async function toggleExtract(mid){
   var b=document.querySelector('.xable[data-mid="'+cssq(mid)+'"]');
-  if(active[mid]){delete active[mid];items=items.filter(function(it){return it.mid!==mid;});rebuildSources();renderRight();applyStates();return;}
+  if(active[mid]){delete active[mid];items=items.filter(function(it){return it.mid!==mid;});rebuildSources();renderRight();applyStates();
+    fetch("/api/extract/release",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({messageIds:[mid]})}).catch(function(){});
+    return;}
+  // The lock: someone else is working this order — tell the user WHO and stop.
+  if(claims[mid]&&claims[mid]!==meUser){toast(claims[mid]+" is working on this order — only they can extract it right now.",true);return;}
   if(b)b.classList.add("busy");
   var btn=b&&b.querySelector(".xbtn");
   if(btn){btn.disabled=true;btn.className="xbtn on";btn.innerHTML='<span class="spin"></span>Extracting…';}
   try{
-    var d=await(await fetch("/api/extract",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,messageId:mid})})).json();
+    var r9=await fetch("/api/extract",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,messageId:mid})});
+    var d=await r9.json();
+    if(r9.status===409){toast(d.error||"Someone else is working on this order.",true);if(b)b.classList.remove("busy");applyStates();return;}
     active[mid]=(d.sources&&d.sources[0]&&d.sources[0].text)||"(no text)";
     var add=(d.items||[]).map(function(it){return {mid:mid,phrase:it.phrase,quantity:it.quantity||"1",line:it.line||0,raw:it.raw||"",unit:it.unit||"",material:it.material||"",matched:it.matched,chosen:it.matched||null,guess:!!it.guess,suggestions:it.suggestions||[],results:[]};});
     items=items.concat(add);rebuildSources();renderRight();openPanel(); // slide the sheet in on phones
@@ -3197,7 +3425,12 @@ async function phraseSuggest(i){
 function findProduct(i,code){var it=items[i];var pool=(it.results||[]).concat(it.suggestions||[]);for(var k=0;k<pool.length;k++)if(pool[k].code===code)return pool[k];return null;}
 // Manual rows never teach the matcher: their "phrase" is a placeholder, not customer wording,
 // and learning it would poison future matching.
-function choose(i,code){var p=findProduct(i,code);if(!p)return;var learn=!items[i].matched&&!items[i].manual;items[i].chosen=p;items[i].learned=learn;if(learn){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:items[i].phrase,code:p.code,description:p.description})}).then(function(){loadCat();}).catch(function(){});}openIdx=null;renderRight();}
+function choose(i,code){var p=findProduct(i,code);if(!p)return;
+  // Learn when the pick TEACHES something: an empty row filled, or a wrong auto-match corrected
+  // (picking a different product than the system chose). Nothing is saved yet — lessons commit
+  // on Copy, so Clear abandons them (a cleared experiment must never teach).
+  var learn=!items[i].manual&&(!items[i].matched||items[i].matched.code!==p.code);
+  items[i].chosen=p;items[i].learned=learn;openIdx=null;renderRight();}
 // Add an extra product the customer never wrote — e.g. the customer wants a 1/2" pump we only
 // have in 3/4", so the 3/4" pump goes on plus the reducer that makes it fit.
 //
@@ -3254,6 +3487,7 @@ el("right").addEventListener("click",function(e){
 // the number is required, not optional.
 function clearOrder(){
   if(ddiPending()&&!window.confirm("You have not saved the DDI order number for the order you just copied. Leave without it?"))return;
+  fetch("/api/extract/release",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({})}).catch(function(){});
   lastCopied=[];active={};items=[];rebuildSources();renderRight();applyStates();
 }
 // Clipboard with a fallback: the async API is blocked in some browsers/policies, so fall back to a
@@ -3300,6 +3534,10 @@ async function copyCsv(){
   if(!cnt)return;
   var saveItems=rows.map(function(it){return {qty:it.quantity||"1",code:it.chosen.code,description:it.chosen.description,phrase:it.phrase};});
   try{await fetch("/api/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,sources:sources,items:saveItems})});}catch(e){}
+  // COMMIT the lessons now — picks only teach once the order is actually copied (Clear = forget).
+  var lessons=items.filter(function(it){return it.learned&&it.chosen&&it.phrase;});
+  lessons.forEach(function(it){fetch("/api/alias",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phrase:it.phrase,code:it.chosen.code,description:it.chosen.description})}).catch(function(){});});
+  if(lessons.length)setTimeout(loadCat,800);
   mids.forEach(function(m){proc[m]=true;procBy[m]=meName;});   // show "Processed by <you>" straight away
   // Keep the panel exactly as-is — just flash the button. The copy + "mark Processed" still happen (above);
   // we only skip the reset so the extracted order stays visible after copying.

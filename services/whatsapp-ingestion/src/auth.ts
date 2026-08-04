@@ -61,6 +61,13 @@ try {
 } catch {
   /* column already exists */
 }
+// The user's save-emoji: when they save an order, this reacts onto the customer's message.
+// Empty = a unique default is picked from a pool by user id.
+try {
+  db.exec("ALTER TABLE users ADD COLUMN emoji TEXT NOT NULL DEFAULT ''");
+} catch {
+  /* column already exists */
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS pending_logins (
     token_hash TEXT PRIMARY KEY,
@@ -93,6 +100,8 @@ export interface User {
   lastLogin: number | null;
   /** 'common' = shared business WhatsApp; 'personal' = their own linked account. */
   waMode: 'common' | 'personal';
+  /** Save-emoji: reacted onto the customer's message when this user saves an order. */
+  emoji: string;
 }
 
 interface UserRow {
@@ -108,6 +117,7 @@ interface UserRow {
   created_at: number;
   last_login: number | null;
   wa_mode: string | null;
+  emoji: string | null;
 }
 
 const SESSION_DAYS = 14;
@@ -126,6 +136,7 @@ function toUser(r: UserRow): User {
     createdAt: r.created_at,
     lastLogin: r.last_login,
     waMode: r.wa_mode === 'personal' ? 'personal' : 'common',
+    emoji: r.emoji ?? '',
   };
 }
 
@@ -225,12 +236,14 @@ export function createUser(
   mustChange = false,
   email = '',
   waMode: 'common' | 'personal' = 'common',
+  emoji = '',
 ): User {
   const salt = randomBytes(16).toString('hex');
   const now = Date.now();
   insUser.run(username, name || username, hashSync(password, salt), salt, role, 1, mustChange ? 1 : 0, now);
   if (email) db.prepare('UPDATE users SET email=? WHERE username=?').run(email, username);
   if (waMode !== 'common') db.prepare('UPDATE users SET wa_mode=? WHERE username=?').run(waMode, username);
+  if (emoji) db.prepare('UPDATE users SET emoji=? WHERE username=?').run(emoji.slice(0, 8), username);
   const r = getByName.get(username) as unknown as UserRow;
   logger.info({ username, role }, 'user created');
   return toUser(r);
@@ -239,7 +252,7 @@ export function createUser(
 /** Partial update. Only provided fields change; password is re-hashed with a fresh salt. */
 export function updateUser(
   id: number,
-  patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal' },
+  patch: { name?: string; role?: Role; active?: boolean; password?: string; email?: string; waMode?: 'common' | 'personal'; emoji?: string },
 ): void {
   const cur = getById.get(id) as UserRow | undefined;
   if (!cur) return;
@@ -248,16 +261,18 @@ export function updateUser(
   const active = patch.active !== undefined ? (patch.active ? 1 : 0) : cur.active;
   const email = patch.email !== undefined ? patch.email : (cur.email ?? '');
   const waMode = patch.waMode !== undefined ? patch.waMode : (cur.wa_mode === 'personal' ? 'personal' : 'common');
+  const emoji = patch.emoji !== undefined ? patch.emoji.slice(0, 8) : (cur.emoji ?? '');
   if (patch.password) {
     const salt = randomBytes(16).toString('hex');
     // must_change=1: an admin-set password is known to the admin, so the user must replace it at
     // next sign-in. (The user's own self-service change clears the flag.)
-    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=?, emoji=?, pass_hash=?, salt=?, must_change=1 WHERE id=?').run(
       name,
       role,
       active,
       email,
       waMode,
+      emoji,
       hashSync(patch.password, salt),
       salt,
       id,
@@ -265,7 +280,7 @@ export function updateUser(
     // A password change invalidates that user's other sessions.
     db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   } else {
-    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=? WHERE id=?').run(name, role, active, email, waMode, id);
+    db.prepare('UPDATE users SET name=?, role=?, active=?, email=?, wa_mode=?, emoji=? WHERE id=?').run(name, role, active, email, waMode, emoji, id);
   }
   if (patch.active === false) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   logger.info({ id, role, active: !!active, passwordChanged: !!patch.password }, 'user updated');
@@ -351,6 +366,11 @@ export async function verifyPassword(id: number, password: string): Promise<bool
 }
 
 /** Set a new password for a user (used by the forced first-login change). */
+/** End every login session of one user — used when their WhatsApp mode changes. */
+export function signOutUser(id: number): void {
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+}
+
 export function changePassword(id: number, password: string, keepToken?: string): void {
   const salt = randomBytes(16).toString('hex');
   db.prepare('UPDATE users SET pass_hash=?, salt=?, must_change=0 WHERE id=?').run(

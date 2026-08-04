@@ -31,6 +31,12 @@ export interface WaClient {
   pin: (messageId: string, on: boolean) => Promise<{ ok: boolean; reason?: string }>;
   /** React to a message with an emoji ('' removes the reaction), like tapping it in WhatsApp. */
   react: (messageId: string, emoji: string) => Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * Unlink this WhatsApp account (like removing the device on the phone). The 'disconnected'
+   * LOGOUT path then wipes the session and reconnects into a fresh QR — which is the point:
+   * an admin relinks a different number without ever touching the server.
+   */
+  logout: () => Promise<void>;
   /** Send a file (image / document / etc.) with an optional caption. Human-initiated only.
    *  asVoice sends an audio file as a WhatsApp VOICE NOTE (the push-to-talk bubble). */
   sendMedia: (
@@ -583,6 +589,10 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     star: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'star' : 'unstar'),
     pin: (messageId: string, on: boolean) => msgAction(client, messageId, on ? 'pin' : 'unpin'),
     react: (messageId: string, emoji: string) => msgAction(client, messageId, 'react', emoji),
+    logout: async () => {
+      logger.warn({ session: tag }, 'unlinking this WhatsApp account on request');
+      await client.logout(); // fires 'disconnected' LOGOUT -> session wipe -> fresh QR
+    },
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions, _sentBy, asVoice): Promise<string> => {
       const media = new MessageMedia(file.mimetype, file.data, file.filename);

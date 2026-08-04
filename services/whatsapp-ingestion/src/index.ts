@@ -319,7 +319,10 @@ function main(): void {
   (messageId, on, via) => asClient(via).star(messageId, on),
   (messageId, on, via) => asClient(via).pin(messageId, on),
   (messageId, emoji, via) => asClient(via).react(messageId, emoji),
-  personalWa);
+  personalWa,
+  // The admin Settings page's "Unlink" for the BUSINESS account: log the device out; the
+  // reconnect surfaces a fresh QR that the same page then displays for the new number.
+  () => common.client.logout());
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 
