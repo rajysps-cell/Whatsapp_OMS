@@ -314,14 +314,20 @@ export function markChatRead(userId: number, chatId: string): void {
   if (!chatId) return;
   upsertRead.run(userId, chatId, Math.floor(Date.now() / 1000)); // messages.ts is in seconds
 }
+// Unread never reaches back before the feature existed (the epoch, set once at first boot with
+// this code) nor before the user's own account existed — so nobody starts with "99+" walls of
+// history, and a user added next month is not "behind" on this month either. Only messages that
+// arrive AFTER those floors count, until each user reads them.
 const unreadStmt = db.prepare(
   'SELECT m.chat_id AS chat_id, COUNT(*) AS n FROM messages m ' +
     'LEFT JOIN chat_reads r ON r.chat_id = m.chat_id AND r.user_id = ? ' +
-    'WHERE m.deleted = 0 AND m.ts > COALESCE(r.last_read_ts, 0) GROUP BY m.chat_id',
+    'WHERE m.deleted = 0 AND m.ts > MAX(COALESCE(r.last_read_ts, 0), ?, ' +
+    'COALESCE((SELECT created_at / 1000 FROM users WHERE id = ?), 0)) GROUP BY m.chat_id',
 );
 export function unreadCountsFor(userId: number): Map<string, number> {
+  const epoch = Number(getSetting('unread.epoch', '0')) || 0;
   const out = new Map<string, number>();
-  for (const r of unreadStmt.all(userId) as Array<{ chat_id: string; n: number }>) out.set(r.chat_id, r.n);
+  for (const r of unreadStmt.all(userId, epoch, userId) as Array<{ chat_id: string; n: number }>) out.set(r.chat_id, r.n);
   return out;
 }
 
@@ -363,6 +369,10 @@ export function listActivity(limit = 100, beforeId = 0, user = '', action = '', 
   return { rows, total };
 }
 db.prepare('DELETE FROM activity_log WHERE ts < ?').run(Date.now() - 90 * 86_400_000); // boot sweep
+
+// One-time baseline for per-user unread: everything that existed BEFORE this feature shipped is
+// read for everyone — badges only count messages from this moment on. Set once, kept forever.
+if (!getSetting('unread.epoch')) setSetting('unread.epoch', String(Math.floor(Date.now() / 1000)));
 
 // --- app settings (admin-editable at /settings; DB so they survive restarts and stay off git) ---
 export function getSetting(key: string, fallback = ''): string {

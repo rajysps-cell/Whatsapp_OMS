@@ -2339,12 +2339,12 @@ function matchPage(me: User): string {
   .toast.act{pointer-events:auto;cursor:pointer}
   /* The ⌄ that opens the message menu. Hidden until hover on mouse devices, always shown where
      there is no hover — before this, nothing on screen said the menu existed at all. */
-  .mbtn{position:absolute;top:1px;right:2px;z-index:2;width:32px;height:28px;border:0;border-radius:8px;
-    background:inherit;color:#33434e;font-size:20px;font-weight:700;line-height:26px;cursor:pointer;opacity:0;
-    transition:opacity .12s;box-shadow:-8px 0 10px -2px inherit}
-  .mbtn:hover{color:#111b21}
+  .mbtn{position:absolute;top:0;right:0;z-index:2;width:42px;height:36px;border:0;border-radius:0 7.5px 0 10px;
+    background:inherit;color:#1f2c34;font-size:26px;font-weight:700;line-height:34px;cursor:pointer;opacity:0;
+    transition:opacity .12s;box-shadow:-10px 0 12px -2px inherit}
+  .mbtn:hover{color:#000}
   .bubble:hover .mbtn,.mbtn:focus{opacity:1}
-  @media (hover:none){.mbtn{opacity:.7}}
+  @media (hover:none){.mbtn{opacity:.8}}
   .starred{color:#f59e0b;margin-right:4px;font-size:11px}
   /* Pinned-message bar above the thread, like WhatsApp's. Click scrolls to the message. */
   .pinbar{display:none;align-items:center;gap:8px;background:var(--panel);border-bottom:1px solid var(--line);
