@@ -72,6 +72,13 @@ db.exec(`
     created_by  TEXT NOT NULL DEFAULT '',
     created_at  INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS chat_reads (
+    user_id      INTEGER NOT NULL,
+    chat_id      TEXT NOT NULL,
+    last_read_ts INTEGER NOT NULL,
+    PRIMARY KEY (user_id, chat_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts);
   CREATE TABLE IF NOT EXISTS activity_log (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       INTEGER NOT NULL,
@@ -293,6 +300,29 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { row
   }
   all.sort((x, y) => y.ts - x.ts);
   return { rows: all.slice(0, limit), total: all.length };
+}
+
+// --- per-user read state -----------------------------------------------------------------
+// Every app user has their OWN read marker per chat: a chat stays "unread" for each user until
+// THEY open it — one user reading does not clear it for the other three. WhatsApp's own unread
+// (catalog_chats.unread) still exists but no longer drives the badges.
+const upsertRead = db.prepare(
+  'INSERT INTO chat_reads (user_id, chat_id, last_read_ts) VALUES (?, ?, ?) ' +
+    'ON CONFLICT(user_id, chat_id) DO UPDATE SET last_read_ts = excluded.last_read_ts',
+);
+export function markChatRead(userId: number, chatId: string): void {
+  if (!chatId) return;
+  upsertRead.run(userId, chatId, Math.floor(Date.now() / 1000)); // messages.ts is in seconds
+}
+const unreadStmt = db.prepare(
+  'SELECT m.chat_id AS chat_id, COUNT(*) AS n FROM messages m ' +
+    'LEFT JOIN chat_reads r ON r.chat_id = m.chat_id AND r.user_id = ? ' +
+    'WHERE m.deleted = 0 AND m.ts > COALESCE(r.last_read_ts, 0) GROUP BY m.chat_id',
+);
+export function unreadCountsFor(userId: number): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of unreadStmt.all(userId) as Array<{ chat_id: string; n: number }>) out.set(r.chat_id, r.n);
+  return out;
 }
 
 // --- user activity log -------------------------------------------------------------------

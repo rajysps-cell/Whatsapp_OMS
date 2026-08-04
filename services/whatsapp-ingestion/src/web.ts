@@ -72,6 +72,7 @@ import {
   isProcessed,
   listActivity,
   logActivity,
+  markChatRead,
   markDeleted,
   markRevoked,
   mentionNames,
@@ -87,6 +88,7 @@ import {
   setPinned,
   setSetting,
   setStarred,
+  unreadCountsFor,
   updateAliasText,
 } from './store';
 
@@ -954,10 +956,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
   if (path === '/api/chats') {
     const list = chatStoreRef ? chatStoreRef.chats() : [];
+    // Unread is PER USER: everything since THIS user's own read marker — one user reading a chat
+    // does not clear it for anyone else. (WhatsApp's own unread no longer drives the badge.)
+    const mine = unreadCountsFor(me.id);
     json(res, 200, {
       source: 'persisted',
       status, // live-connection state for the header pill (this endpoint is already polled every 6s)
-      chats: list.map((c) => ({ id: c.id, title: c.title, lastText: c.lastText, lastTs: c.lastTs, unread: c.unread, isGroup: c.isGroup })),
+      chats: list.map((c) => ({ id: c.id, title: c.title, lastText: c.lastText, lastTs: c.lastTs, unread: mine.get(c.id) ?? 0, isGroup: c.isGroup })),
     });
     return;
   }
@@ -1050,6 +1055,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
+    markChatRead(me.id, id); // opening (and keeping open — this polls) marks the chat read for ME only
     const orderNos = orderNoOf(id); // DDI order numbers typed after Copy, keyed by message
     json(res, 200, {
       mentions: mentionNames(), // '@<id>' in a body -> display name
@@ -2333,11 +2339,12 @@ function matchPage(me: User): string {
   .toast.act{pointer-events:auto;cursor:pointer}
   /* The ⌄ that opens the message menu. Hidden until hover on mouse devices, always shown where
      there is no hover — before this, nothing on screen said the menu existed at all. */
-  .mbtn{position:absolute;top:2px;right:3px;z-index:2;width:22px;height:20px;border:0;border-radius:6px;
-    background:inherit;color:var(--mut);font-size:14px;line-height:18px;cursor:pointer;opacity:0;
-    transition:opacity .12s;box-shadow:-6px 0 8px -2px inherit}
+  .mbtn{position:absolute;top:1px;right:2px;z-index:2;width:32px;height:28px;border:0;border-radius:8px;
+    background:inherit;color:#33434e;font-size:20px;font-weight:700;line-height:26px;cursor:pointer;opacity:0;
+    transition:opacity .12s;box-shadow:-8px 0 10px -2px inherit}
+  .mbtn:hover{color:#111b21}
   .bubble:hover .mbtn,.mbtn:focus{opacity:1}
-  @media (hover:none){.mbtn{opacity:.55}}
+  @media (hover:none){.mbtn{opacity:.7}}
   .starred{color:#f59e0b;margin-right:4px;font-size:11px}
   /* Pinned-message bar above the thread, like WhatsApp's. Click scrolls to the message. */
   .pinbar{display:none;align-items:center;gap:8px;background:var(--panel);border-bottom:1px solid var(--line);
@@ -2360,7 +2367,10 @@ function matchPage(me: User): string {
   .qt{font-size:13px;line-height:18px;color:rgba(11,20,26,.6);display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
   .qm{font-style:italic;opacity:.85}
   /* "Sent by <user>" — marks a message as sent from this app rather than typed in WhatsApp. */
-  .whoout{color:#075e54}
+  .sentby{display:inline-block;margin:0 0 5px;font-size:11px;letter-spacing:.2px;
+    color:#3f6b57;background:#eafaf0;border:1px solid #a7f3d0;border-radius:20px;
+    padding:3px 11px;line-height:1.45}
+  .sentby b{color:var(--em2);font-weight:700}
   /* Composer — the only write surface in the app; one message per explicit send. */
   .composer{display:flex;align-items:flex-end;gap:9px;padding:9px 14px;background:#f0f2f5;border-top:1px solid var(--line)}
   .composer textarea{flex:1;resize:none;max-height:120px;padding:9px 13px;font:inherit;font-size:14px;line-height:20px;
@@ -2750,9 +2760,8 @@ msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // 
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
 var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(m.reactions)+'</div>':"";
-// The sender of an app-sent message reads like a WhatsApp group sender: small, bold, ABOVE the
-// text — not a pill under it.
-var sentTag=sentBy?'<div class="who whoout">'+esc(sentBy)+'</div>':"";
+// The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
+var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
@@ -2805,7 +2814,7 @@ function showOffline(s){
   box.querySelector(".offbox").className="offbox"+(bad?" bad":"");
   box.className="offline on";
 }
-function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+c.unread+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
+function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+(c.unread>99?"99+":c.unread)+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
 async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];navIdx=-1;renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
