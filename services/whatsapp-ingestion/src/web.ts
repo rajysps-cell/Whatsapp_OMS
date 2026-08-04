@@ -2948,10 +2948,9 @@ function showOffline(s){
       msg="Waiting for the WhatsApp connection. This usually takes a few seconds.",
       note="",bad=false,wait=true;
   if(WA_PERSONAL&&(s==="not linked"||s==="waiting for scan"||s==="auth failure")){
-    icon="📱";bad=false;wait=false;
-    title="Link your WhatsApp";
-    msg="Your account uses your OWN WhatsApp. Scan a QR once and your chats appear here.";
-    note="Open the Link WhatsApp tab in the header (or go to /link) and scan with your phone.";
+    // No dead-end curtain: an unlinked personal user goes straight to their QR. /link returns
+    // here by itself the moment the scan succeeds, so there is no loop.
+    location.href="/link";return;
   }else if(s==="waiting for scan"||s==="auth failure"){
     icon="🔌";bad=true;wait=false;
     title="WhatsApp needs to be re-linked";
