@@ -27,3 +27,4 @@ services/whatsapp-ingestion/data.sqlite-*
 # Downloaded media / audit copies of product-export imports
 services/whatsapp-ingestion/store/
 services/whatsapp-ingestion/imports/
+services/whatsapp-ingestion/auth-personal/

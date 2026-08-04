@@ -177,7 +177,7 @@ export function setStatus(s: string): void {
 }
 
 function json(res: http.ServerResponse, code: number, body: unknown): void {
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
 }
 // Warehouse/own side vs customer. Own device (fromMe) or a sender whose display name matches a
@@ -198,7 +198,8 @@ function validateAliasInput(raw: unknown): { ok: true; text: string; norm: strin
   return { ok: true, text, norm };
 }
 function html(res: http.ServerResponse, body: string): void {
-  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  // no-store: after sign-out, Back must never resurrect a cached copy of a signed-in page.
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
   res.end(body);
 }
 /**
@@ -1830,6 +1831,7 @@ function adminPage(me: User): string {
 <script>
 var users=[],meId=${me.id},editId=null;
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" err":"");setTimeout(function(){t.className="toast"+(bad?" err":"");},2600);}
@@ -1991,6 +1993,7 @@ function settingsPage(me: User): string {
 </div>
 <div class="toast" id="toast"></div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function toast(m,bad){var t=el("toast");t.textContent=m;t.className="toast on"+(bad?" bad":"");setTimeout(function(){t.className="toast"+(bad?" bad":"");},3200);}
@@ -2067,6 +2070,7 @@ function linkPage(me: User): string {
   <div class="back"><a href="/">&#8592; Back to Order Matching</a></div>
 </div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 async function tick(){
   try{
@@ -2139,6 +2143,7 @@ function reportPage(me: User): string {
   </tr></thead><tbody id="tb"></tbody></table></div></div>
 </div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
@@ -2272,6 +2277,7 @@ function activityPage(me: User): string {
     taught aliases and ignores, user and settings changes — kept for 90 days. Reading chats is not logged.</p>
 </div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
@@ -2796,6 +2802,7 @@ function wireSwipe(elm){
 }
 // Sign-out is a POST so a third-party page can't force it with an <img>/<a> to /logout.
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function el(id){return document.getElementById(id);}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function debounce(fn,ms){var t;return function(){var a=arguments,x=this;clearTimeout(t);t=setTimeout(function(){fn.apply(x,a);},ms);};}
@@ -2920,10 +2927,14 @@ var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
 var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
-async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var d=await(await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages")).json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);var sig=threadSig(ms);if(sig===lastSig)return;lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
-async function loadChats(){try{var d=await(await fetch("/api/chats")).json();chats=d.chats||[];
+async function loadChats(){try{var r=await fetch("/api/chats");
+  // 401 = the session is gone (signed out elsewhere, or expired). Go to the login page instead
+  // of pretending the server is unreachable while showing stale chats.
+  if(r.status===401){location.href="/login";return;}
+  var d=await r.json();chats=d.chats||[];
   // The chat that is OPEN on screen is read by definition — a poll that raced the read marker
   // must not flash its badge back for a few seconds.
   for(var i=0;i<chats.length;i++)if(chats[i].id===curChat)chats[i].unread=0;
