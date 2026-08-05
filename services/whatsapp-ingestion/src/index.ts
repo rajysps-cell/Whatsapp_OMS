@@ -14,6 +14,7 @@ import {
   bumpUnread,
   clearUnread,
   markRevoked,
+  hasMessagesFor,
   recordAccountChats,
   recordSentBy,
   saveMessage,
@@ -165,7 +166,8 @@ function main(): void {
       chats.record(event);
       // Membership on ARRIVAL, not only at the 2-min catalog sync — a brand-new chat must be
       // openable the moment its first message lands, or the thread endpoint 403s until the sync.
-      recordAccountChats(account, [event.groupId]);
+      // Only for real content: protocol notifications must not conjure chats into the list.
+      if (event.text || event.media) recordAccountChats(account, [event.groupId]);
       bumpUnread(event.groupId, event.ts); // badge appears now, not at the next 2-min catalog sync
       logger.info({ event, session: account }, 'wa-event');
 
@@ -203,7 +205,7 @@ function main(): void {
       const event = await toMessageEvent(msg);
       if (event) {
         chats.record(event);
-        recordAccountChats(account, [event.groupId]);
+        if (event.text || event.media) recordAccountChats(account, [event.groupId]);
         if (event.media) void cacheMediaNow(session.client.media, event.messageId, event.kind);
         clearUnread(event.groupId); // replying from the account marks the chat read in WhatsApp
         // If this chat has a queued send from the app, this is that message — attribute it.
@@ -239,7 +241,12 @@ function main(): void {
     },
     onCatalog: (rows) => {
       upsertCatalog(rows); // names/unread — shared catalog
-      recordAccountChats(account, rows.map((r) => r.id)); // WHICH chats this account can see
+      // Membership = REAL conversations only. WhatsApp Web's chat store also carries hundreds of
+      // bare contact entries — a personal account synced 832 of those as raw-number "chats".
+      // (lastTs looked like a discriminator but WhatsApp stamps times onto contact entries too.)
+      // The rule that matches what the user sees in their own WhatsApp: groups are chats, and a
+      // 1:1 is a chat once ANY message of it exists in our store (live or backfilled).
+      recordAccountChats(account, rows.filter((r) => r.isGroup || hasMessagesFor(r.id)).map((r) => r.id));
     },
     // Recovered history goes straight to the messages table (dedup on msg id) — no order
     // extraction on backfill; the /match "only new messages" flow decides what to process.
@@ -279,6 +286,10 @@ function main(): void {
     },
     for(u: User): unknown {
       return sessions.get(`u${u.id}`)?.client ?? null;
+    },
+    unlink(u: User): void {
+      const s = sessions.get(`u${u.id}`);
+      if (s) void s.client.logout().catch((err) => logger.warn({ err, session: `u${u.id}` }, 'personal unlink failed'));
     },
     stop(userId: number): void {
       const k = `u${userId}`;

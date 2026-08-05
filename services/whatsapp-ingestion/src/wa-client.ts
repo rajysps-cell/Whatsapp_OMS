@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import pkg from 'whatsapp-web.js';
 import type { Message, Reaction } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
@@ -591,7 +593,34 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     react: (messageId: string, emoji: string) => msgAction(client, messageId, 'react', emoji),
     logout: async () => {
       logger.warn({ session: tag }, 'unlinking this WhatsApp account on request');
-      await client.logout(); // fires 'disconnected' LOGOUT -> session wipe -> fresh QR
+      // Belt and braces: wwebjs' logout() is unreliable on WhatsApp Web 2.3000.x (like everything
+      // else that goes through its Store lookups), so the QR must not depend on it succeeding.
+      // Try the polite device-logout with a timeout, then FORCE a fresh session regardless:
+      // destroy the browser, wipe the saved login, start again — that always ends in a QR. If the
+      // polite logout failed, the phone keeps a stale "linked device" entry the user can remove.
+      try {
+        await Promise.race([
+          client.logout(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('logout timed out')), 15_000)),
+        ]);
+        logger.info({ session: tag }, 'device logged out cleanly');
+      } catch (err) {
+        logger.warn({ err, session: tag }, 'polite logout failed — forcing a fresh session');
+      }
+      try {
+        await client.destroy();
+      } catch {
+        /* already down */
+      }
+      try {
+        fs.rmSync(path.join(authDir, 'session'), { recursive: true, force: true });
+      } catch (err) {
+        logger.warn({ err, session: tag }, 'session wipe failed');
+      }
+      initAt = Date.now();
+      sawQr = false;
+      stuckRestarts = 0;
+      client.initialize().catch((err) => logger.error({ err, session: tag }, 'relink initialize failed'));
     },
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions, _sentBy, asVoice): Promise<string> => {

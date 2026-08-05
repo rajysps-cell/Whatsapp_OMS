@@ -127,6 +127,8 @@ export interface PersonalWa {
   ensure(u: User): void;
   state(u: User): { started: boolean; status: string; qr: string | null };
   for(u: User): unknown;
+  /** Unlink the user's own WhatsApp — their session relinks into a fresh QR. */
+  unlink(u: User): void;
   stop(userId: number): void;
 }
 let personalWaRef: PersonalWa | null = null;
@@ -139,6 +141,13 @@ let commonUnlinkFn: (() => Promise<void>) | null = null;
  * idle claim expires after the admin-configured minutes (Settings), so a closed laptop can never
  * hold an order hostage.
  */
+/** True when s is nothing but emoji (1-2 glyphs) — the save-emoji field accepts only that. */
+function validEmoji(s: string): boolean {
+  if (!s) return true;
+  if ([...s].length > 6) return false;
+  return /^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|‍|️|⃣)+$/u.test(s);
+}
+
 /** Fallback save-emojis for users the admin gave none — distinct per user id, stable. */
 const EMOJI_POOL = ['✅', '👍', '🆗', '⭐', '✔️', '🟢', '💚', '🔵', '🟣', '🟠'] as const;
 const extractClaims = new Map<string, { username: string; at: number }>();
@@ -283,6 +292,12 @@ function checkInlineScripts(): void {
     ['/board', dashboardPage()],
     ['/login', loginPage()],
     ['/change-password', changePasswordPage(fake)],
+    // Every page belongs here: the Settings page shipped with a broken script for hours because
+    // it was missing from this list — the exact failure this guard exists to make loud.
+    ['/settings', settingsPage(fake)],
+    ['/activity', activityPage(fake)],
+    ['/report', reportPage(fake)],
+    ['/link', linkPage(fake)],
   ];
   for (const [name, body] of pages) {
     const blocks = body.match(/<script>([\s\S]*?)<\/script>/g) ?? [];
@@ -565,6 +580,10 @@ async function handleAdmin(
     }
     const waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
     const emoji = typeof body['emoji'] === 'string' ? (body['emoji'] as string).trim().slice(0, 8) : '';
+    if (!validEmoji(emoji)) {
+      json(res, 200, { ok: false, error: 'Save-emoji: only an emoji is allowed (e.g. ✅).' });
+      return true;
+    }
     const created = createUser(u.value, p.value, String(body['name'] ?? '').trim().slice(0, 80), role, true, em.value, waMode, emoji);
     // Welcome mail with the temporary password — it stops working at first sign-in, when the
     // user must choose their own. Best-effort: a mail outage must not block creating accounts.
@@ -595,7 +614,14 @@ async function handleAdmin(
     if (body['role'] !== undefined) patch.role = body['role'] === 'admin' ? 'admin' : 'user';
     if (body['active'] !== undefined) patch.active = !!body['active'];
     if (body['waMode'] !== undefined) patch.waMode = body['waMode'] === 'personal' ? 'personal' : 'common';
-    if (body['emoji'] !== undefined) patch.emoji = String(body['emoji']).trim().slice(0, 8);
+    if (body['emoji'] !== undefined) {
+      const pe = String(body['emoji']).trim().slice(0, 8);
+      if (!validEmoji(pe)) {
+        json(res, 200, { ok: false, error: 'Save-emoji: only an emoji is allowed (e.g. ✅).' });
+        return true;
+      }
+      patch.emoji = pe;
+    }
     if (body['email'] !== undefined) {
       const em = validateEmail(body['email']);
       if (!em.ok) {
@@ -1128,6 +1154,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     html(res, linkPage(me));
     return;
   }
+  if (path === '/api/link/unlink' && req.method === 'POST') {
+    if (me.waMode !== 'personal' || !personalWaRef) {
+      json(res, 200, { ok: false, error: 'Not available.' });
+      return;
+    }
+    logActivity(me.username, 'wa-unlink', 'personal WhatsApp unlinked', clientIp(req));
+    personalWaRef.unlink(me);
+    json(res, 200, { ok: true });
+    return;
+  }
   if (path === '/api/link/state') {
     if (me.waMode !== 'personal') {
       json(res, 200, { status: 'common' });
@@ -1389,6 +1425,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     try {
       const messageId = await sendMediaFn(chatId, { data, mimetype, filename }, signed || undefined, undefined, me.username, asVoice, vr2.via);
+      // A voice note cannot carry text, so recipients could not see WHO recorded it. Send the
+      // signature as its own follow-up right behind it — the site renders such a signature-only
+      // message as just the "Sent by" pill. Best-effort: the voice note itself already went.
+      if (asVoice && sendMessageFn) {
+        void sendMessageFn(chatId, `✍🏼 BY *${me.username.toUpperCase()}*`, undefined, me.username, undefined, vr2.via).catch(
+          (err) => logger.warn({ err, user: me.username }, 'voice signature follow-up failed'),
+        );
+      }
       if (messageId) recordSentBy(messageId, me.username);
       logger.info({ user: me.username, chatId, filename, mimetype, messageId }, 'user sent a file');
       logActivity(me.username, 'send-file', `${filename} -> ${chatId}`, clientIp(req));
@@ -1579,7 +1623,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         );
       }
     }
-    json(res, 200, { ok: true, updated: n });
+    json(res, 200, { ok: true, updated: n, emoji: saveEmoji });
     return;
   }
   // Forward a message to another chat. Implemented as copy-and-send through the normal signed
@@ -1994,6 +2038,7 @@ function adminPage(me: User): string {
     <label for="fWa">WhatsApp</label><select id="fWa"><option value="common">Common — the shared business WhatsApp</option><option value="personal">Personal — they link their OWN WhatsApp (QR at sign-in)</option></select>
     <label for="fEmoji">Save-emoji <span style="font-weight:400">(reacted onto the customer's message when this user saves an order; empty = automatic)</span></label>
     <input id="fEmoji" autocomplete="off" maxlength="8" placeholder="e.g. ✅" style="width:90px">
+    <div class="epal" id="epal"></div>
     <label for="fPass" id="lPass">Password</label><input id="fPass" type="password" autocomplete="new-password" placeholder="at least 8 characters">
   </div>
   <div class="err" id="mErr"></div>
@@ -2001,6 +2046,8 @@ function adminPage(me: User): string {
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
+var EMOJI_CHOICES=["✅","👍","🆗","⭐","✔️","🟢","💚","🔵","🟣","🟠","🔥","💪","🙏","🎯","📦","🚚","⚡","🌟","🫡","🤝","💯","🏆"];
+function renderEpal(){var p=document.getElementById("epal");if(!p||p.childNodes.length)return;p.innerHTML=EMOJI_CHOICES.map(function(e2){return '<button type="button" class="epbtn" data-e="'+e2+'">'+e2+'</button>';}).join("");p.addEventListener("click",function(ev){var b=ev.target.closest(".epbtn");if(b){document.getElementById("fEmoji").value=b.dataset.e;}});}
 var users=[],meId=${me.id},editId=null;
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
@@ -2030,12 +2077,12 @@ function render(){
 }
 function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
   el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
-  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fEmoji").value="";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  renderEpal();el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fEmoji").value="";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
   el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
 function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
   el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
   el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
-  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fEmoji").value=u.emoji||"";el("fActive").value=u.active?"1":"0";
+  renderEpal();el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fEmoji").value=u.emoji||"";el("fActive").value=u.active?"1":"0";
   el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
   el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
 function closeModal(){el("modal").className="modal";}
@@ -2222,9 +2269,7 @@ async function waTick(){
 }
 waTick();
 el("waUnlink").addEventListener("click",async function(){
-  if(!window.confirm("Unlink the BUSINESS WhatsApp?
-
-Messages stop until a new phone scans the QR that will appear here. Are you sure?"))return;
+  if(!window.confirm("Unlink the BUSINESS WhatsApp? Messages stop until a new phone scans the QR that will appear here. Are you sure?"))return;
   var b=el("waUnlink");b.disabled=true;b.textContent="Unlinking…";
   try{
     var d=await(await fetch("/api/settings/wa-unlink",{method:"POST"})).json();
@@ -2266,6 +2311,8 @@ function linkPage(me: User): string {
   ol{text-align:left;font-size:12.5px;color:#3b4a54;margin:14px 0 0;padding-left:20px;line-height:1.7}
   a{color:#059669;font-weight:600;text-decoration:none}
   .back{margin-top:14px;font-size:12.5px}
+  .unlink{margin-top:12px;padding:8px 16px;font-size:12.5px;font-weight:600;border-radius:8px;border:1px solid #fca5a5;background:#fff;color:#b91c1c;cursor:pointer}
+  .unlink:hover{background:#fef2f2}
 </style></head><body>
 <header><h1>Link WhatsApp</h1><div class="spacer"></div>${navHtml(me, '/link')}</header>
 <div class="wrap">
@@ -2280,6 +2327,7 @@ function linkPage(me: User): string {
     <li>Tap <b>Settings → Linked devices → Link a device</b></li>
     <li>Point the phone at the QR code above</li>
   </ol>
+  <button class="unlink" id="unlinkBtn" style="display:none">Unlink my WhatsApp…</button>
   <div class="back"><a href="/">&#8592; Back to Order Matching</a></div>
 </div>
 </div>
@@ -2287,22 +2335,37 @@ function linkPage(me: User): string {
 window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function el(id){return document.getElementById(id);}
+var wasUnlinked=false; // arrived already-connected = manage screen; JUST linked = go to chats
 async function tick(){
   try{
     var d=await(await fetch("/api/link/state")).json();
     var st=el("st");
     if(d.status==="connected"){
-      st.textContent="Connected — opening your chats…";st.className="st ok";
-      el("qrbox").innerHTML="&#9989; Linked";
-      setTimeout(function(){location.href="/";},1500);
-      return;
+      if(wasUnlinked){
+        st.textContent="Connected — opening your chats…";st.className="st ok";
+        el("qrbox").innerHTML="&#9989; Linked";
+        setTimeout(function(){location.href="/";},1500);
+        return;
+      }
+      st.textContent="Connected — this is YOUR WhatsApp";st.className="st ok";
+      el("qrbox").innerHTML="&#9989; Linked and working";
+      el("unlinkBtn").style.display="";
+    }else{
+      wasUnlinked=true;
+      el("unlinkBtn").style.display="none";
+      st.textContent=d.status==="waiting for scan"?"Waiting for you to scan…":d.status;
+      st.className="st";
+      if(d.qr)el("qrbox").innerHTML='<img alt="QR code" src="'+d.qr+'">';
     }
-    st.textContent=d.status==="waiting for scan"?"Waiting for you to scan…":d.status;
-    st.className="st";
-    if(d.qr)el("qrbox").innerHTML='<img alt="QR code" src="'+d.qr+'">';
   }catch(e){el("st").textContent="server unreachable";}
   setTimeout(tick,2500);
 }
+el("unlinkBtn").addEventListener("click",async function(){
+  if(!window.confirm("Unlink YOUR WhatsApp from this system? Your chats stop appearing here until you scan again."))return;
+  var b=el("unlinkBtn");b.disabled=true;b.textContent="Unlinking…";
+  try{await fetch("/api/link/unlink",{method:"POST"});}catch(e){}
+  b.disabled=false;b.textContent="Unlink my WhatsApp…";
+});
 tick();
 </script></body></html>`;
 }
@@ -2997,6 +3060,7 @@ var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 var claims={}; // messageId -> username currently extracting it (the lock)
+var pendingReacts={}; // messageId -> emoji just saved here, shown before WhatsApp echoes it back
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
 function showChat(){document.body.classList.add("inchat");}
@@ -3100,6 +3164,9 @@ function sigName(line,emojiOnly){
 function splitSignature(text,out){
   if(!out)return{body:text,by:null};
   var s=String(text||"");
+  // A message that IS only a signature (the follow-up behind a voice note): show just the pill.
+  var whole=sigName(s,true);
+  if(whole)return{body:"",by:whole};
   // New form first: the signature is the FIRST line, above the text (like a group sender name).
   var fn=s.indexOf("\\n");
   if(fn>0){
@@ -3135,7 +3202,7 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var hr=m.reactions&&m.reactions.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(m.reactions)+'</div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
 // The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
 var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
@@ -3207,7 +3274,7 @@ function showOffline(s){
   box.className="offline on";
 }
 function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+(c.unread>99?"99+":c.unread)+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];navIdx=-1;
+async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];pendingReacts={};navIdx=-1;
   // Clear the badge the INSTANT the chat is opened — the server marker is set by the thread
   // fetch below, but the badge must not wait the few seconds until the next list poll.
   for(var ci=0;ci<chats.length;ci++)if(chats[ci].id===id)chats[ci].unread=0;
@@ -3572,10 +3639,11 @@ async function saveDdiNo(){
       // now — no extra click anywhere. Their lines leave the working panel (hand-added rows
       // belonged to this order too); anything extracted after Copy stays untouched.
       var saved=lastCopied.slice();
-      saved.forEach(function(m){orderNos[m]=no;delete active[m];});
+      saved.forEach(function(m){orderNos[m]=no;delete active[m];if(d.emoji)pendingReacts[m]=d.emoji;});
       items=items.filter(function(it){return it.mid&&saved.indexOf(it.mid)<0;});
       lastCopied=[];
       rebuildSources();renderRight();applyStates();
+      lastSig="";refreshThread();
       toast("DDI order #"+no+" saved — order complete");
     }
     else toast(d.error||"Could not save",true);

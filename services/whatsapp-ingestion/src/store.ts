@@ -318,7 +318,22 @@ const upsertAccountChat = db.prepare(
 );
 export function recordAccountChats(account: string, chatIds: string[]): void {
   const now = Date.now();
-  for (const id of chatIds) if (id) upsertAccountChat.run(account, id, now);
+  // Only real conversations: groups, phone contacts, lid contacts. Newsletters/channels and
+  // status broadcasts also live in WhatsApp Web's chat store and must never become "chats" here
+  // (a personal account surfaced "Aaj Tak" as a customer chat).
+  for (const id of chatIds) if (id && /@(g\.us|c\.us|lid)$/.test(id)) upsertAccountChat.run(account, id, now);
+}
+const hasMsgStmt = db.prepare(
+  "SELECT 1 FROM messages WHERE chat_id = ? AND (COALESCE(body, '') <> '' OR kind IN " +
+    "('image','video','audio','voice','document','sticker','ptv')) LIMIT 1",
+);
+/**
+ * Does this chat contain anything a human would call a conversation? Call logs, "security code
+ * changed" and other protocol rows do NOT count — a third of a personal account's synced chats
+ * contained nothing else, and they showed up as raw-number ghosts in the list.
+ */
+export function hasMessagesFor(chatId: string): boolean {
+  return hasMsgStmt.get(chatId) !== undefined;
 }
 const accountChatsStmt = db.prepare('SELECT chat_id FROM account_chats WHERE account = ?');
 export function chatsOfAccount(account: string): Set<string> {
@@ -811,14 +826,17 @@ export function listChats(): ChatRow[] {
   for (const c of cat) {
     // A @lid catalog chat and its @c.us captured twin are the same conversation — fold together.
     const hit = byId.get(c.chat_id) ?? (c.alt_id ? byId.get(c.alt_id) : undefined);
+    // A nameless 1:1 shows the PHONE NUMBER when we know it — "+15551234567" beats the raw
+    // internal @lid digits that read like garbage in the list.
+    const phone = c.alt_id && /@c\.us$/.test(c.alt_id) ? `+${c.alt_id.split('@')[0]}` : '';
     if (hit) {
-      if (!hit.title && c.name) hit.title = c.name;
+      if (!hit.title && (c.name || phone)) hit.title = c.name || phone;
       hit.unread = c.unread;
       if (c.last_ts > hit.lastTs) hit.lastTs = c.last_ts;
     } else {
       byId.set(c.chat_id, {
         id: c.chat_id,
-        title: getChatName(c.chat_id) || c.name || tail(c.chat_id),
+        title: getChatName(c.chat_id) || c.name || phone || tail(c.chat_id),
         lastText: '',
         lastTs: c.last_ts,
         count: 0,
