@@ -621,7 +621,10 @@ export interface CatalogChat {
 /** Refresh the full-chat catalog (from WhatsApp Web's IndexedDB). */
 export function upsertCatalog(rows: CatalogChat[]): void {
   for (const r of rows) {
-    if (!r.id) continue;
+    // Same real-conversation shapes as membership: newsletters/channels and status broadcasts
+    // must not even enter the catalog — a one-time purge kept resurrecting because every catalog
+    // sync re-upserted them.
+    if (!r.id || !/@(g\.us|c\.us|lid)$/.test(r.id)) continue;
     upsertCatalogStmt.run(r.id, r.name || null, r.isGroup ? 1 : 0, r.lastTs, r.unread, r.altId);
   }
 }
