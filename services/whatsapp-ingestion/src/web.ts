@@ -1297,6 +1297,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { error: 'bad chat id' });
       return;
     }
+    // Same account gate as the thread itself: this returns real people's names, so a chat the
+    // caller's WhatsApp account cannot see must not answer here either. (Found by audit: the
+    // messages endpoint was guarded, this sibling was not.)
+    if (!chatsOfAccount(accountFor(me)).has(pid)) {
+      json(res, 403, { error: 'This chat is not on your WhatsApp account.' });
+      return;
+    }
     json(res, 200, { participants: chatParticipants(pid) });
     return;
   }
