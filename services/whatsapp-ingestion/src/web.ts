@@ -196,8 +196,7 @@ function accountFor(me: User): string {
   return me.waMode === 'personal' ? `u${me.id}` : 'common';
 }
 /**
- * JSON for embedding inside a <script>
-window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();}); block. JSON.stringify alone does not escape `</script>`,
+ * JSON for embedding inside a <script> block. JSON.stringify alone does not escape `</script>`,
  * so a display name containing it would close the tag early; also escapes U+2028/U+2029, which
  * are literal line terminators in JS but legal inside a JSON string.
  */
@@ -311,8 +310,7 @@ const NAV_CSS = `
   .navlink.cur{background:#e7f8f2;color:#059669}
 `;
 /**
- * Boot-time self-check: render each page and parse its inline <script>
-window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();}); blocks. Catches the
+ * Boot-time self-check: render each page and parse its inline <script> blocks. Catches the
  * template-literal escaping trap (\s / \d / \n eaten before the browser sees them), which
  * otherwise ships a page whose JavaScript never runs.
  */
@@ -1080,7 +1078,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (path === '/api/orders') {
-    json(res, 200, { status, ts: Math.floor(Date.now() / 1000), orders: ordersProvider() });
+    // Account-scoped like everything else: order cards carry chat ids, message ids, sender names
+    // and message text, so a personal user must not receive the business account's cards (or the
+    // reverse). No role check is enough here — the scope is the account, not the role.
+    const visibleOrders = chatsOfAccount(accountFor(me));
+    json(res, 200, {
+      status: waStateFor(me).status,
+      ts: Math.floor(Date.now() / 1000),
+      orders: ordersProvider().filter((o) => visibleOrders.has(o.groupId)),
+    });
     return;
   }
   if (path === '/api/products/search') {
@@ -1108,6 +1114,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         : typeof body['messageId'] === 'string'
           ? [body['messageId'] as string]
           : [];
+      // OWNERSHIP FIRST. This block writes locks, so it must never run for messages the caller
+      // cannot see: otherwise anyone could freeze another account's whole order workflow (and the
+      // 409 would leak the holder's username to them).
+      if (midsWanted.length && !midsWanted.every((m) => canSeeMessage(me, m))) {
+        json(res, 403, { ok: false, error: 'Those messages are not on your WhatsApp account.' });
+        return;
+      }
       claimsSweep();
       for (const m of midsWanted) {
         const c = extractClaims.get(m);
@@ -1147,7 +1160,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // Work cap: matching is CPU-bound on one thread, so an unbounded batch (a whole chat's
     // history) froze the server for everyone. 40 messages is far above any real order.
-    if (sources.length > 40) sources = sources.slice(-40);
+    if (sources.length > 40) {
+      sources = sources.slice(-40);
+      if (newCount > 40) newCount = 40; // report what was actually extracted, not what was found
+    }
     // Per-source extraction: line numbers must mean "line N of THAT message", so a 3-message order
     // cannot run its numbering across message boundaries. Material headers also stay scoped to the
     // message that declared them.
@@ -1161,13 +1177,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const body = await readBody(req);
     const cid = typeof body['chatId'] === 'string' ? (body['chatId'] as string) : '';
     const srcs = Array.isArray(body['sources']) ? (body['sources'] as Array<{ messageId?: string; text?: string }>) : [];
-    if (cid && !canSeeChat(me, cid)) {
+    // Unconditional: an omitted chatId used to skip this entirely. Both the chat AND every
+    // source message must belong to the caller's account before anything is written.
+    if (!canSeeChat(me, cid)) {
       json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
       return;
     }
     const itemsJson = JSON.stringify(body['items'] ?? []);
     let saved = 0;
     const who = me.name || me.username; // attribute the completed order to whoever clicked Copy
+    if (!srcs.every((s) => !s || typeof s.messageId !== 'string' || !s.messageId || canSeeMessage(me, s.messageId))) {
+      json(res, 403, { ok: false, error: 'Those messages are not on your WhatsApp account.' });
+      return;
+    }
     for (const s of srcs) {
       if (s && typeof s.messageId === 'string' && s.messageId) {
         saveExtraction(s.messageId, cid, typeof s.text === 'string' ? s.text : '', itemsJson, who);
@@ -1185,7 +1207,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const code = typeof body['code'] === 'string' ? (body['code'] as string) : '';
     const desc = typeof body['description'] === 'string' ? (body['description'] as string) : '';
     if (phrase && code) {
-      addAlias(normalize(phrase), code, desc, phrase.trim());
+      addAlias(normalize(phrase), code, desc, phrase.trim(), accountFor(me));
       logActivity(me.username, 'teach-alias', `"${phrase.trim().slice(0, 80)}" -> ${code}`, clientIp(req));
     }
     json(res, 200, { ok: true, aliases: aliasCount() });
@@ -1407,6 +1429,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { ok: false, error: 'Pick a chat first.' });
       return;
     }
+    // The most dangerous gap of all: without this, a signed-in user could make ANY linked WhatsApp
+    // account message any JID they could name — a real outbound message to a stranger.
+    if (!canSeeChat(me, chatId)) {
+      json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
+      return;
+    }
     const trimmed = text.trim();
     if (!trimmed) {
       json(res, 400, { ok: false, error: 'Message is empty.' });
@@ -1471,6 +1499,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const caption = typeof body['caption'] === 'string' ? (body['caption'] as string).trim() : '';
     if (!chatId || !/@(g\.us|c\.us|lid)$/.test(chatId)) {
       json(res, 400, { ok: false, error: 'Pick a chat first.' });
+      return;
+    }
+    // Same gate as /api/send. This one was missed once already and a probe put a real file into a
+    // real customer group — an ungated outbound path is the worst kind of gap in this app.
+    if (!canSeeChat(me, chatId)) {
+      json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
       return;
     }
     if (!data || !mimetype) {
@@ -1635,6 +1669,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string').slice(0, 100)
       : [];
     for (const m of ids) {
+      if (!canSeeMessage(me, m)) continue; // never let a heartbeat plant a lock on another account
       const c = extractClaims.get(m);
       if (!c || c.username === me.username) extractClaims.set(m, { username: me.username, at: Date.now() });
     }

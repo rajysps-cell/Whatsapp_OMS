@@ -115,6 +115,7 @@ for (const [table, col] of [
   // Star/pin state as this app last set it. Deliberately OUR record, not a live mirror of
   // WhatsApp: stars applied on a phone do not sync back, and that is fine — this drives the UI
   // badges for actions taken here. pinned holds the pin timestamp (0 = not pinned).
+  ['aliases', "account TEXT NOT NULL DEFAULT ''"],
   ['messages', 'starred INTEGER NOT NULL DEFAULT 0'],
   ['messages', 'pinned INTEGER NOT NULL DEFAULT 0'],
 ] as const) {
@@ -126,7 +127,7 @@ for (const [table, col] of [
 }
 
 const insAlias = db.prepare(
-  'INSERT OR IGNORE INTO aliases (phrase_norm, product_code, product_desc, created_at, alias_text) VALUES (?, ?, ?, ?, ?)',
+  'INSERT OR IGNORE INTO aliases (phrase_norm, product_code, product_desc, created_at, alias_text, account) VALUES (?, ?, ?, ?, ?, ?)',
 );
 const getAliasStmt = db.prepare('SELECT product_code, product_desc FROM aliases WHERE phrase_norm = ?');
 const countAliasStmt = db.prepare('SELECT COUNT(*) AS n FROM aliases');
@@ -289,9 +290,12 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000, accoun
   if (toTs > 0) { aConds.push('created_at <= ?'); aArgs.push(toTs); }
   const aWhere = aConds.length ? ' WHERE ' + aConds.join(' AND ') : '';
   const learned = db
-    .prepare(`SELECT phrase_norm, alias_text, product_code, product_desc, created_at FROM aliases${aWhere}`)
-    .all(...aArgs) as Array<{ phrase_norm: string; alias_text: string | null; product_code: string; product_desc: string; created_at: number }>;
+    .prepare(`SELECT phrase_norm, alias_text, product_code, product_desc, created_at, account FROM aliases${aWhere}`)
+    .all(...aArgs) as Array<{ phrase_norm: string; alias_text: string | null; product_code: string; product_desc: string; created_at: number; account: string | null }>;
   for (const a of learned) {
+    // A taught phrase is the CUSTOMER's own wording, so it only goes back to its own account.
+    // '' = legacy rows, all taught on the business account before personal mode existed.
+    if (account && (a.account || 'common') !== account) continue;
     const phrase = a.alias_text || a.phrase_norm;
     if (seen.has(`${a.product_code}|${phrase.toLowerCase().trim()}`)) continue;
     if (!matches(a.product_code, a.product_desc, phrase)) continue;
@@ -534,9 +538,9 @@ export interface AliasHit {
 
 /** Save a learned mapping (customer text -> product). Dedup on the normalized phrase.
  *  `text` is the original display alias (falls back to the normalized phrase). */
-export function addAlias(phraseNorm: string, code: string, desc: string, text?: string): void {
+export function addAlias(phraseNorm: string, code: string, desc: string, text?: string, account = ''): void {
   if (!phraseNorm || !code) return;
-  insAlias.run(phraseNorm, code, desc, Date.now(), (text ?? phraseNorm) || null);
+  insAlias.run(phraseNorm, code, desc, Date.now(), (text ?? phraseNorm) || null, account);
 }
 export function getAlias(phraseNorm: string): AliasHit | null {
   const r = getAliasStmt.get(phraseNorm) as { product_code: string; product_desc: string } | undefined;
