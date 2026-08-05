@@ -148,6 +148,23 @@ function validEmoji(s: string): boolean {
   return /^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|‍|️|⃣)+$/u.test(s);
 }
 
+/**
+ * The emoji catalog (emoji + search keywords) shared by the composer picker, the reaction
+ * picker and the admin save-emoji popup — ONE source so the sets can never drift apart.
+ */
+const EMO_CATALOG: Array<[string, string]> = [
+["😀","grinning happy smile"],["😁","beaming grin teeth"],["😂","joy laugh tears funny lol"],["🤣","rofl rolling laugh"],["😊","smile blush happy"],["😍","heart eyes love"],["🥰","love hearts adore"],["😘","kiss love"],["😉","wink"],["😎","cool sunglasses"],["🤩","star struck wow"],["🤔","thinking hmm"],["🙄","eye roll"],["😅","sweat relief phew"],["😬","grimace awkward"],["😭","crying sob sad"],["😢","cry sad tear"],["😡","angry mad red"],["😤","frustrated steam"],["🥳","party celebrate birthday"],["🤯","mind blown"],["😴","sleep tired zzz"],["🤒","sick fever ill"],["🤗","hug"],["😇","angel innocent"],["🫤","meh unsure"],["😐","neutral blank"],["🙂","slight smile ok"],
+["🤝","handshake deal agree"],["👍","thumbs up ok yes like good"],["👎","thumbs down no bad"],["👌","ok perfect"],["🙏","thanks pray please folded hands"],["💪","strong muscle power"],["🙌","raised hands praise celebrate"],["👏","clap applause"],["✌️","peace victory"],["🤞","fingers crossed luck"],["👊","fist bump punch"],["🫡","salute yes sir"],["👋","wave hello bye hi"],["🤙","call me shaka"],["👉","point right"],["👈","point left"],["☝️","point up one"],["✋","stop hand high five"],
+["❤️","red heart love"],["🧡","orange heart"],["💚","green heart"],["💙","blue heart"],["💛","yellow heart"],["🖤","black heart"],["💯","hundred 100 percent perfect"],["💔","broken heart"],
+["🔥","fire hot lit flame"],["⭐","star"],["✨","sparkles shine new"],["⚡","lightning fast bolt"],["💥","boom explosion"],["🎉","party popper congrats celebrate"],["🎊","confetti celebrate"],["🎯","target bullseye goal"],["🏆","trophy winner champion"],["🥇","gold medal first"],
+["✅","check done yes complete green tick"],["☑️","checkbox done tick"],["✔️","check mark tick done"],["❌","cross no wrong x cancel"],["⚠️","warning caution alert"],["❓","question mark"],["❗","exclamation important"],["🚫","prohibited no ban stop"],["♻️","recycle"],["🆗","ok button"],["🆕","new"],["🔴","red circle"],["🟢","green circle go"],["🟡","yellow circle wait"],
+["📦","package box parcel order"],["🚚","truck delivery shipping"],["🚛","lorry truck shipping"],["🛻","pickup truck"],["🚗","car"],["🏃","running hurry rush"],["⏳","hourglass waiting time"],["⏰","alarm clock time"],["🕐","clock one time"],["📅","calendar date"],["📍","pin location place"],["🗺️","map directions"],["🏠","house home"],["🏢","building office"],["🏗️","construction crane site"],["🚧","construction barrier work"],
+["📞","phone call telephone"],["📱","mobile phone cell"],["💬","speech chat message"],["📧","email envelope mail"],["📋","clipboard list"],["📝","memo note write"],["📄","document page paper"],["🧾","receipt invoice bill"],["💰","money bag cash"],["💵","dollar money cash"],["💳","credit card payment"],["🛒","cart shopping buy"],["🏷️","tag label price"],["⚖️","scale balance weigh"],["📏","ruler measure"],["📐","triangle ruler measure"],
+["🔧","wrench tool fix plumbing"],["🔨","hammer tool"],["🛠️","hammer wrench tools repair"],["🔩","nut bolt screw"],["🪛","screwdriver tool"],["⚙️","gear settings cog"],["🧰","toolbox tools kit"],["🪠","plunger plumbing drain"],["🚿","shower plumbing"],["🛁","bathtub bath tub"],["🚽","toilet plumbing wc"],["🔗","link chain"],["🧲","magnet"],["🪜","ladder"],["🧯","fire extinguisher safety"],["💧","water drop leak"],["🌊","water wave flood"],["🧊","ice cold frozen"],["🌡️","thermometer temperature heat"],["☀️","sun sunny hot"],["🌧️","rain weather"],["❄️","snow cold winter freeze"],
+["☕","coffee break"],["🍕","pizza food lunch"],["🍔","burger food"],["🥤","drink cup soda"],["🎂","cake birthday"],["🍀","clover luck lucky"],["🌹","rose flower"],["🎁","gift present"],["👀","eyes looking watch see"],["🧠","brain smart think"],["🫶","heart hands love thanks"],["🤲","open palms give"],["💤","zzz sleep"],["🐢","turtle slow"],["🐇","rabbit fast quick"],["🦺","safety vest work"],["⛑️","helmet safety rescue"],["👷","construction worker builder"],["🧑‍🔧","mechanic plumber technician"]
+,
+["😃","big smile happy"],["😄","smile eyes happy"],["😆","laughing squint xd"],["🙃","upside down silly"],["😋","yummy tasty tongue"],["😛","tongue out playful"],["🤪","zany crazy wild"],["🧐","monocle inspect"],["🤓","nerd glasses"],["🥸","disguise glasses moustache"],["😏","smirk sly"],["😒","unamused annoyed"],["😞","disappointed sad"],["😔","pensive sad"],["😟","worried concerned"],["😕","confused unsure"],["🙁","frown slightly sad"],["☹️","frowning sad"],["😣","persevering struggling"],["😖","confounded frustrated"],["😫","tired exhausted"],["🥱","yawn bored sleepy"],["😩","weary tired"],["🥺","pleading puppy eyes please"],["😨","fearful scared"],["😰","anxious sweat nervous"],["😱","scream shocked horror"],["😳","flushed embarrassed blush"],["🤭","giggle hand over mouth oops"],["🤫","shush quiet secret"],["🤥","lying pinocchio"],["😶","no mouth speechless"],["😬","grimacing awkward"],["🙄","rolling eyes whatever"],["😪","sleepy tear"],["🤤","drooling"],["😷","mask sick"],["🤧","sneezing tissue"],["🥵","hot sweating heat"],["🥶","cold freezing blue"],["😵","dizzy knocked out"],["🤠","cowboy hat yeehaw"],["😈","devil smiling horns"],["👻","ghost boo"],["💀","skull dead"],["👽","alien ufo"],["🤖","robot bot"],["💩","poop"],["🙈","see no evil monkey"],["🙉","hear no evil monkey"],["🙊","speak no evil monkey"],["🐶","dog puppy"],["🐱","cat kitten"],["🦁","lion"],["🐯","tiger"],["🐮","cow"],["🐷","pig"],["🐸","frog"],["🐵","monkey"],["🐔","chicken"],["🦅","eagle bird"],["🦉","owl"],["🐺","wolf"],["🐴","horse"],["🦄","unicorn"],["🐝","bee"],["🦋","butterfly"],["🐢","turtle slow"],["🐍","snake"],["🐘","elephant"],["🐬","dolphin"],["🐳","whale"],["🦈","shark"],["🌹","rose flower love"],["🌻","sunflower"],["🌸","blossom flower pink"],["🌈","rainbow"],["🌙","moon night"],["💎","diamond gem"],["🎈","balloon party"],["🎁","gift present"],["🏠","house home"],["🚀","rocket launch fast"],["✈️","airplane travel"],["🚢","ship boat"],["🍎","apple fruit"],["🍌","banana"],["🍇","grapes"],["🍉","watermelon"],["🍩","donut"],["🍦","icecream"],["🍺","beer cheers"],["🥂","cheers champagne toast"],["⚽","soccer football"],["🏀","basketball"],["🏏","cricket bat"],["🎮","game controller"],["🎵","music note"],["🎤","microphone sing"],["📷","camera photo"],["💡","bulb idea light"],["🔔","bell notification"],["📢","announce loudspeaker"],["🙋","raising hand me"],["💃","dancing woman"],["🕺","dancing man"],["👑","crown king queen"],["💍","ring engagement"],["🧿","evil eye nazar"],["🕉️","om hindu"],["🙏🏻","thanks pray light"],["👍🏻","thumbs up light"],["👍🏽","thumbs up medium"]];
+
 /** Fallback save-emojis for users the admin gave none — distinct per user id, stable. */
 const EMOJI_POOL = ['✅', '👍', '🆗', '⭐', '✔️', '🟢', '💚', '🔵', '🟣', '🟠'] as const;
 const extractClaims = new Map<string, { username: string; at: number }>();
@@ -519,7 +536,9 @@ async function handleAdmin(
   // to go to the server"). State shows the shared account's connection + its QR when one is
   // pending; Unlink logs the device out so a NEW number can scan the fresh QR right there.
   if (path === '/api/settings/wa-state') {
-    json(res, 200, { status, qr: qrDataUrl });
+    // Never hand out a QR while connected: after a successful re-scan the old QR image must
+    // vanish from the Settings page, not linger next to a linked account.
+    json(res, 200, { status, qr: status === 'connected' ? null : qrDataUrl });
     return true;
   }
   if (path === '/api/settings/wa-unlink' && req.method === 'POST') {
@@ -2007,6 +2026,18 @@ function adminPage(me: User): string {
     color:#fff;padding:10px 18px;border-radius:9px;font-size:13px;opacity:0;transition:all .25s;z-index:30}
   .toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast.err{background:var(--red)}
+  .emopop{position:fixed;inset:0;z-index:70;display:none;align-items:center;justify-content:center;background:#0008}
+  .emopop.on{display:flex}
+  .emocard{background:#fff;border-radius:14px;width:min(480px,92vw);max-height:70vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 10px 40px #0005}
+  .emohead{display:flex;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .emohead input{flex:1;padding:8px 12px;font-size:13.5px;border:1px solid var(--line);border-radius:8px;outline:none}
+  .emohead input:focus{border-color:var(--em2)}
+  .emohead button{border:0;background:none;font-size:14px;cursor:pointer;color:var(--mut);width:32px}
+  .emonone{margin:8px 14px 0;padding:7px;border:1px dashed var(--line);border-radius:8px;background:none;color:var(--mut);font-size:12.5px;cursor:pointer}
+  .emonone:hover{border-color:var(--em2);color:var(--em2)}
+  #emogrid{display:grid;grid-template-columns:repeat(10,1fr);gap:2px;padding:10px 14px;overflow-y:auto}
+  #emogrid button{font-size:21px;background:none;border:0;cursor:pointer;padding:6px 0;border-radius:7px;line-height:1.2}
+  #emogrid button:hover{background:#f0f2f5}
 </style></head><body>
 <header><h1>User Management</h1><span class="who">signed in as <b>${esc(me.username)}</b></span>
   <div class="spacer"></div>
@@ -2036,18 +2067,27 @@ function adminPage(me: User): string {
       <div id="wrapActive"><label for="fActive">Status</label><select id="fActive"><option value="1">Active</option><option value="0">Disabled</option></select></div>
     </div>
     <label for="fWa">WhatsApp</label><select id="fWa"><option value="common">Common — the shared business WhatsApp</option><option value="personal">Personal — they link their OWN WhatsApp (QR at sign-in)</option></select>
-    <label for="fEmoji">Save-emoji <span style="font-weight:400">(reacted onto the customer's message when this user saves an order; empty = automatic)</span></label>
-    <input id="fEmoji" autocomplete="off" maxlength="8" placeholder="e.g. ✅" style="width:90px">
-    <div class="epal" id="epal"></div>
+    <label>Save-emoji <span style="font-weight:400">(reacted onto the customer's message when this user saves an order)</span></label>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button type="button" id="fEmojiBtn" title="Choose an emoji" style="font-size:22px;width:44px;height:40px;border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer">&#128512;</button>
+      <span class="muted" id="fEmojiHint" style="font-size:12px">automatic</span>
+      <input type="hidden" id="fEmoji">
+    </div>
     <label for="fPass" id="lPass">Password</label><input id="fPass" type="password" autocomplete="new-password" placeholder="at least 8 characters">
   </div>
   <div class="err" id="mErr"></div>
   <div class="sheetacts"><button class="btn ghost" id="mCancel">Cancel</button><button class="btn" id="mSave">Save</button></div>
 </div></div>
+<div class="emopop" id="emopop"><div class="emocard"><div class="emohead"><input id="emosearch" placeholder="search emoji… (fire, thanks, truck)" autocomplete="off"><button type="button" id="emoclose">&#10005;</button></div><button type="button" class="emonone" id="emonone">No emoji — automatic</button><div id="emogrid"></div></div></div>
 <div class="toast" id="toast"></div>
 <script>
-var EMOJI_CHOICES=["✅","👍","🆗","⭐","✔️","🟢","💚","🔵","🟣","🟠","🔥","💪","🙏","🎯","📦","🚚","⚡","🌟","🫡","🤝","💯","🏆"];
-function renderEpal(){var p=document.getElementById("epal");if(!p||p.childNodes.length)return;p.innerHTML=EMOJI_CHOICES.map(function(e2){return '<button type="button" class="epbtn" data-e="'+e2+'">'+e2+'</button>';}).join("");p.addEventListener("click",function(ev){var b=ev.target.closest(".epbtn");if(b){document.getElementById("fEmoji").value=b.dataset.e;}});}
+var EMOJIS=${JSON.stringify(EMO_CATALOG)};
+function setEmoji(v){el("fEmoji").value=v||"";el("fEmojiBtn").textContent=v||String.fromCodePoint(0x1F600);el("fEmojiHint").textContent=v?"":"automatic";}
+function emoGrid(q){
+  q=String(q||"").toLowerCase().trim();
+  var list=q?EMOJIS.filter(function(p2){if(p2[0]===q)return true;var w=p2[1].split(" ");for(var i=0;i<w.length;i++)if(w[i].indexOf(q)===0)return true;return false;}):EMOJIS;
+  el("emogrid").innerHTML=list.length?list.map(function(p2){return '<button type="button" data-emo="'+p2[0]+'" title="'+esc(p2[1])+'">'+p2[0]+'</button>';}).join(""):'<div class="muted" style="grid-column:1/-1;padding:8px">No emoji found.</div>';
+}
 var users=[],meId=${me.id},editId=null;
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
@@ -2077,12 +2117,12 @@ function render(){
 }
 function openAdd(){editId=null;el("mTitle").textContent="Add user";el("mSub").textContent="They will set their own password at first sign-in.";
   el("wrapUser").style.display="";el("wrapActive").style.display="none";el("lPass").textContent="Temporary password";
-  renderEpal();el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";el("fEmoji").value="";el("fPass").value="";el("fPass").placeholder="at least 8 characters";
+  el("fUser").value="";el("fName").value="";el("fEmail").value="";el("fRole").value="user";el("fWa").value="common";setEmoji("");el("fPass").value="";el("fPass").placeholder="at least 8 characters";
   el("mErr").className="err";el("modal").className="modal on";el("fUser").focus();}
 function openEdit(id){var u=users.filter(function(x){return x.id===id;})[0];if(!u)return;editId=id;
   el("mTitle").textContent="Edit "+u.username;el("mSub").textContent="Leave the password blank to keep it unchanged.";
   el("wrapUser").style.display="none";el("wrapActive").style.display="";el("lPass").textContent="New password (optional)";
-  renderEpal();el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";el("fEmoji").value=u.emoji||"";el("fActive").value=u.active?"1":"0";
+  el("fName").value=u.name||"";el("fEmail").value=u.email||"";el("fRole").value=u.role;el("fWa").value=u.waMode||"common";setEmoji(u.emoji||"");el("fActive").value=u.active?"1":"0";
   el("fPass").value="";el("fPass").placeholder="leave blank to keep current";
   el("mErr").className="err";el("modal").className="modal on";el("fName").focus();}
 function closeModal(){el("modal").className="modal";}
@@ -2118,6 +2158,13 @@ el("tb").addEventListener("click",function(e){
   var rs=e.target.closest("[data-reset]");if(rs){resetDevices(+rs.dataset.reset);return;}
   var dl=e.target.closest("[data-del]");if(dl&&!dl.disabled){del(+dl.dataset.del);return;}});
 el("mFields").addEventListener("keydown",function(e){if(e.key==="Enter")save();});
+// Save-emoji popup: the full searchable catalog; picking one sets it for the user being edited.
+el("fEmojiBtn").addEventListener("click",function(){el("emosearch").value="";emoGrid("");el("emopop").className="emopop on";el("emosearch").focus();});
+el("emoclose").addEventListener("click",function(){el("emopop").className="emopop";});
+el("emopop").addEventListener("click",function(e){if(e.target===el("emopop"))el("emopop").className="emopop";});
+el("emosearch").addEventListener("input",function(){emoGrid(this.value);});
+el("emonone").addEventListener("click",function(){setEmoji("");el("emopop").className="emopop";});
+el("emogrid").addEventListener("click",function(e){var b=e.target.closest("[data-emo]");if(b){setEmoji(b.dataset.emo);el("emopop").className="emopop";}});
 load();
 </script></body></html>`;
 }
@@ -2261,9 +2308,11 @@ el("save").addEventListener("click",async function(){
 async function waTick(){
   try{
     var d=await(await fetch("/api/settings/wa-state")).json();
-    el("waStatus").textContent=d.status||"unknown";
+    var st=el("waStatus");
+    if(d.status==="connected"){st.innerHTML='<span style="color:#059669">&#9989; WhatsApp linked and working</span>';}
+    else st.textContent=d.status||"unknown";
     var box=el("waQrBox");
-    if(d.qr){el("waQr").src=d.qr;box.style.display="";}else box.style.display="none";
+    if(d.qr&&d.status!=="connected"){el("waQr").src=d.qr;box.style.display="";}else box.style.display="none";
   }catch(e){}
   setTimeout(waTick,3000);
 }
@@ -3843,6 +3892,10 @@ async function sendVoice(blob){
 el("micbtn").addEventListener("click",function(){if(el("recbar").classList.contains("on"))recStop(true);else recStart();});
 el("reccancel").addEventListener("click",function(){recStop(false);});
 el("recsend").addEventListener("click",function(){recStop(true);});
+
+// --- emoji picker: searchable, most-used first, shared by the composer AND reactions ---
+// Each entry: [emoji, search keywords]. Keywords are what the search box matches against.
+var EMO=${JSON.stringify(EMO_CATALOG)};stener("click",function(){recStop(true);});
 
 // --- emoji picker: searchable, most-used first, shared by the composer AND reactions ---
 // Each entry: [emoji, search keywords]. Keywords are what the search box matches against.
