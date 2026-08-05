@@ -290,6 +290,10 @@ export function deleteUser(id: number): void {
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
   db.prepare('DELETE FROM pending_logins WHERE user_id = ?').run(id);
   db.prepare('DELETE FROM trusted_devices WHERE user_id = ?').run(id);
+  // Per-user leftovers: read markers and (for a personal account) its chat membership. Without
+  // this a deleted user's rows linger forever and a recycled id would inherit them.
+  db.prepare('DELETE FROM chat_reads WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM account_chats WHERE account = ?').run(`u${id}`);
   delUserStmt.run(id);
   logger.info({ id }, 'user deleted');
 }

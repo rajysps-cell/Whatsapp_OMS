@@ -196,6 +196,32 @@ function accountFor(me: User): string {
   return me.waMode === 'personal' ? `u${me.id}` : 'common';
 }
 /**
+ * JSON for embedding inside a <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();}); block. JSON.stringify alone does not escape `</script>`,
+ * so a display name containing it would close the tag early; also escapes U+2028/U+2029, which
+ * are literal line terminators in JS but legal inside a JSON string.
+ */
+function jsIn(v: unknown): string {
+  return JSON.stringify(v)
+    .replace(/</g, "\\u003c")
+    .replace(new RegExp(String.fromCharCode(0x2028), "g"), "\\u2028")
+    .replace(new RegExp(String.fromCharCode(0x2029), "g"), "\\u2029");
+}
+
+/**
+ * THE account gate. Every endpoint that takes a chatId or a messageId must pass through one of
+ * these two — an audit found the guard on only 3 of a dozen such endpoints, which let a common
+ * user dump a personal user's private chats through /api/extract and stream their media.
+ */
+function canSeeChat(me: User, chatId: string): boolean {
+  return !!chatId && chatsOfAccount(accountFor(me)).has(chatId);
+}
+/** Same gate, resolved from a message id (unknown message = refuse). */
+function canSeeMessage(me: User, messageId: string): boolean {
+  const m = messageId ? getMessage(messageId) : null;
+  return !!m && canSeeChat(me, m.chatId);
+}
+/**
  * Resolve the client an action must go through. Personal users MUST act through their own linked
  * WhatsApp — never silently fall back to the business account.
  */
@@ -285,7 +311,8 @@ const NAV_CSS = `
   .navlink.cur{background:#e7f8f2;color:#059669}
 `;
 /**
- * Boot-time self-check: render each page and parse its inline <script> blocks. Catches the
+ * Boot-time self-check: render each page and parse its inline <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();}); blocks. Catches the
  * template-literal escaping trap (\s / \d / \n eaten before the browser sees them), which
  * otherwise ships a page whose JavaScript never runs.
  */
@@ -1095,6 +1122,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     let newCount = -1;
     if (!text && typeof body['chatId'] === 'string' && chatStoreRef) {
       const cid = body['chatId'] as string;
+      // Account gate: without this, pasting a chat id returned every message body of a chat the
+      // caller cannot even open (audit finding, critical).
+      if (!canSeeChat(me, cid)) {
+        json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
+        return;
+      }
       const mid = typeof body['messageId'] === 'string' ? (body['messageId'] as string) : '';
       const mids = Array.isArray(body['messageIds'])
         ? (body['messageIds'] as unknown[]).filter((x): x is string => typeof x === 'string')
@@ -1112,6 +1145,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       text = sources.map((s) => s.text).join('\n');
       if (!mids.length) newCount = pick.length;
     }
+    // Work cap: matching is CPU-bound on one thread, so an unbounded batch (a whole chat's
+    // history) froze the server for everyone. 40 messages is far above any real order.
+    if (sources.length > 40) sources = sources.slice(-40);
     // Per-source extraction: line numbers must mean "line N of THAT message", so a 3-message order
     // cannot run its numbering across message boundaries. Material headers also stay scoped to the
     // message that declared them.
@@ -1125,6 +1161,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const body = await readBody(req);
     const cid = typeof body['chatId'] === 'string' ? (body['chatId'] as string) : '';
     const srcs = Array.isArray(body['sources']) ? (body['sources'] as Array<{ messageId?: string; text?: string }>) : [];
+    if (cid && !canSeeChat(me, cid)) {
+      json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
+      return;
+    }
     const itemsJson = JSON.stringify(body['items'] ?? []);
     let saved = 0;
     const who = me.name || me.username; // attribute the completed order to whoever clicked Copy
@@ -1155,6 +1195,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const body = await readBody(req);
     const cid = typeof body['chatId'] === 'string' ? (body['chatId'] as string) : '';
     const name = typeof body['name'] === 'string' ? (body['name'] as string).trim() : '';
+    if (cid && !canSeeChat(me, cid)) {
+      json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
+      return;
+    }
     if (cid && name) {
       setChatName(cid, name);
       logActivity(me.username, 'rename-chat', `${cid} -> "${name.slice(0, 60)}"`, clientIp(req));
@@ -1226,6 +1270,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = safeDecode(mm2[1] ?? '');
     if (!id) {
       json(res, 400, { error: 'missing id' });
+      return;
+    }
+    // Account gate before a single byte is served: cached media was streamable by id alone.
+    if (!canSeeMessage(me, id)) {
+      json(res, 403, { error: 'This media is not on your WhatsApp account.' });
       return;
     }
     const safe = mediaCacheKey(id);
@@ -1483,6 +1532,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 404, { ok: false, error: 'Message not found.' });
       return;
     }
+    if (!canSeeChat(me, msg.chatId)) {
+      json(res, 403, { ok: false, error: 'That message is not on your WhatsApp account.' });
+      return;
+    }
     const owner = sentByOf(messageId);
     if (!owner || owner.toLowerCase() !== me.username.toLowerCase()) {
       json(res, 403, { ok: false, error: 'You can only delete messages you sent from this app.' });
@@ -1529,6 +1582,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 404, { ok: false, error: 'Message not found.' });
       return;
     }
+    if (!canSeeMessage(me, messageId)) {
+      json(res, 403, { ok: false, error: 'That message is not on your WhatsApp account.' });
+      return;
+    }
     const r = await fn(messageId, on, vsp.via);
     if (!r.ok) {
       json(res, 500, { ok: false, error: r.reason ?? 'WhatsApp refused.' });
@@ -1554,6 +1611,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const emoji = typeof body['emoji'] === 'string' ? (body['emoji'] as string).slice(0, 8) : '';
     if (!messageId || !getMessage(messageId)) {
       json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    if (!canSeeMessage(me, messageId)) {
+      json(res, 403, { ok: false, error: 'That message is not on your WhatsApp account.' });
       return;
     }
     const r = await reactFn(messageId, emoji, vre.via);
@@ -1632,6 +1693,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 400, { ok: false, error: 'No processed messages given.' });
       return;
     }
+    if (!ids.every((m) => canSeeMessage(me, m))) {
+      json(res, 403, { ok: false, error: 'Those messages are not on your WhatsApp account.' });
+      return;
+    }
     const n = setOrderNo(ids, orderNo);
     logger.info({ user: me.username, orderNo, messages: n }, 'DDI order number saved');
     logActivity(me.username, 'ddi-number', `#${orderNo} on ${n} message(s)`, clientIp(req));
@@ -1672,6 +1737,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const msg = messageId ? getMessage(messageId) : null;
     if (!msg) {
       json(res, 404, { ok: false, error: 'Message not found.' });
+      return;
+    }
+    // Both ends must be on the caller's own account: forwarding read a message out of a chat the
+    // caller cannot open, and could push it into one they do not own.
+    if (!canSeeChat(me, msg.chatId) || !canSeeChat(me, toChat)) {
+      json(res, 403, { ok: false, error: 'That chat is not on your WhatsApp account.' });
       return;
     }
     // Strip the original sender's app signature — the forward gets the FORWARDER's signature.
@@ -1716,7 +1787,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // "to" is a DATE (inclusive): add a day so 31-07 includes everything ON the 31st.
     const toRaw = parseLocalDate(u.searchParams.get('to') ?? '');
     const to = toRaw ? toRaw + 86_400_000 - 1 : 0;
-    json(res, 200, reportRows(q, from, to));
+    json(res, 200, reportRows(q, from, to, 2000, accountFor(me)));
     return;
   }
   if (path === '/report') {
@@ -1882,7 +1953,8 @@ function authShell(title: string, inner: string, script: string): string {
   .err.on{display:block}
   .hint{margin-top:16px;font-size:12px;color:var(--mut);line-height:1.5}
 </style></head><body><div class="card">${inner}</div>
-<script>${script}</script></body></html>`;
+<script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});${script}</script></body></html>`;
 }
 
 function loginPage(): string {
@@ -2088,6 +2160,7 @@ function adminPage(me: User): string {
 <div class="emopop" id="emopop"><div class="emocard"><div class="emohead"><input id="emosearch" placeholder="search emoji… (fire, thanks, truck)" autocomplete="off"><button type="button" id="emoclose">&#10005;</button></div><button type="button" class="emonone" id="emonone">No emoji — automatic</button><div id="emogrid"></div></div></div>
 <div class="toast" id="toast"></div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 var EMOJIS=${JSON.stringify(EMO_CATALOG)};
 function setEmoji(v){el("fEmoji").value=v||"";el("fEmojiBtn").textContent=v||String.fromCodePoint(0x1F600);el("fEmojiHint").textContent=v?"":"automatic";}
 function emoGrid(q){
@@ -2676,6 +2749,7 @@ function dashboardPage(): string {
 <header><div class="dot" id="dot"></div><h1>Order Command Center</h1><span class="conn" id="conn">connecting…</span><div class="spacer"></div><span class="meta" id="meta"></span><a class="navlink" href="/report">Report</a><a class="navlink" href="/match">Order Matching →</a></header>
 <div class="board" id="board"></div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 const COLS=[["new","New Orders","#3b82f6"],["discussion","Discussion","#f59e0b"],["waiting_customer","Waiting Customer","#fb923c"],["waiting_warehouse","Waiting Warehouse","#a78bfa"],["finalized","Finalized","#22c55e"]];
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ago=ts=>{if(!ts)return"";let s=Math.floor(Date.now()/1000)-ts;if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";if(s<86400)return Math.floor(s/3600)+"h";return Math.floor(s/86400)+"d";};
@@ -3111,8 +3185,9 @@ function matchPage(me: User): string {
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
+window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
-var meName=${JSON.stringify(me.name || me.username)},meUser=${JSON.stringify(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},IS_ADMIN=${me.role === 'admin' ? 'true' : 'false'},appUsers=[];
+var meName=${jsIn(me.name || me.username)},meUser=${jsIn(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},IS_ADMIN=${me.role === 'admin' ? 'true' : 'false'},appUsers=[];
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 var claims={}; // messageId -> username currently extracting it (the lock)

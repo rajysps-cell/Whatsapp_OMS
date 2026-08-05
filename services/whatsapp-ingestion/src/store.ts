@@ -229,7 +229,10 @@ export interface ReportRow {
   /** aliases' primary key, only on learned rows — lets the report delete a bad lesson. */
   norm?: string;
 }
-export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { rows: ReportRow[]; total: number } {
+export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000, account = ''): { rows: ReportRow[]; total: number } {
+  // Scope to ONE WhatsApp account when asked: order lines saved from a personal user's private
+  // chats must not surface in a common user's report (audit finding).
+  const visible = account ? chatsOfAccount(account) : null;
   const ql = q.toLowerCase().trim();
   const qq = ql.replace(/\s+/g, '');
   // Space-insensitive on top of substring: customers write "nohub", the catalog writes
@@ -251,6 +254,7 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000): { row
   const seen = new Set<string>(); // code|wording pairs already covered by an order row
   for (const s of saved) {
     if (!s.items) continue;
+    if (visible && !visible.has(s.chat_id ?? '')) continue;
     let lines: Array<{ qty?: string; code?: string; description?: string; phrase?: string }>;
     try {
       lines = JSON.parse(s.items) as typeof lines;
