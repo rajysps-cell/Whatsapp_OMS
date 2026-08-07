@@ -16,6 +16,12 @@ dist/
 # Local SQLite DB (aliases, processed msgs, chat names)
 data.sqlite
 data.sqlite-*
+# Hand-made copies taken before risky migrations. These hold EVERY captured customer message, and
+# this repo is public — one `git add .` would publish the lot. Ignored by shape, not by name.
+*.bak
+*.bak-*
+*.backup
+data.sqlite.*
 
 # Env & logs
 .env
