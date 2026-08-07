@@ -156,12 +156,18 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     PAGE_DEAD.test(String((err as { message?: string } | null)?.message ?? err ?? ''));
 
   const spawnFresh = (label: string): Promise<void> => {
+    rebuilding = true;
     client = makeClient();
     sawReadyEvent = false; // a new browser has not proved its event hooks yet
     for (const [ev, fn] of listeners) {
       (client as unknown as { on(e: string, f: (...a: never[]) => void): void }).on(ev, fn);
     }
-    return client.initialize().catch((err: unknown) => logger.error({ err, session: tag }, label));
+    return client
+      .initialize()
+      .catch((err: unknown) => logger.error({ err, session: tag }, label))
+      .finally(() => {
+        rebuilding = false;
+      });
   };
   const rebuild = (label: string): void => {
     void client
@@ -188,6 +194,12 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   // list and sends fine but NEVER receives. Measured: every probe-only session delivered zero
   // messages, while every real-ready session delivered them normally.
   let sawReadyEvent = false;
+  // True from the moment a rebuild starts until the new client finishes initialize(). Without it
+  // the watchdog probed the OLD page while it was being torn down, got rows back, and declared the
+  // session ready 3 seconds after a restart — impossibly fast for a fresh browser. Everything then
+  // ran against a frame that was already dying, so every send failed with "detached Frame" while
+  // the header said Live chat.
+  let rebuilding = false;
   // Has the history backfill run for this session yet? See becomeReady for why it runs only once.
   let didBackfill = false;
   let readyAt = 0;
@@ -370,6 +382,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
    * it as soon as the real event is overdue, rather than waiting for someone to notice silence.
    */
   const checkFalseReady = (): void => {
+    if (rebuilding) return;
     if (!ready || sawReadyEvent || sawQr) return;
     if (!readyAt || Date.now() - readyAt < REAL_READY_GRACE_MS) return;
     // Traffic beats theory. whatsapp-web.js' 'ready' event has not fired ONCE on this WhatsApp Web
@@ -408,6 +421,9 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   let probing = false; // catalogSync is async and the interval is not — never overlap two probes
   const watchdog = setInterval(() => {
     checkFalseReady(); // runs even while "ready" — that is the whole point of it
+    // A session being replaced has no opinion worth hearing: probing here reaches the OLD page
+    // mid-teardown and declares the new session ready before its browser has even loaded.
+    if (rebuilding) return;
     if (ready || probing) return;
     if (sawQr) return; // waiting on a human to scan — restarting would loop and lose the QR
     if (Date.now() - initAt < PROBE_AFTER_MS) return;
