@@ -170,6 +170,10 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
       });
   };
   const rebuild = (label: string): void => {
+    // Set BEFORE destroy(), not inside spawnFresh: destroy() is async, and in the gap before it
+    // resolved the watchdog was still free to probe the page that was on its way out and declare
+    // the session ready — which is exactly what it kept doing, 4 seconds after each rebuild.
+    rebuilding = true;
     void client
       .destroy()
       .catch(() => undefined)
