@@ -1900,8 +1900,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 403, { ok: false, error: 'That chat is not on your WhatsApp account.' });
       return;
     }
-    // Strip the original sender's app signature — the forward gets the FORWARDER's signature.
-    const text = msg.body.replace(/\n\n✍🏼 BY \*[A-Za-z0-9]+\*\s*$/u, '').trim();
+    // Strip whatever signature the original already carried — leading (current form) or trailing
+    // (older messages), ours or an earlier forwarder's. This forward gets the FORWARDER's own mark.
+    const SIG = String.raw`(?:✍[\u{1F3FB}-\u{1F3FF}️]*|↪️?)\s*(?:FORWARDED\s+)?BY\s+\*[A-Za-z0-9]+\*`;
+    const text = msg.body
+      .replace(new RegExp(`^${SIG}\\s*`, 'iu'), '')
+      .replace(new RegExp(`\\n\\n${SIG}\\s*$`, 'iu'), '')
+      .trim();
+    // Label a forward AS a forward. It used to go out with the ordinary "by NAME" signature —
+    // indistinguishable from a message that person had typed, so the reader could not tell it had
+    // been passed on, or by whom.
+    const fwdSig = `↪️ FORWARDED BY *${me.username.toUpperCase()}*`;
     const MEDIA_KINDS = ['image', 'video', 'audio', 'voice', 'document', 'sticker', 'ptv'];
     try {
       let sentId = '';
@@ -1915,14 +1924,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           json(res, 404, { ok: false, error: 'The file could not be retrieved from WhatsApp any more.' });
           return;
         }
-        const caption = text ? `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}` : undefined;
+        const caption = text ? `${fwdSig}\n\n${text}` : fwdSig;
         sentId = await sendMediaFn(toChat, { data: file.data, mimetype: file.mimetype, filename: file.filename ?? 'file' }, caption, undefined, me.username, undefined, vf.via);
       } else {
         if (!sendMessageFn || !text) {
           json(res, 400, { ok: false, error: 'There is no text to forward.' });
           return;
         }
-        sentId = await sendMessageFn(toChat, `✍🏼 BY *${me.username.toUpperCase()}*\n\n${text}`, undefined, me.username, undefined, vf.via);
+        sentId = await sendMessageFn(toChat, `${fwdSig}\n\n${text}`, undefined, me.username, undefined, vf.via);
       }
       if (sentId) recordSentBy(sentId, me.username);
       logger.info({ user: me.username, from: msg.chatId, to: toChat, messageId }, 'message forwarded');
@@ -3289,6 +3298,7 @@ function matchPage(me: User): string {
   @media (hover:none){.mbtn{opacity:.8}}
   .who.tap{cursor:pointer}
   .who.tap:hover{text-decoration:underline}
+  .sentby.fwd{background:#eef2ff;border-color:#c7d2fe;color:#4338ca}
   .starred{color:#f59e0b;margin-right:4px;font-size:11px}
   /* Pinned-message bar above the thread, like WhatsApp's. Click scrolls to the message. */
   .pinbar{display:none;align-items:center;gap:8px;background:var(--panel);border-bottom:1px solid var(--line);
@@ -3315,6 +3325,9 @@ function matchPage(me: User): string {
     color:#3f6b57;background:#eafaf0;border:1px solid #a7f3d0;border-radius:20px;
     padding:3px 11px;line-height:1.45}
   .sentby b{color:var(--em2);font-weight:700}
+  /* The badge can be longer than the message ("Forwarded by admin" over "hi"), so let the bubble
+     grow to fit it instead of clipping the name off. */
+  .sentby{white-space:nowrap}
   /* Composer — the only write surface in the app; one message per explicit send. */
   .composer{display:flex;align-items:flex-end;gap:9px;padding:9px 14px;background:#f0f2f5;border-top:1px solid var(--line)}
   .composer textarea{flex:1;resize:none;max-height:120px;padding:9px 13px;font:inherit;font-size:14px;line-height:20px;
@@ -3686,6 +3699,8 @@ function mediaBlock(m){
 // Chat-list preview: drop a trailing signature line so the sidebar shows the message, not "hi -- admin".
 function stripSig(t){
   var s=String(t||"");
+  // Forward marker leads the message the same way the signature does.
+  s=s.replace(/^\\s*\\u21AA\\uFE0F?\\s*forwarded\\s+by\\s+\\*?[A-Za-z0-9]{3,32}\\*?\\s*\\n+/i,"");
   // New form: the signature LEADS the message (emoji form only — a leading "-- x" could be text).
   s=s.replace(/^\\s*\\u270D[\\uD83C\\uDFFB-\\uDFFF\\uFE0F]*\\s*(?:by\\s+)?\\*?[A-Za-z0-9]{3,32}\\*?\\s*\\n+/i,"");
   // Old form: signature on the last line.
@@ -3700,6 +3715,16 @@ function stripSig(t){
 // Parse one line as a signature; returns the known username or null. emojiOnly restricts to the
 // "<writing-hand> BY *name*" form — used for the FIRST line, where a plain "-- something" could
 // be genuine message text.
+// The FORWARD marker, which is deliberately distinct from the "written by" one. Returns the name.
+function fwdName(line){
+  var s2=String(line||"").trim();
+  if(s2.indexOf(String.fromCodePoint(0x21AA))!==0)return null;
+  var rest=s2.slice(1).replace(String.fromCodePoint(0xFE0F),"").trim();
+  var m=/^forwarded\\s+by\\s*\\*?([A-Za-z0-9]{3,32})\\*?$/i.exec(rest);
+  if(!m)return null;
+  for(var i=0;i<appUsers.length;i++){if(String(appUsers[i]).toLowerCase()===m[1].toLowerCase())return appUsers[i];}
+  return null;                                                 // not one of our accounts = not ours
+}
 function sigName(line,emojiOnly){
   var s2=String(line||"").trim(),m=null;
   var EMO=String.fromCodePoint(0x270D);   // matches the emoji with or without a skin-tone modifier
@@ -3717,12 +3742,17 @@ function sigName(line,emojiOnly){
 function splitSignature(text,out){
   if(!out)return{body:text,by:null};
   var s=String(text||"");
+  // Forwards carry their own marker, so the badge can say "Forwarded by" instead of "Sent by".
+  var wholeF=fwdName(s);
+  if(wholeF)return{body:"",by:wholeF,fwd:true};
   // A message that IS only a signature (the follow-up behind a voice note): show just the pill.
   var whole=sigName(s,true);
   if(whole)return{body:"",by:whole};
   // New form first: the signature is the FIRST line, above the text (like a group sender name).
   var fn=s.indexOf("\\n");
   if(fn>0){
+    var fTop=fwdName(s.slice(0,fn));
+    if(fTop)return{body:s.slice(fn+1).replace(/^\\s+/,""),by:fTop,fwd:true};
     var byTop=sigName(s.slice(0,fn),true);
     if(byTop)return{body:s.slice(fn+1).replace(/^\\s+/,""),by:byTop};
   }
@@ -3760,7 +3790,9 @@ var nm=(!out&&m.isGroup&&!grp)?'<div class="who'+(wj?" tap":"")+'" style="color:
   +(wj?' data-jid="'+esc(wj)+'" data-name="'+esc(m.pushName||wj)+'" title="Message this person privately"':'')
   +'>'+esc(m.pushName||"~")+'</div>':"";var ck=out?ackHtml(m.ack):"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
 // The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
-var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
+// "Forwarded by" when the message was passed on, "Sent by" when it was written here. sig.fwd is
+// the only trustworthy signal: m.sentBy records WHO sent it, not HOW.
+var sentTag=sentBy?'<div><span class="sentby'+(sig.fwd?" fwd":"")+'">'+(sig.fwd?"&#8618; Forwarded by ":"Sent by ")+'<b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
