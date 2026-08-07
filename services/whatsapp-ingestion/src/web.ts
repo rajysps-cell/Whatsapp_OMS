@@ -73,6 +73,7 @@ import {
   addSaveBatch,
   replaceOwnReaction,
   chatParticipants,
+  sharesVisibleGroup,
   chatsOfAccount,
   saveBatchesForChat,
   searchChatsByMessage,
@@ -260,6 +261,15 @@ function jsIn(v: unknown): string {
  */
 function canSeeChat(me: User, chatId: string): boolean {
   return !!chatId && chatsOfAccount(visibleAccount(me)).has(chatId);
+}
+/**
+ * May this user OPEN or WRITE TO this chat? Everything canSeeChat allows, plus one case it cannot:
+ * a person picked from a group's member list who we have never had a private chat with. There is no
+ * account_chats row for that conversation until the first message exists, so the strict gate refused
+ * it and the send button did nothing. Sharing a visible group is the same permission WhatsApp uses.
+ */
+function canOpenChat(me: User, chatId: string): boolean {
+  return canSeeChat(me, chatId) || sharesVisibleGroup(visibleAccount(me), chatId);
 }
 /** Same gate, resolved from a message id (unknown message = refuse). */
 function canSeeMessage(me: User, messageId: string): boolean {
@@ -1463,7 +1473,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // Both directions of privacy: a personal user cannot open the business chats, and nobody on
     // the business account can open a personal user's chats.
-    if (!canSeeChat(me, id)) {
+    if (!canOpenChat(me, id)) {
       json(res, 403, { error: 'This chat is not on your WhatsApp account.' });
       return;
     }
@@ -1483,7 +1493,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
       claims, // messageId -> username currently extracting it (the lock)
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId), batches: batches.get(m.messageId) ?? [] })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, ack: m.ack, orderNo: orderNos.get(m.messageId), batches: batches.get(m.messageId) ?? [] })),
     });
     return;
   }
@@ -1508,7 +1518,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // The most dangerous gap of all: without this, a signed-in user could make ANY linked WhatsApp
     // account message any JID they could name — a real outbound message to a stranger.
-    if (!canSeeChat(me, chatId)) {
+    if (!canOpenChat(me, chatId)) {
       json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
       return;
     }
@@ -1580,7 +1590,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // Same gate as /api/send. This one was missed once already and a probe put a real file into a
     // real customer group — an ungated outbound path is the worst kind of gap in this app.
-    if (!canSeeChat(me, chatId)) {
+    if (!canOpenChat(me, chatId)) {
       json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
       return;
     }
@@ -3303,7 +3313,8 @@ function matchPage(me: User): string {
   .mhint{padding:8px 14px;color:var(--mut);font-size:12px}
   .metarow{display:flex;align-items:center;gap:6px;justify-content:flex-end;margin-top:1px}
   .meta{font-size:11px;color:rgba(11,20,26,.45);white-space:nowrap;user-select:none;line-height:1}
-  .ck{margin-left:3px;color:#53bdeb}
+  .ck{margin-left:3px;color:#8696a0}          /* sent / delivered — grey, like WhatsApp */
+  .ck.read{color:#53bdeb}                     /* read — WhatsApp blue */
   .react{position:absolute;bottom:-13px;background:#fff;border-radius:12px;padding:2px 6px;font-size:13px;box-shadow:0 1px 1.5px rgba(11,20,26,.16);display:inline-flex;align-items:center;line-height:1;white-space:nowrap;cursor:pointer}
   .react:hover{box-shadow:0 1px 3px rgba(11,20,26,.3)}
   /* "Reacted by" popup — one group per emoji, like WhatsApp. */
@@ -3556,7 +3567,7 @@ var meName=${jsIn(me.name || me.username)},meUser=${jsIn(me.username)},WA_PERSON
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 var claims={}; // messageId -> username currently extracting it (the lock)
-var finalHidden=false; // Final Order folded away? Sticky while the panel re-renders.
+var finalHidden=true; // Starts folded — the arrow opens it. Sticky while the panel re-renders.
 var pendingReacts={}; // messageId -> emoji just saved here, shown before WhatsApp echoes it back
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
@@ -3699,15 +3710,27 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;if(m.batches&&m.batches.length)batchesOf[m.messageId]=m.batches;else delete batchesOf[m.messageId];var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;if(m.batches&&m.batches.length)batchesOf[m.messageId]=m.batches;else delete batchesOf[m.messageId];var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?ackHtml(m.ack):"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
 // The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
 var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
 var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="sbrow" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="rembtn" style="display:none" data-rem="1" data-mid="'+esc(m.messageId)+'">Remaining</button><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+/**
+ * WhatsApp's own ticks, from WhatsApp's own ack: 1 = sent (one tick), 2 = delivered (two),
+ * 3 read / 4 played (two blue). 0 means WhatsApp has not reported yet — show the single tick
+ * rather than nothing, because the message IS out of here by then.
+ * Messages sent before this was recorded have ack 0 and stay on one tick; new ones fill in live.
+ */
+function ackHtml(a){
+  var n=Number(a||0);
+  if(n>=3)return '<span class="ck read" title="Read">&#10003;&#10003;</span>';
+  if(n===2)return '<span class="ck" title="Delivered">&#10003;&#10003;</span>';
+  return '<span class="ck" title="Sent">&#10003;</span>';
+}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
-function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
+function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;sp+=(ms[i].ack||0);/* a tick going grey->blue must re-render */}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
 // While an extraction is open here, keep its lock fresh (the server expires idle locks).
 function heartbeatClaims(){var mids=Object.keys(active);if(!mids.length)return;fetch("/api/extract/heartbeat",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({messageIds:mids})}).catch(function(){});}
 async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};heartbeatClaims();var sig=threadSig(ms);if(sig===lastSig){applyStates();return;}lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();
@@ -3856,9 +3879,13 @@ hideMembers();closeFind();el("tobottom").style.display="none";var d=await(await 
  * messages sit below the fold — which is why opening a chat sometimes needed a manual scroll down.
  * Re-pin after layout, and again as media reports its real height.
  */
+var pinGen=0;
+/** Stop the pending re-pins above — a jump to a searched message must not be dragged back down. */
+function cancelScrollToBottom(){pinGen++;}
 function scrollThreadToBottom(){
   var mb=el("msgs");if(!mb)return;
-  var pin=function(){mb.scrollTop=mb.scrollHeight;};
+  var gen=++pinGen;
+  var pin=function(){if(gen!==pinGen)return;mb.scrollTop=mb.scrollHeight;};
   pin();
   requestAnimationFrame(pin);
   setTimeout(pin,120);setTimeout(pin,400);setTimeout(pin,1000);
@@ -4264,8 +4291,13 @@ el("memberpop").addEventListener("click",async function(e){
   if(!window.confirm('Start a new private chat with '+name+'?\\n\\nThis opens a conversation that does not exist yet.'))return;
   await loadChats();
   var again=chats.find(function(c){return c.id===jid;});
-  if(again)selectChat(again.id);
-  else toast("No messages with "+name+" yet — send one from the box below once the chat opens.",true);
+  if(again){selectChat(again.id);return;}
+  // Still no chat row — there is no history to have one. Open the empty thread anyway so the
+  // composer points at THIS PERSON. Without it the composer stayed aimed at the group, which is
+  // why the send button appeared to do nothing (and would have replied to the whole group).
+  chats.unshift({id:jid,title:name,isGroup:false,unread:0,lastText:"",lastTs:Math.floor(Date.now()/1000)});
+  await selectChat(jid);
+  toast("New chat with "+name+" — your first message starts the conversation.");
 });
 document.addEventListener("click",function(e){
   if(!e.target.closest("#memberpop")&&!e.target.closest("#threadtitle"))hideMembers();
@@ -4278,14 +4310,29 @@ el("threadtitle").addEventListener("click",function(){
 
 el("chatlist").addEventListener("click",async function(e){
   var r=e.target.closest(".chatrow");if(!r)return;
-  var id=r.dataset.id,hit=msgHits[id];
+  var id=r.dataset.id,hit=msgHits[id],q=((el("chatsearch")||{}).value||"").trim();
   await selectChat(id);
   // Opening from a CONTENT search should land on the message that matched, not at the bottom of
-  // the thread — otherwise you have found the chat but still have to hunt for the line.
-  if(hit&&hit.msgId)jumpToMessage(hit.msgId);
+  // the thread — otherwise you have found the chat but still have to hunt for the line. The word
+  // also carries into this chat's own search, so the arrows walk EVERY mention of it here.
+  if(hit&&hit.msgId)jumpToMessage(hit.msgId,q);
 });
-/** Scroll a message into view and flash it, the same way a tapped reply-quote does. */
-function jumpToMessage(mid){
+/**
+ * Scroll a message into view and flash it, the same way a tapped reply-quote does.
+ * With a search word, open the in-chat find bar on it and select the hit inside THIS message.
+ */
+function jumpToMessage(mid,q){
+  cancelScrollToBottom(); // selectChat pins to the newest message for up to a second; not now
+  if(q&&q.length>1){
+    el("findbar").style.display="flex";
+    el("findq").value=q;
+    runFind();
+    // runFind lands on the newest hit; move to the one in the message the search actually found.
+    for(var i=0;i<findHits.length;i++){
+      var b=findHits[i].closest(".bubble");
+      if(b&&b.dataset.mid===mid){findAt=i;showFindHit();break;}
+    }
+  }
   var t=document.querySelector('.msgs .bubble[data-mid="'+cssq(mid)+'"]');
   if(!t){toast("That message is further back than this view loads.",true);return;}
   t.scrollIntoView({behavior:"smooth",block:"center"});

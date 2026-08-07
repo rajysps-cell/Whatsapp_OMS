@@ -16,6 +16,7 @@ import {
   dropAccount,
   getSetting,
   markRevoked,
+  setAck,
   hasMessagesFor,
   pruneAccountChats,
   retireAccountMessages,
@@ -237,6 +238,8 @@ function main(): void {
         }
       }
     },
+    // WhatsApp's own delivery state for our sent messages — drives the real ticks in the thread.
+    onAck: (messageId, ack) => setAck(messageId, ack),
     onReaction: async (reaction) => {
       const event = toReactionEvent(reaction);
       if (!event) return;

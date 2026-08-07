@@ -139,6 +139,11 @@ for (const [table, col] of [
   // accounts read one merged timeline (measured: 840 messages across 3 threads).
   // Groups are exempt — a group message genuinely is one message both members can see.
   ['messages', "account TEXT NOT NULL DEFAULT ''"],
+  // WhatsApp's own delivery state for messages WE sent: 1 = sent (one tick), 2 = delivered to the
+  // device (two ticks), 3 = read / 4 = played (two blue ticks). 0 = not reported yet. The ticks in
+  // the thread used to be a hard-coded double check on every outgoing message, which told nobody
+  // anything.
+  ['messages', 'ack INTEGER NOT NULL DEFAULT 0'],
 ] as const) {
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
@@ -215,6 +220,16 @@ export function setStarred(msgId: string, on: boolean): void {
 
 export function setPinned(msgId: string, on: boolean): void {
   db.prepare('UPDATE messages SET pinned = ? WHERE msg_id = ?').run(on ? Date.now() : 0, msgId);
+}
+
+/**
+ * Record WhatsApp's delivery state for a message we sent. Never goes backwards: acks can arrive
+ * out of order (a 'read' for one device racing a 'delivered' for another), and a tick that
+ * un-blues itself is worse than one that is slightly late.
+ */
+export function setAck(msgId: string, ack: number): void {
+  if (!msgId || !Number.isFinite(ack) || ack <= 0) return;
+  db.prepare('UPDATE messages SET ack = ? WHERE msg_id = ? AND ack < ?').run(ack, msgId, ack);
 }
 
 // --- learned NON-products -----------------------------------------------------------------
@@ -583,8 +598,8 @@ const SYSTEM_KINDS = [
   'interactive',
 ];
 const chatMsgsStmt = db.prepare(`
-  SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned FROM (
-    SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned
+  SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned, ack FROM (
+    SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned, ack
     FROM messages
     WHERE chat_id = ?
       AND ${ACCOUNT_SCOPE}
@@ -879,6 +894,8 @@ export interface MsgRow {
   /** Starred/pinned from this app (drives the badges; phone-side stars do not sync back). */
   starred?: boolean;
   pinned?: boolean;
+  /** WhatsApp delivery state for our own messages: 1 sent, 2 delivered, 3 read, 4 played. */
+  ack?: number;
 }
 
 // --- @mention names ------------------------------------------------------------------
@@ -913,6 +930,22 @@ const chatSendersStmt = db.prepare(
   "SELECT sender, MAX(ts) AS last_ts FROM messages WHERE chat_id = ? AND " + ACCOUNT_SCOPE +
     " AND sender <> '' AND from_me = 0 GROUP BY sender ORDER BY last_ts DESC",
 );
+
+// Has this person posted in a GROUP the account actually holds? That is the whole permission for
+// starting a brand-new private chat from the group member list: WhatsApp lets you message anyone
+// you share a group with, and this keeps the gate exactly that tight — no chat_id you can merely
+// name, only someone already speaking in front of you.
+const sharesGroupStmt = db.prepare(
+  'SELECT 1 AS ok FROM messages m JOIN account_chats a ON a.chat_id = m.chat_id AND a.account = ? ' +
+    'WHERE m.is_group = 1 AND (m.sender LIKE ? OR m.sender LIKE ?) LIMIT 1',
+);
+export function sharesVisibleGroup(account: string, jid: string): boolean {
+  if (!account || !jid || jid.endsWith('@g.us')) return false;
+  const id = (jid.split('@')[0] ?? '').split(':')[0] ?? '';
+  if (!id) return false;
+  // Match the same person under either domain (@lid / @c.us) and with any device suffix.
+  return !!sharesGroupStmt.get(account, `${id}@%`, `${id}:%`);
+}
 
 export interface Participant {
   /** Bare numeric id — this is what goes in the message text after '@'. */
@@ -1146,6 +1179,7 @@ export function chatMessages(chatId: string, limit: number, account: string): Ms
     sentBy: sentMap.get(r.msg_id),
     starred: !!(r as unknown as { starred?: number }).starred,
     pinned: !!(r as unknown as { pinned?: number }).pinned,
+    ack: Number((r as unknown as { ack?: number }).ack ?? 0),
   }));
 }
 

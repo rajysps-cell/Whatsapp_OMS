@@ -79,6 +79,8 @@ export interface WaClientHandlers {
   onRevoked?: (messageId: string) => void;
   /** This session's own WhatsApp id, once known — used to identify OUR reactions. */
   onIdentity?: (wid: string) => void;
+  /** WhatsApp's delivery state for a message we sent: 1 sent, 2 delivered, 3 read, 4 played. */
+  onAck?: (messageId: string, ack: number) => void;
 }
 
 /** One message recovered from WhatsApp Web's in-memory (decrypted) message models. */
@@ -115,14 +117,51 @@ export const CATALOG_EVERY_MS = 2 * 60 * 1000;
 export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = {}): WaClient {
   const authDir = opts.authDir ?? config.authDir;
   const tag = opts.tag ?? 'common';
-  const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: authDir }),
-    puppeteer: {
-      headless: true,
-      // --no-sandbox is needed on most Linux servers / containers.
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    },
-  });
+  /**
+   * Build a BRAND NEW client. Never reuse one that has been destroyed.
+   *
+   * destroy() closes the browser and tears down the auth strategy; calling initialize() on that
+   * same instance afterwards does not bring a session back — the browser never reappears, while
+   * the catalog probe races the dying page and reports "connected". Measured on 2026-08-07: the
+   * session restarted every 6 minutes for half an hour, the pill said Live chat the whole time,
+   * and there was no Chromium process on the box at all. Reactions sent during those windows were
+   * lost for good, because WhatsApp re-delivers queued MESSAGES on reconnect but never re-fires
+   * reaction events — which is exactly how this surfaced ("Nate's emoji never showed up").
+   */
+  const makeClient = (): InstanceType<typeof Client> =>
+    new Client({
+      authStrategy: new LocalAuth({ dataPath: authDir }),
+      puppeteer: {
+        headless: true,
+        // --no-sandbox is needed on most Linux servers / containers.
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      },
+    });
+  let client = makeClient();
+  // Every handler registered below, remembered so a freshly built client gets all of them back.
+  const listeners: Array<[string, (...a: never[]) => void]> = [];
+  const on = (ev: string, fn: (...a: never[]) => void): void => {
+    listeners.push([ev, fn]);
+    (client as unknown as { on(e: string, f: (...a: never[]) => void): void }).on(ev, fn);
+  };
+  /**
+   * Close the browser and come back on a FRESH client, re-attaching every handler.
+   * The only way back from a dead page — see makeClient() for why re-initializing is not.
+   */
+  const spawnFresh = (label: string): Promise<void> => {
+    client = makeClient();
+    sawReadyEvent = false; // a new browser has not proved its event hooks yet
+    for (const [ev, fn] of listeners) {
+      (client as unknown as { on(e: string, f: (...a: never[]) => void): void }).on(ev, fn);
+    }
+    return client.initialize().catch((err: unknown) => logger.error({ err, session: tag }, label));
+  };
+  const rebuild = (label: string): void => {
+    void client
+      .destroy()
+      .catch(() => undefined)
+      .then(() => spawnFresh(label));
+  };
 
   // Watchdog state. A start that never reaches 'ready' used to sit there until an operator
   // noticed — that is what caused the outage after the last deploy.
@@ -156,7 +195,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     bridgeRestarts = 0; // traffic is flowing again: this is the only proof that the restart worked
   };
 
-  client.on('qr', (qr) => {
+  on('qr', (qr: string) => {
     sawQr = true; // a human must scan; restarting the client cannot help and would loop forever
     logger.info({ session: tag }, 'scan this QR from the phone: WhatsApp → Linked devices → Link a device (or open the web page)');
     qrcode.generate(qr, { small: true });
@@ -226,15 +265,15 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
       );
     }
   };
-  client.on('ready', () => {
+  on('ready', () => {
     sawReadyEvent = true; // the library's hooks are in: this session can actually receive
     becomeReady('ready event');
   });
-  client.on('auth_failure', (msg) => {
+  on('auth_failure', (msg: string) => {
     logger.error({ msg }, 'auth failure');
     handlers.onStatus?.('auth failure');
   });
-  client.on('disconnected', (reason) => {
+  on('disconnected', (reason: string) => {
     ready = false;
     initAt = Date.now();
     stuckRestarts = 0;
@@ -248,11 +287,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     // destroy() first: this event fires synchronously from inside the library, which does NOT
     // close the browser here. Calling initialize() straight away launched a second Chromium into
     // the same profile directory, and whichever lost the race was orphaned and never closed.
-    client
-      .destroy()
-      .catch(() => undefined)
-      .then(() => client.initialize())
-      .catch((err) => logger.error({ err }, 'reconnect failed'));
+    rebuild('reconnect failed');
   });
 
   // Watchdog. Two jobs, in order of preference:
@@ -295,11 +330,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     initAt = Date.now();
     lastEventAt = Date.now();
     handlers.onStatus?.('reconnecting');
-    client
-      .destroy()
-      .catch(() => undefined)
-      .then(() => client.initialize())
-      .catch((err) => logger.error({ err, session: tag }, 'restart failed'));
+    rebuild('restart failed');
   };
 
   /**
@@ -352,11 +383,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
         'WhatsApp never became ready and the chat catalog is unreadable — restarting the client',
       );
       initAt = Date.now(); // reset first so a slow restart cannot trigger a second one
-      client
-        .destroy()
-        .catch(() => undefined)
-        .then(() => client.initialize())
-        .catch((err) => logger.error({ err }, 'watchdog reinitialize failed'));
+      rebuild('watchdog reinitialize failed');
     };
     probing = true;
     catalogSync(client)
@@ -374,11 +401,24 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   watchdog.unref();
 
   // 'message' fires for inbound messages only (not our own) — exactly the read-only surface we want.
-  client.on('message', (msg) => {
+  on('message', (msg: Message) => {
     sawEvent();
     Promise.resolve(handlers.onMessage(msg)).catch((err) => logger.error({ err }, 'onMessage failed'));
   });
-  client.on('message_reaction', (reaction) => {
+  if (handlers.onAck) {
+    // The real read receipts. Fires repeatedly per message as it progresses sent -> delivered ->
+    // read, for our OWN messages. Only @lid chats sometimes hand back an id without _serialized,
+    // so rebuild it the same way the revoke handler does rather than dropping the update.
+    on('message_ack', (msg: Message, ack: number) => {
+      sawEvent();
+      const id = (msg as unknown as { id?: { fromMe?: boolean; remote?: string | { _serialized?: string }; id?: string; _serialized?: string } }).id;
+      if (!id) return;
+      const remote = typeof id.remote === 'object' ? (id.remote?._serialized ?? '') : (id.remote ?? '');
+      const messageId = id._serialized || (id.id ? `${id.fromMe ? 'true' : 'false'}_${remote}_${id.id}` : '');
+      if (messageId) handlers.onAck?.(messageId, ack);
+    });
+  }
+  on('message_reaction', (reaction: Reaction) => {
     sawEvent();
     Promise.resolve(handlers.onReaction(reaction)).catch((err) =>
       logger.error({ err }, 'onReaction failed'),
@@ -387,7 +427,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   // 'message_create' fires for ALL new messages incl. our own; keep only fromMe here so we don't
   // double-handle inbound (already covered by 'message'). Lets us persist the account's own replies.
   if (handlers.onSent) {
-    client.on('message_create', (msg) => {
+    on('message_create', (msg: Message) => {
       sawEvent(); // our own echo counts: it proves the bridge is still carrying traffic
       if (!msg.fromMe) return;
       Promise.resolve(handlers.onSent?.(msg)).catch((err) => logger.error({ err }, 'onSent failed'));
@@ -396,7 +436,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   if (handlers.onRevoked) {
     // Fires when ANYONE deletes-for-everyone — a customer from their phone, or this app itself.
     // `before` (the original message) carries the id we stored; `after` is the revocation stub.
-    client.on('message_revoke_everyone', (after, before) => {
+    on('message_revoke_everyone', (after: Message, before: Message | null) => {
       const src = (before ?? after) as { id?: { fromMe?: boolean; remote?: string | { _serialized?: string }; id?: string; _serialized?: string } };
       const id = src?.id;
       if (!id) return;
@@ -406,7 +446,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     });
   }
 
-  client.initialize().catch((err) => logger.error({ err }, 'initialize failed'));
+  client.initialize().catch((err: unknown) => logger.error({ err }, 'initialize failed'));
 
   // Recover per-chat history through WhatsApp Web's own module system (window.require).
   // The encrypted-at-rest IndexedDB records are decrypted by the page into in-memory models;
@@ -757,7 +797,9 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
       initAt = Date.now();
       sawQr = false;
       stuckRestarts = 0;
-      client.initialize().catch((err) => logger.error({ err, session: tag }, 'relink initialize failed'));
+      // A fresh client, not this destroyed one — the session dir was just wiped, and a destroyed
+      // client never comes back from initialize() (see makeClient).
+      void spawnFresh('relink initialize failed');
     },
     media: (messageId: string) => fetchMedia(client, messageId),
     sendMedia: async (chatId, file, caption, mentions, _sentBy, asVoice): Promise<string> => {
