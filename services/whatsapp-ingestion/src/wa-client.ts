@@ -188,9 +188,8 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   // list and sends fine but NEVER receives. Measured: every probe-only session delivered zero
   // messages, while every real-ready session delivered them normally.
   let sawReadyEvent = false;
-  // When the history backfill last ran. See becomeReady for why this is throttled.
-  const BACKFILL_EVERY_MS = 30 * 60 * 1000;
-  let lastBackfillAt = 0;
+  // Has the history backfill run for this session yet? See becomeReady for why it runs only once.
+  let didBackfill = false;
   let readyAt = 0;
   // Consecutive catalog-sync throws. Zero on any answer; three in a row (~6 min) means the page
   // is gone rather than merely quiet, and only a fresh browser brings it back.
@@ -285,8 +284,12 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     // session, and the fresh session immediately backfilled again. Sends failed for the whole
     // window because sendMessage needs that same page. History does not change retroactively and
     // live messages arrive as events, so once is enough.
-    if (handlers.onHistory && Date.now() - lastBackfillAt > BACKFILL_EVERY_MS) {
-      lastBackfillAt = Date.now();
+    //
+    // Once per SESSION, not on a timer: the first connect is the one that genuinely needs to
+    // recover what happened while the app was down. A later reconnect was offline for seconds and
+    // WhatsApp re-delivers queued messages anyway, so repeating it only risks the page again.
+    if (handlers.onHistory && !didBackfill) {
+      didBackfill = true;
       historyBackfill(client, handlers.onHistory).catch((err) =>
         logger.error({ err }, 'history backfill failed'),
       );
