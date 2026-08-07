@@ -77,6 +77,8 @@ export interface WaClientHandlers {
   onHistory?: (msgs: HistoryMsg[]) => void;
   /** Someone deleted a message for everyone (from their phone or from this app). */
   onRevoked?: (messageId: string) => void;
+  /** This session's own WhatsApp id, once known — used to identify OUR reactions. */
+  onIdentity?: (wid: string) => void;
 }
 
 /** One message recovered from WhatsApp Web's in-memory (decrypted) message models. */
@@ -103,6 +105,13 @@ export interface WaSessionOpts {
   tag?: string;
 }
 
+/**
+ * How often each session re-reads its own chat catalog. 2 min: unread is bumped live on each
+ * message, so this only needs to catch up on reads done elsewhere (phone/WhatsApp Web) and correct
+ * drift. Exported because chat-membership pruning measures its grace period in sweeps of this.
+ */
+export const CATALOG_EVERY_MS = 2 * 60 * 1000;
+
 export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = {}): WaClient {
   const authDir = opts.authDir ?? config.authDir;
   const tag = opts.tag ?? 'common';
@@ -122,6 +131,30 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   let initAt = Date.now();
   let sawQr = false; // WhatsApp asked for a scan: only a human can fix that
   let stuckRestarts = 0;
+  // When we last actually RECEIVED something from WhatsApp. A session can keep its page (so the
+  // catalog still reads back) while its event bridge is dead: sends still go out, nothing ever
+  // comes in. That happened for 6 hours straight — 192 catalog syncs, 0 message events — and
+  // looked to staff like "voice notes don't work", because the thread never updated.
+  let lastEventAt = Date.now();
+  // Did whatsapp-web.js fire its OWN 'ready'? That event is what proves the library finished
+  // injecting its page hooks — and those hooks are the only path inbound messages travel. The
+  // catalog probe below can declare a session live without them: such a session reads its chat
+  // list and sends fine but NEVER receives. Measured: every probe-only session delivered zero
+  // messages, while every real-ready session delivered them normally.
+  let sawReadyEvent = false;
+  let readyAt = 0;
+  // Consecutive catalog-sync throws. Zero on any answer; three in a row (~6 min) means the page
+  // is gone rather than merely quiet, and only a fresh browser brings it back.
+  let syncFails = 0;
+  let syncRestarts = 0;
+  // Counted SEPARATELY from stuckRestarts, which becomeReady resets on every reconnect — sharing it
+  // would make the cap meaningless here (each restart reconnects, resetting its own limit) and put a
+  // permanently deaf session into an endless restart loop. Only a real event clears this.
+  let bridgeRestarts = 0;
+  const sawEvent = (): void => {
+    lastEventAt = Date.now();
+    bridgeRestarts = 0; // traffic is flowing again: this is the only proof that the restart worked
+  };
 
   client.on('qr', (qr) => {
     sawQr = true; // a human must scan; restarting the client cannot help and would loop forever
@@ -146,19 +179,46 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
     stuckRestarts = 0;
     logger.info({ via, session: tag }, 'connection open — listening for group events (read-only)');
     handlers.onStatus?.('connected');
+    lastEventAt = Date.now(); // a fresh connection starts the silence clock over
+    readyAt = Date.now();
+    // This session's OWN WhatsApp id. Needed to keep our reactions honest: WhatsApp allows one
+    // reaction per account per message, so we must know which stored reaction is ours to replace.
+    try {
+      const wid = (client as unknown as { info?: { wid?: { _serialized?: string } } }).info?.wid?._serialized;
+      if (wid) handlers.onIdentity?.(wid);
+    } catch {
+      /* info is not always populated (notably on the catalog-probe path) — never fatal */
+    }
     if (handlers.onCatalog) {
       const sync = (): void => {
         catalogSync(client)
           .then((rows) => {
+            syncFails = 0;      // the page answered: whatever it says, it is still there
+            syncRestarts = 0;   // …and that is the proof a sync-failure restart actually worked
             if (rows) handlers.onCatalog?.(rows);
+            if (rows?.length) checkEventBridge(rows);
           })
-          .catch((err) => logger.error({ err }, 'catalog sync failed'));
+          .catch((err) => {
+            // A THROWN sync means the page itself is gone — "Attempted to use detached Frame"
+            // after WhatsApp Web reloads under us. This was the one dead state no guard could
+            // see: the bridge check needs rows it never gets, the false-ready check exits because
+            // 'ready' genuinely fired, and the watchdog only runs while NOT ready. It failed every
+            // 2 minutes for 15.7 hours and nothing noticed.
+            syncFails++;
+            logger.error({ err, consecutiveFailures: syncFails }, 'catalog sync failed');
+            if (syncFails < MAX_SYNC_FAILS) return;
+            syncFails = 0;
+            if (syncRestarts >= MAX_SYNC_RESTARTS) return; // stop hammering a genuinely broken host
+            syncRestarts++;
+            restartClient('the chat catalog has been unreadable for several sweeps — the page is gone, restarting', {
+              attempt: syncRestarts,
+              consecutiveFailures: MAX_SYNC_FAILS,
+            });
+          });
       };
       sync();
       if (catalogTimer) clearInterval(catalogTimer); // 'ready' re-fires after reconnects
-      // 2 min: unread is bumped live on each message, so this only needs to catch up on reads
-      // done elsewhere (phone/WhatsApp Web) and correct any drift. ponytail: lower if it ever lags.
-      catalogTimer = setInterval(sync, 2 * 60 * 1000);
+      catalogTimer = setInterval(sync, CATALOG_EVERY_MS);
     }
     if (handlers.onHistory) {
       historyBackfill(client, handlers.onHistory).catch((err) =>
@@ -166,7 +226,10 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
       );
     }
   };
-  client.on('ready', () => becomeReady('ready event'));
+  client.on('ready', () => {
+    sawReadyEvent = true; // the library's hooks are in: this session can actually receive
+    becomeReady('ready event');
+  });
   client.on('auth_failure', (msg) => {
     logger.error({ msg }, 'auth failure');
     handlers.onStatus?.('auth failure');
@@ -204,8 +267,79 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   const PROBE_AFTER_MS = 15 * 1000; // let the normal path win first; the probe is read-only and cheap
   const STUCK_MS = 90 * 1000;
   const MAX_STUCK_RESTARTS = 6; // stop hammering a genuinely broken session
+
+  /**
+   * The watchdog above only runs while NOT ready, so it cannot see a session that connects and
+   * then goes deaf. This can: the catalog carries each chat's own last-activity time, straight
+   * from the page. If WhatsApp says a chat moved well after the last event we received, messages
+   * are arriving at the page and never reaching us — the bridge is dead and only a fresh browser
+   * fixes it. Restarting is safe: history backfill re-reads what was missed on reconnect.
+   */
+  const SILENT_MS = 10 * 60 * 1000; // generous: a real gap must not restart a healthy quiet session
+  const MAX_BRIDGE_RESTARTS = 3;
+  const MAX_SYNC_FAILS = 3;    // ~6 minutes of an unreadable page before we rebuild the browser
+  const MAX_SYNC_RESTARTS = 5; // and give up after five rebuilds if the page will not come back
+  // How long a probe-only session is given to produce a real 'ready' before we call it broken.
+  // It normally arrives within ~5s, so 3 min is patient; the cost of waiting longer is that
+  // inbound customer orders are silently not arriving the whole time.
+  const REAL_READY_GRACE_MS = 3 * 60 * 1000;
+
+  /**
+   * Rebuild the browser. Callers own their own attempt budget — a session that is deaf and one
+   * whose page has vanished are different faults with different evidence of recovery, so sharing
+   * a counter would let either mask the other.
+   */
+  const restartClient = (why: string, extra: Record<string, unknown>): void => {
+    logger.warn({ session: tag, ...extra }, why);
+    ready = false;
+    initAt = Date.now();
+    lastEventAt = Date.now();
+    handlers.onStatus?.('reconnecting');
+    client
+      .destroy()
+      .catch(() => undefined)
+      .then(() => client.initialize())
+      .catch((err) => logger.error({ err, session: tag }, 'restart failed'));
+  };
+
+  /**
+   * A session that only ever went "ready" through the catalog probe cannot receive messages —
+   * whatsapp-web.js never installed its page hooks. It looks perfectly healthy (chat list syncs,
+   * sends work, the pill says Live) which is precisely why it went unnoticed for 6 hours. Recycle
+   * it as soon as the real event is overdue, rather than waiting for someone to notice silence.
+   */
+  const checkFalseReady = (): void => {
+    if (!ready || sawReadyEvent || sawQr) return;
+    if (!readyAt || Date.now() - readyAt < REAL_READY_GRACE_MS) return;
+    if (bridgeRestarts >= MAX_BRIDGE_RESTARTS) return;
+    bridgeRestarts++;
+    restartClient('connected only via the catalog probe — whatsapp-web.js never became ready, so no message can arrive; restarting', {
+      attempt: bridgeRestarts,
+      readySince: new Date(readyAt).toISOString(),
+    });
+  };
+  const checkEventBridge = (rows: CatalogRow[]): void => {
+    if (!ready || sawQr) return;
+    let newest = 0;
+    for (const r of rows) if (r.lastTs > newest) newest = r.lastTs;
+    const newestMs = newest * 1000; // catalog stamps are epoch SECONDS
+    if (!newestMs || newestMs > Date.now() + 60_000) return; // absent or clock-skewed — ignore
+    if (newestMs <= lastEventAt + SILENT_MS) return;
+    // Give up after a few tries rather than restarting forever: if reconnecting does not revive the
+    // bridge, the cause is outside this process (a whatsapp-web.js/WhatsApp Web mismatch), and a
+    // restart loop would only add downtime. History backfill still runs on each connect, so the app
+    // keeps catching up even in this degraded state. Cleared only by a real event arriving.
+    if (bridgeRestarts >= MAX_BRIDGE_RESTARTS) return;
+    bridgeRestarts++;
+    restartClient('WhatsApp has newer activity than any event we received — the event bridge is dead, restarting', {
+      attempt: bridgeRestarts,
+      newestChatActivity: new Date(newestMs).toISOString(),
+      lastEventAt: new Date(lastEventAt).toISOString(),
+    });
+  };
   let probing = false; // catalogSync is async and the interval is not — never overlap two probes
   const watchdog = setInterval(() => {
+    checkFalseReady(); // runs even while "ready" — that is the whole point of it
     if (ready || probing) return;
     if (sawQr) return; // waiting on a human to scan — restarting would loop and lose the QR
     if (Date.now() - initAt < PROBE_AFTER_MS) return;
@@ -241,9 +375,11 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
 
   // 'message' fires for inbound messages only (not our own) — exactly the read-only surface we want.
   client.on('message', (msg) => {
+    sawEvent();
     Promise.resolve(handlers.onMessage(msg)).catch((err) => logger.error({ err }, 'onMessage failed'));
   });
   client.on('message_reaction', (reaction) => {
+    sawEvent();
     Promise.resolve(handlers.onReaction(reaction)).catch((err) =>
       logger.error({ err }, 'onReaction failed'),
     );
@@ -252,6 +388,7 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   // double-handle inbound (already covered by 'message'). Lets us persist the account's own replies.
   if (handlers.onSent) {
     client.on('message_create', (msg) => {
+      sawEvent(); // our own echo counts: it proves the bridge is still carrying traffic
       if (!msg.fromMe) return;
       Promise.resolve(handlers.onSent?.(msg)).catch((err) => logger.error({ err }, 'onSent failed'));
     });

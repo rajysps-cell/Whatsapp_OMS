@@ -21,6 +21,21 @@ db.exec(`
     chat_id      TEXT,
     processed_at INTEGER NOT NULL
   );
+  -- One row per SAVE, not per message. A single customer message is often filled in shifts: one
+  -- rep matches what they can and saves, another picks up what is left. The processed table keys
+  -- on message_id so it can only remember the last person and the last DDI number; this records
+  -- every save, so the thread can show who did which products and under which order number.
+  -- Deliberately alongside processed, which keeps driving isProcessed and the Report untouched.
+  CREATE TABLE IF NOT EXISTS save_batches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    chat_id    TEXT,
+    username   TEXT NOT NULL,
+    order_no   TEXT NOT NULL DEFAULT '',
+    items      TEXT,
+    saved_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_batches_msg ON save_batches(message_id);
   CREATE TABLE IF NOT EXISTS chat_names (
     chat_id    TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -118,6 +133,12 @@ for (const [table, col] of [
   ['aliases', "account TEXT NOT NULL DEFAULT ''"],
   ['messages', 'starred INTEGER NOT NULL DEFAULT 0'],
   ['messages', 'pinned INTEGER NOT NULL DEFAULT 0'],
+  // WHICH WhatsApp account captured this message. Load-bearing for privacy, not bookkeeping:
+  // a 1:1 chat_id IS the other person's jid, so the business's chat with someone and a personal
+  // account's chat with that SAME person collide on one chat_id. Without this column both
+  // accounts read one merged timeline (measured: 840 messages across 3 threads).
+  // Groups are exempt — a group message genuinely is one message both members can see.
+  ['messages', "account TEXT NOT NULL DEFAULT ''"],
 ] as const) {
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`);
@@ -125,6 +146,12 @@ for (const [table, col] of [
     /* column already exists */
   }
 }
+
+// The 1:1 privacy predicate, shared by every read that returns message content. A group row is
+// visible to any account holding the group; a 1:1 row only to the account that captured it.
+// Deliberately `= ?` and not `IN (?, '')`: legacy rows with no stamp stay invisible rather than
+// leaking to whoever asks first. They come back correctly stamped on the next history backfill.
+const ACCOUNT_SCOPE = '(is_group = 1 OR account = ?)';
 
 const insAlias = db.prepare(
   'INSERT OR IGNORE INTO aliases (phrase_norm, product_code, product_desc, created_at, alias_text, account) VALUES (?, ?, ?, ?, ?, ?)',
@@ -238,9 +265,12 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000, accoun
   const qq = ql.replace(/\s+/g, '');
   // Space-insensitive on top of substring: customers write "nohub", the catalog writes
   // "NO HUB" — both must find each other.
-  const matches = (code: string, desc: string, phrase: string): boolean => {
+  // One box searches everything on the row: SKU, our description, the customer's wording, WHO saved
+  // it, the DDI number, and the date as displayed — so "nate", "197327" and "aug 4" all work.
+  const matches = (code: string, desc: string, phrase: string, by = '', orderNo = '', ts = 0): boolean => {
     if (!ql) return true;
-    const hay = `${code} ${desc} ${phrase}`.toLowerCase();
+    const when = ts ? new Date(ts).toDateString().toLowerCase() : '';
+    const hay = `${code} ${desc} ${phrase} ${by} ${orderNo} ${when}`.toLowerCase();
     return hay.includes(ql) || hay.replace(/\s+/g, '').includes(qq);
   };
   const conds: string[] = [];
@@ -256,18 +286,22 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000, accoun
   for (const s of saved) {
     if (!s.items) continue;
     if (visible && !visible.has(s.chat_id ?? '')) continue;
-    let lines: Array<{ qty?: string; code?: string; description?: string; phrase?: string }>;
+    let lines: Array<{ qty?: string; code?: string; description?: string; phrase?: string; open?: boolean; uom?: string }>;
     try {
       lines = JSON.parse(s.items) as typeof lines;
     } catch {
       continue;
     }
     for (const l of lines) {
+      // Skip the rows that were still UNMATCHED at save time. They ride along in the saved blob so
+      // the Remaining button knows what is left, but they are not order lines — they have no SKU
+      // and showed up in this report as "(no code)".
+      if (l.open || !String(l.code ?? '').trim()) continue;
       const code = l.code ?? '';
       const desc = l.description ?? '';
       const phrase = l.phrase ?? '';
       seen.add(`${code}|${phrase.toLowerCase().trim()}`);
-      if (!matches(code, desc, phrase)) continue;
+      if (!matches(code, desc, phrase, s.processed_by ?? '', s.order_no ?? '', s.processed_at)) continue;
       all.push({
         code,
         description: desc,
@@ -318,8 +352,8 @@ export function reportRows(q: string, fromTs = 0, toTs = 0, limit = 2000, accoun
 
 // --- per-ACCOUNT chat membership ---------------------------------------------------------
 // Which WhatsApp account can see which chat. 'common' is the shared business WhatsApp; a
-// personal account is 'u<userId>'. Messages stay GLOBAL (deduped by msg id, so a group that
-// both accounts are in has one merged timeline) — only the chat LIST is filtered per account.
+// personal account is 'u<userId>'. Message ROWS are scoped too (messages.account): a group is
+// genuinely shared, a 1:1 never is — see the messages.account migration comment.
 const upsertAccountChat = db.prepare(
   'INSERT INTO account_chats (account, chat_id, seen_at) VALUES (?, ?, ?) ' +
     'ON CONFLICT(account, chat_id) DO UPDATE SET seen_at = excluded.seen_at',
@@ -332,20 +366,52 @@ export function recordAccountChats(account: string, chatIds: string[]): void {
   for (const id of chatIds) if (id && /@(g\.us|c\.us|lid)$/.test(id)) upsertAccountChat.run(account, id, now);
 }
 const hasMsgStmt = db.prepare(
-  "SELECT 1 FROM messages WHERE chat_id = ? AND (COALESCE(body, '') <> '' OR kind IN " +
+  "SELECT 1 FROM messages WHERE chat_id = ? AND " + ACCOUNT_SCOPE + " AND (COALESCE(body, '') <> '' OR kind IN " +
     "('image','video','audio','voice','document','sticker','ptv')) LIMIT 1",
 );
 /**
  * Does this chat contain anything a human would call a conversation? Call logs, "security code
  * changed" and other protocol rows do NOT count — a third of a personal account's synced chats
  * contained nothing else, and they showed up as raw-number ghosts in the list.
+ *
+ * Scoped per account: this decides catalog ADMISSION, so an unscoped answer let a bare contact
+ * entry in account A's address book become a full chat for A purely because account B had
+ * messages with that same person.
  */
-export function hasMessagesFor(chatId: string): boolean {
-  return hasMsgStmt.get(chatId) !== undefined;
+export function hasMessagesFor(chatId: string, account: string): boolean {
+  return hasMsgStmt.get(chatId, account) !== undefined;
 }
 const accountChatsStmt = db.prepare('SELECT chat_id FROM account_chats WHERE account = ?');
 export function chatsOfAccount(account: string): Set<string> {
+  if (!account) return new Set(); // no account = sees nothing (an unlinked personal user)
   return new Set((accountChatsStmt.all(account) as Array<{ chat_id: string }>).map((r) => r.chat_id));
+}
+// Membership has to SHRINK as well as grow. Without these, account_chats was a permanently
+// growing union: a chat deleted on the phone, or one belonging to a PREVIOUS number linked to
+// this same account slot, stayed visible forever.
+const pruneAccountChatsStmt = db.prepare('DELETE FROM account_chats WHERE account = ? AND seen_at < ?');
+export function pruneAccountChats(account: string, cutoff: number): number {
+  return Number(pruneAccountChatsStmt.run(account, cutoff).changes ?? 0);
+}
+/**
+ * Retire the messages captured by a PREVIOUS WhatsApp number on this account slot.
+ *
+ * 'common' is a slot, not a number: unlink it and link a different phone and both numbers' history
+ * carries the same stamp, so the old number's private conversations would surface inside the new
+ * one's threads for any customer they both talked to. Re-stamping (never deleting — order records,
+ * DDI numbers and attribution all point at these rows) keeps the history for audit while making it
+ * invisible to the account going forward.
+ */
+const retireStmt = db.prepare('UPDATE messages SET account = ? WHERE account = ?');
+export function retireAccountMessages(account: string, retiredTag: string): number {
+  if (!account || !retiredTag || account === retiredTag) return 0;
+  return Number(retireStmt.run(retiredTag, account).changes ?? 0);
+}
+const dropAccountStmt = db.prepare('DELETE FROM account_chats WHERE account = ?');
+/** Forget an account's chats outright: unlink, session stop, mode switch, or a different phone. */
+export function dropAccount(account: string): number {
+  if (!account) return 0;
+  return Number(dropAccountStmt.run(account).changes ?? 0);
 }
 
 // --- per-user read state -----------------------------------------------------------------
@@ -475,9 +541,14 @@ const setChatNameStmt = db.prepare(
 );
 const getChatNameStmt = db.prepare('SELECT name FROM chat_names WHERE chat_id = ?');
 
+// Was INSERT OR IGNORE. Still never overwrites captured content or our own flags (deleted,
+// starred, pinned) — the DO UPDATE touches exactly one column, and only when it is still blank.
+// That lets each session's history backfill CLAIM its own pre-existing rows on the next connect,
+// which is how messages saved before the account column existed get attributed without guessing.
 const insMessage = db.prepare(
-  'INSERT OR IGNORE INTO messages (msg_id, chat_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender) ' +
-    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  'INSERT INTO messages (msg_id, chat_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, account) ' +
+    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
+    "ON CONFLICT(msg_id) DO UPDATE SET account = excluded.account WHERE messages.account = ''",
 );
 // Latest message per chat (window fn), newest chat first. Powers the /match chat list.
 const listChatsStmt = db.prepare(`
@@ -486,6 +557,7 @@ const listChatsStmt = db.prepare(`
       COUNT(*) OVER (PARTITION BY chat_id) AS cnt,
       ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY ts DESC, msg_id DESC) AS rn
     FROM messages
+    WHERE ${ACCOUNT_SCOPE}
   ) WHERE rn = 1
   ORDER BY last_ts DESC
   LIMIT 1000
@@ -515,6 +587,7 @@ const chatMsgsStmt = db.prepare(`
     SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned
     FROM messages
     WHERE chat_id = ?
+      AND ${ACCOUNT_SCOPE}
       AND deleted = 0
       AND NOT (COALESCE(body, '') = '' AND kind IN (${SYSTEM_KINDS.map((k) => `'${k}'`).join(',')}))
     ORDER BY ts DESC, msg_id DESC LIMIT ?
@@ -598,6 +671,152 @@ export function isProcessed(messageId: string): boolean {
   return isProcessedStmt.get(messageId) !== undefined;
 }
 
+/**
+ * Put OUR account's reaction on a message, replacing whatever it had before.
+ *
+ * WhatsApp permits exactly one reaction per account per message: react again and the previous
+ * emoji is gone, not stacked. The thread showed both because we only ever learned about our own
+ * reactions from the echo, which does not reliably arrive — leaving a stale emoji next to the new
+ * one and implying one account had reacted twice.
+ */
+export function replaceOwnReaction(msgId: string, selfJid: string, emoji: string): void {
+  if (!msgId || !selfJid) return;
+  for (const jid of selfIdentities(selfJid)) {
+    delOwnReactionsStmt.run(msgId, jid, `${jid.split('@')[0]}:%`);
+  }
+  if (emoji) upsertReactionStmt.run(msgId, selfJid, emoji, Math.floor(Date.now() / 1000));
+}
+// Device suffixes: the same account appears as 123@lid and 123:7@lid depending on which linked
+// device produced the row, so clearing only the exact jid would leave a twin behind.
+const delOwnReactionsStmt = db.prepare(
+  'DELETE FROM reactions WHERE msg_id = ? AND (sender = ? OR sender LIKE ?)',
+);
+/**
+ * Every jid that IS us. One WhatsApp account has two forms — the phone-number id (…@c.us) and the
+ * lid (…@lid) — and which one appears depends on where the row came from: our own send reports the
+ * @c.us wid, WhatsApp's echo of that same reaction arrives as @lid. Treating only one as ours left
+ * the twin behind and the thread showed one account reacting twice, which WhatsApp does not allow.
+ * catalog_chats already pairs the two forms, so use it rather than guessing.
+ */
+function selfIdentities(selfJid: string): string[] {
+  const out = new Set<string>([selfJid]);
+  const bare = selfJid.split('@')[0] ?? '';
+  const rows = db
+    .prepare('SELECT chat_id, alt_id FROM catalog_chats WHERE chat_id = ? OR alt_id = ? OR chat_id LIKE ? OR alt_id LIKE ?')
+    .all(selfJid, selfJid, `${bare}@%`, `${bare}@%`) as Array<{ chat_id: string; alt_id: string | null }>;
+  for (const r of rows) {
+    if (r.chat_id) out.add(r.chat_id);
+    if (r.alt_id) out.add(r.alt_id);
+  }
+  return [...out];
+}
+
+/**
+ * Chats whose MESSAGES contain the search words — "where did that customer mention Uber?" rather
+ * than "which chat is called Uber". Returns one matching snippet per chat so the list can show why
+ * it matched. Account-scoped through the same predicate every other message read uses: a search
+ * must never surface text from a WhatsApp account the searcher cannot open.
+ */
+export function searchChatsByMessage(
+  q: string,
+  account: string,
+  limit = 60,
+): Map<string, { msgId: string; snippet: string }> {
+  const out = new Map<string, { msgId: string; snippet: string }>();
+  const needle = q.trim();
+  if (needle.length < 2 || !account) return out;
+  // LIKE with the wildcards bound as data, and ESCAPE so a customer searching "100%" or "3_4"
+  // gets those literal characters instead of wildcards.
+  const pat = `%${needle.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+  // msg_id and body ride alongside MAX(ts): SQLite documents that bare columns in an aggregate
+  // query come from the row that produced the max, so this is the NEWEST match per chat — which
+  // is the one to jump to.
+  const rows = db
+    .prepare(
+      `SELECT m.chat_id AS chat_id, m.msg_id AS msg_id, m.body AS body, MAX(m.ts) AS ts FROM messages m
+        WHERE m.body LIKE ? ESCAPE '\\' AND m.deleted = 0 AND ${ACCOUNT_SCOPE}
+          AND m.chat_id IN (SELECT chat_id FROM account_chats WHERE account = ?)
+        GROUP BY m.chat_id ORDER BY ts DESC LIMIT ?`,
+    )
+    .all(pat, account, account, limit) as Array<{ chat_id: string; msg_id: string; body: string | null }>;
+  for (const r of rows) {
+    const body = String(r.body ?? '');
+    const at = body.toLowerCase().indexOf(needle.toLowerCase());
+    const from = Math.max(0, at - 24);
+    out.set(r.chat_id, {
+      msgId: r.msg_id,
+      snippet: (from ? '…' : '') + body.slice(from, from + 90).replace(/\s+/g, ' ').trim(),
+    });
+  }
+  return out;
+}
+
+// --- save batches: who filled which products, and under which order number ----------------
+export interface SaveBatch {
+  id: number;
+  by: string;
+  orderNo: string;
+  items: unknown[];
+  at: number;
+}
+const insBatch = db.prepare(
+  'INSERT INTO save_batches (message_id, chat_id, username, order_no, items, saved_at) VALUES (?, ?, ?, ?, ?, ?)',
+);
+/** Record one save. Returns the row id so the DDI number can be stamped onto exactly this save. */
+export function addSaveBatch(messageId: string, chatId: string, username: string, itemsJson: string): number {
+  if (!messageId || !username) return 0;
+  return Number(insBatch.run(messageId, chatId || null, username, '', itemsJson || null, Date.now()).lastInsertRowid ?? 0);
+}
+// The DDI number arrives AFTER the save (the rep pastes into DDI and gets a number back), so it
+// lands on that user's own still-unnumbered saves — never on someone else's half of the order.
+const stampBatchStmt = db.prepare(
+  "UPDATE save_batches SET order_no = ? WHERE message_id = ? AND username = ? AND order_no = ''",
+);
+export function stampBatchOrderNo(messageIds: string[], username: string, orderNo: string): number {
+  let n = 0;
+  for (const id of messageIds) n += Number(stampBatchStmt.run(orderNo, id, username).changes);
+  return n;
+}
+const batchesStmt = db.prepare(
+  'SELECT id, username, order_no, items, saved_at FROM save_batches WHERE message_id = ? ORDER BY saved_at ASC, id ASC',
+);
+export function saveBatchesFor(messageId: string): SaveBatch[] {
+  return (batchesStmt.all(messageId) as Array<{ id: number; username: string; order_no: string; items: string | null; saved_at: number }>)
+    .map((r) => {
+      let items: unknown[] = [];
+      try {
+        const p: unknown = JSON.parse(r.items || '[]');
+        if (Array.isArray(p)) items = p;
+      } catch {
+        /* a malformed blob must not break the whole thread */
+      }
+      return { id: r.id, by: r.username, orderNo: r.order_no || '', items, at: r.saved_at };
+    });
+}
+/** All batches for a chat, keyed by message — one query per thread render, not one per bubble. */
+export function saveBatchesForChat(chatId: string): Map<string, SaveBatch[]> {
+  const rows = db
+    .prepare(
+      'SELECT b.message_id AS mid, b.id, b.username, b.order_no, b.items, b.saved_at FROM save_batches b ' +
+        'JOIN messages m ON m.msg_id = b.message_id WHERE m.chat_id = ? ORDER BY b.saved_at ASC, b.id ASC',
+    )
+    .all(chatId) as Array<{ mid: string; id: number; username: string; order_no: string; items: string | null; saved_at: number }>;
+  const out = new Map<string, SaveBatch[]>();
+  for (const r of rows) {
+    let items: unknown[] = [];
+    try {
+      const p: unknown = JSON.parse(r.items || '[]');
+      if (Array.isArray(p)) items = p;
+    } catch {
+      /* ignore */
+    }
+    const arr = out.get(r.mid) ?? [];
+    arr.push({ id: r.id, by: r.username, orderNo: r.order_no || '', items, at: r.saved_at });
+    out.set(r.mid, arr);
+  }
+  return out;
+}
+
 export function setChatName(chatId: string, name: string): void {
   if (!chatId || !name) return;
   setChatNameStmt.run(chatId, name, Date.now());
@@ -671,21 +890,28 @@ const mentionFromMsgsStmt = db.prepare(`
          push_name AS name, COUNT(*) AS n
     FROM messages
    WHERE instr(sender, '@') > 1 AND trim(COALESCE(push_name, '')) <> ''
+     AND ${ACCOUNT_SCOPE}
    GROUP BY id, name
 `);
+// Scoped to the caller's own chats. This map used to be a GLOBAL contact directory built from every
+// catalog row: 578 of the ids in it belonged to one personal account (family, neighbours, a child's
+// class group) and were served to all six business staff on every 4-second thread poll.
 const mentionFromCatalogStmt = db.prepare(`
   SELECT substr(chat_id, 1, instr(chat_id, '@') - 1) AS id, name FROM catalog_chats
    WHERE is_group = 0 AND instr(chat_id, '@') > 1 AND trim(COALESCE(name, '')) <> ''
+     AND chat_id IN (SELECT chat_id FROM account_chats WHERE account = ?)
   UNION ALL
   SELECT substr(alt_id, 1, instr(alt_id, '@') - 1) AS id, name FROM catalog_chats
    WHERE is_group = 0 AND instr(COALESCE(alt_id, ''), '@') > 1 AND trim(COALESCE(name, '')) <> ''
+     AND chat_id IN (SELECT chat_id FROM account_chats WHERE account = ?)
 `);
 
 // Who can be @-mentioned in a given chat. WhatsApp's own participant list isn't reachable (the
 // Store APIs are broken), so derive it from everyone who has actually spoken in the chat — which
 // is exactly who staff would want to tag.
 const chatSendersStmt = db.prepare(
-  "SELECT sender, MAX(ts) AS last_ts FROM messages WHERE chat_id = ? AND sender <> '' AND from_me = 0 GROUP BY sender ORDER BY last_ts DESC",
+  "SELECT sender, MAX(ts) AS last_ts FROM messages WHERE chat_id = ? AND " + ACCOUNT_SCOPE +
+    " AND sender <> '' AND from_me = 0 GROUP BY sender ORDER BY last_ts DESC",
 );
 
 export interface Participant {
@@ -696,11 +922,11 @@ export interface Participant {
   name: string;
 }
 
-export function chatParticipants(chatId: string): Participant[] {
-  const names = mentionNames();
+export function chatParticipants(chatId: string, account: string): Participant[] {
+  const names = mentionNames(account);
   const seen = new Set<string>();
   const out: Participant[] = [];
-  for (const r of chatSendersStmt.all(chatId) as Array<{ sender: string; last_ts: number }>) {
+  for (const r of chatSendersStmt.all(chatId, account) as Array<{ sender: string; last_ts: number }>) {
     const jid = r.sender;
     const at = jid.indexOf('@');
     if (at < 1) continue;
@@ -713,23 +939,26 @@ export function chatParticipants(chatId: string): Participant[] {
   return out;
 }
 
-let mentionCache: { at: number; map: Record<string, string> } | null = null;
+// Cached PER ACCOUNT — one shared cache would hand the first caller's directory to everyone,
+// which is the very leak this scoping exists to close.
+const mentionCache = new Map<string, { at: number; map: Record<string, string> }>();
 
-/** id -> display name for @mentions. Cached for 60s. */
-export function mentionNames(): Record<string, string> {
-  if (mentionCache && Date.now() - mentionCache.at < 60_000) return mentionCache.map;
+/** id -> display name for @mentions, limited to chats this account can see. Cached for 60s. */
+export function mentionNames(account: string): Record<string, string> {
+  const hit = mentionCache.get(account);
+  if (hit && Date.now() - hit.at < 60_000) return hit.map;
   const map: Record<string, string> = {};
   // Catalog names first (stable contact names), then the most-frequent pushName wins any gap.
-  for (const r of mentionFromCatalogStmt.all() as Array<{ id: string; name: string }>) {
+  for (const r of mentionFromCatalogStmt.all(account, account) as Array<{ id: string; name: string }>) {
     if (r.id && r.name && !map[r.id]) map[r.id] = r.name;
   }
-  const byCount = (mentionFromMsgsStmt.all() as Array<{ id: string; name: string; n: number }>).sort(
+  const byCount = (mentionFromMsgsStmt.all(account) as Array<{ id: string; name: string; n: number }>).sort(
     (a, b) => b.n - a.n,
   );
   for (const r of byCount) {
     if (r.id && r.name && !map[r.id]) map[r.id] = r.name;
   }
-  mentionCache = { at: Date.now(), map };
+  mentionCache.set(account, { at: Date.now(), map });
   return map;
 }
 
@@ -740,6 +969,8 @@ function tail(id: string): string {
 export interface SaveMsg {
   messageId: string;
   chatId: string;
+  /** WhatsApp account that captured it: 'common' or 'u<userId>'. Required — see the column comment. */
+  account: string;
   sender: string;
   pushName?: string;
   text?: string;
@@ -768,6 +999,7 @@ export function saveMessage(m: SaveMsg): void {
     m.replyTo ?? null,
     m.replyText ?? null,
     m.replySender ?? null,
+    m.account,
   );
 }
 
@@ -803,8 +1035,8 @@ export function saveReaction(msgId: string, sender: string, emoji: string, ts: n
  * catalog synced from WhatsApp Web's IndexedDB (so every chat appears even before any
  * message is captured). Title priority: manual/learned name > WhatsApp name > id tail.
  */
-export function listChats(): ChatRow[] {
-  const captured = listChatsStmt.all() as Array<{
+export function listChats(account: string): ChatRow[] {
+  const captured = listChatsStmt.all(account) as Array<{
     chat_id: string;
     is_group: number;
     cnt: number;
@@ -863,8 +1095,8 @@ export function listChats(): ChatRow[] {
 }
 
 /** Recent persisted history for one chat, chronological. */
-export function chatMessages(chatId: string, limit: number): MsgRow[] {
-  const rows = chatMsgsStmt.all(chatId, limit) as Array<{
+export function chatMessages(chatId: string, limit: number, account: string): MsgRow[] {
+  const rows = chatMsgsStmt.all(chatId, account, limit) as Array<{
     msg_id: string;
     sender: string | null;
     push_name: string | null;

@@ -322,6 +322,9 @@ export function matchItem(
       imageUrl: '',
       stock: 0,
       norm: normalize(alias.desc),
+      // A learned alias can name a code the catalog no longer carries; assume the common unit.
+      uom: 'EA',
+      uoms: ['EA'],
     };
     return { matched: product, suggestions: genuine(top) };
   }

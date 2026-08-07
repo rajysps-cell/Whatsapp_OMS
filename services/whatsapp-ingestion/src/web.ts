@@ -70,8 +70,13 @@ import {
   getAliasRow,
   getMessage,
   getSetting,
+  addSaveBatch,
+  replaceOwnReaction,
   chatParticipants,
   chatsOfAccount,
+  saveBatchesForChat,
+  searchChatsByMessage,
+  stampBatchOrderNo,
   isProcessed,
   listActivity,
   logActivity,
@@ -165,8 +170,36 @@ const EMO_CATALOG: Array<[string, string]> = [
 ,
 ["😃","big smile happy"],["😄","smile eyes happy"],["😆","laughing squint xd"],["🙃","upside down silly"],["😋","yummy tasty tongue"],["😛","tongue out playful"],["🤪","zany crazy wild"],["🧐","monocle inspect"],["🤓","nerd glasses"],["🥸","disguise glasses moustache"],["😏","smirk sly"],["😒","unamused annoyed"],["😞","disappointed sad"],["😔","pensive sad"],["😟","worried concerned"],["😕","confused unsure"],["🙁","frown slightly sad"],["☹️","frowning sad"],["😣","persevering struggling"],["😖","confounded frustrated"],["😫","tired exhausted"],["🥱","yawn bored sleepy"],["😩","weary tired"],["🥺","pleading puppy eyes please"],["😨","fearful scared"],["😰","anxious sweat nervous"],["😱","scream shocked horror"],["😳","flushed embarrassed blush"],["🤭","giggle hand over mouth oops"],["🤫","shush quiet secret"],["🤥","lying pinocchio"],["😶","no mouth speechless"],["😬","grimacing awkward"],["🙄","rolling eyes whatever"],["😪","sleepy tear"],["🤤","drooling"],["😷","mask sick"],["🤧","sneezing tissue"],["🥵","hot sweating heat"],["🥶","cold freezing blue"],["😵","dizzy knocked out"],["🤠","cowboy hat yeehaw"],["😈","devil smiling horns"],["👻","ghost boo"],["💀","skull dead"],["👽","alien ufo"],["🤖","robot bot"],["💩","poop"],["🙈","see no evil monkey"],["🙉","hear no evil monkey"],["🙊","speak no evil monkey"],["🐶","dog puppy"],["🐱","cat kitten"],["🦁","lion"],["🐯","tiger"],["🐮","cow"],["🐷","pig"],["🐸","frog"],["🐵","monkey"],["🐔","chicken"],["🦅","eagle bird"],["🦉","owl"],["🐺","wolf"],["🐴","horse"],["🦄","unicorn"],["🐝","bee"],["🦋","butterfly"],["🐢","turtle slow"],["🐍","snake"],["🐘","elephant"],["🐬","dolphin"],["🐳","whale"],["🦈","shark"],["🌹","rose flower love"],["🌻","sunflower"],["🌸","blossom flower pink"],["🌈","rainbow"],["🌙","moon night"],["💎","diamond gem"],["🎈","balloon party"],["🎁","gift present"],["🏠","house home"],["🚀","rocket launch fast"],["✈️","airplane travel"],["🚢","ship boat"],["🍎","apple fruit"],["🍌","banana"],["🍇","grapes"],["🍉","watermelon"],["🍩","donut"],["🍦","icecream"],["🍺","beer cheers"],["🥂","cheers champagne toast"],["⚽","soccer football"],["🏀","basketball"],["🏏","cricket bat"],["🎮","game controller"],["🎵","music note"],["🎤","microphone sing"],["📷","camera photo"],["💡","bulb idea light"],["🔔","bell notification"],["📢","announce loudspeaker"],["🙋","raising hand me"],["💃","dancing woman"],["🕺","dancing man"],["👑","crown king queen"],["💍","ring engagement"],["🧿","evil eye nazar"],["🕉️","om hindu"],["🙏🏻","thanks pray light"],["👍🏻","thumbs up light"],["👍🏽","thumbs up medium"]];
 
-/** Fallback save-emojis for users the admin gave none — distinct per user id, stable. */
-const EMOJI_POOL = ['✅', '👍', '🆗', '⭐', '✔️', '🟢', '💚', '🔵', '🟣', '🟠'] as const;
+/**
+ * Save-emojis handed out to users the admin gave none. Deliberately wide: the old 10-emoji list was
+ * indexed by `user.id % 10`, which both COLLIDED (admin was ✅ and Shulem, id 10, also got ✅) and
+ * was never written down, so it was recomputed on every save instead of belonging to the person.
+ * Visually distinct from each other at bubble size — the whole point is telling people apart.
+ */
+const EMOJI_POOL = [
+  '✅', '🔵', '🟢', '🟣', '🟠', '🔴', '🟡', '🟤', '⭐', '💚',
+  '💙', '💜', '🧡', '❤️', '🔶', '🔷', '🟩', '🟦', '🟪', '🟧',
+  '🎯', '🔖', '📌', '🏁', '🥇', '🥈', '🥉', '🌟', '⚡', '🔥',
+] as const;
+/**
+ * The emoji that belongs to this user, assigning one the first time they need it.
+ *
+ * Picks the first emoji nobody else holds, then SAVES it, so it is theirs from then on rather than
+ * being recomputed each save. An admin can still change it on the Users page; clearing that field
+ * is how you ask for a fresh one.
+ */
+function saveEmojiFor(me: User): string {
+  if (me.emoji) return me.emoji;
+  const taken = new Set(listUsers().map((u) => u.emoji).filter(Boolean));
+  const pick = EMOJI_POOL.find((e) => !taken.has(e)) ?? EMOJI_POOL[me.id % EMOJI_POOL.length]!;
+  try {
+    updateUser(me.id, { emoji: pick });
+    logger.info({ user: me.username, emoji: pick }, 'save-emoji assigned');
+  } catch (err) {
+    logger.warn({ err, user: me.username }, 'could not store the assigned save-emoji');
+  }
+  return pick;
+}
 const extractClaims = new Map<string, { username: string; at: number }>();
 function lockMs(): number {
   return Math.max(1, Number(getSetting('extract.lockMinutes', '5')) || 5) * 60_000;
@@ -191,9 +224,22 @@ function waStateFor(me: User): { status: string; qr: string | null } {
   }
   return { status, qr: null };
 }
-/** Which account's chats this user sees. */
+/** Which account a user's actions and saved work belong TO. Never blank — this is attribution. */
 function accountFor(me: User): string {
   return me.waMode === 'personal' ? `u${me.id}` : 'common';
+}
+/**
+ * Which account's chats this user may READ — '' (nothing) while a personal user's own WhatsApp is
+ * not connected. Membership is a snapshot on disk, so without this an unlinked personal user kept
+ * full read access to every chat their phone had ever synced.
+ *
+ * Deliberately NOT applied to 'common': a five-minute business reconnect would blank the chat list
+ * for all six staff mid-shift. The business account's membership is refreshed and pruned by its own
+ * catalog sweeps instead.
+ */
+function visibleAccount(me: User): string {
+  if (me.waMode !== 'personal') return 'common';
+  return waStateFor(me).status === 'connected' ? `u${me.id}` : '';
 }
 /**
  * JSON for embedding inside a <script> block. JSON.stringify alone does not escape `</script>`,
@@ -213,7 +259,7 @@ function jsIn(v: unknown): string {
  * user dump a personal user's private chats through /api/extract and stream their media.
  */
 function canSeeChat(me: User, chatId: string): boolean {
-  return !!chatId && chatsOfAccount(accountFor(me)).has(chatId);
+  return !!chatId && chatsOfAccount(visibleAccount(me)).has(chatId);
 }
 /** Same gate, resolved from a message id (unknown message = refuse). */
 function canSeeMessage(me: User, messageId: string): boolean {
@@ -308,6 +354,17 @@ const NAV_CSS = `
   .navlink{color:#667781;text-decoration:none;font-size:13px;font-weight:600;margin-left:2px;padding:6px 11px;border-radius:8px;white-space:nowrap}
   .navlink:hover{background:#f0f2f5;color:#111b21}
   .navlink.cur{background:#e7f8f2;color:#059669}
+  /* On a phone the nav is wider than the screen; let it wrap instead of dragging the whole page sideways. */
+  @media (max-width:860px){header{flex-wrap:wrap;gap:6px 8px;padding:9px 12px}}
+`;
+/** Clickable column headers: a dim up/down arrow that turns green and points once the column sorts. */
+const SORT_CSS = `
+  th.sortable{cursor:pointer;user-select:none;position:relative;padding-right:20px}
+  th.sortable:hover{background:#f1f5f9;color:#111b21}
+  th.sortable::after{content:"\\2195";position:absolute;right:6px;opacity:.3;font-size:11px}
+  th.sortable.sorted::after{opacity:1;color:#059669}
+  th.sortable.sorted[data-dir="asc"]::after{content:"\\2191"}
+  th.sortable.sorted[data-dir="desc"]::after{content:"\\2193"}
 `;
 /**
  * Boot-time self-check: render each page and parse its inline <script> blocks. Catches the
@@ -1081,7 +1138,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Account-scoped like everything else: order cards carry chat ids, message ids, sender names
     // and message text, so a personal user must not receive the business account's cards (or the
     // reverse). No role check is enough here — the scope is the account, not the role.
-    const visibleOrders = chatsOfAccount(accountFor(me));
+    const visibleOrders = chatsOfAccount(visibleAccount(me));
     json(res, 200, {
       status: waStateFor(me).status,
       ts: Math.floor(Date.now() / 1000),
@@ -1147,7 +1204,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         : mid
           ? [mid]
           : [];
-      const msgs = chatStoreRef.messages(cid);
+      const msgs = chatStoreRef.messages(cid, visibleAccount(me));
       // With messageId(s): extract ONLY those bubbles (also serves as Reprocess for processed ones).
       // Without: all inbound customer messages not yet processed. Nothing is marked here —
       // marking happens on explicit /api/save, so unsaved extractions can be re-run.
@@ -1183,9 +1240,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       json(res, 403, { ok: false, error: 'This chat is not on your WhatsApp account.' });
       return;
     }
-    const itemsJson = JSON.stringify(body['items'] ?? []);
+    const allItems = Array.isArray(body['items']) ? (body['items'] as Array<Record<string, unknown>>) : [];
+    // `processed` is the record of what was ORDERED, so the still-unmatched rows are stripped here.
+    // They stay in the save batch below, which is where the Remaining button reads them from.
+    const itemsJson = JSON.stringify(allItems.filter((x) => x && !x['open'] && String(x['code'] ?? '').trim()));
     let saved = 0;
-    const who = me.name || me.username; // attribute the completed order to whoever clicked Copy
+    // The USERNAME, not the display name: the badge has to name the login people recognise
+    // ("admin", "raj", "ruturaj"), and it is also what the browser compares against to decide
+    // whether a badge is your own and therefore double-clickable.
+    const who = me.username;
     if (!srcs.every((s) => !s || typeof s.messageId !== 'string' || !s.messageId || canSeeMessage(me, s.messageId))) {
       json(res, 403, { ok: false, error: 'Those messages are not on your WhatsApp account.' });
       return;
@@ -1193,6 +1256,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     for (const s of srcs) {
       if (s && typeof s.messageId === 'string' && s.messageId) {
         saveExtraction(s.messageId, cid, typeof s.text === 'string' ? s.text : '', itemsJson, who);
+        // …and separately, THIS save as its own batch: an order filled in shifts keeps one badge
+        // per person, so nobody's half is overwritten by whoever saves last. Only the products
+        // belonging to THIS message go in its batch — one order can span several messages.
+        const mine = allItems.filter((x) => x && typeof x['mid'] === 'string' && x['mid'] === s.messageId);
+        addSaveBatch(s.messageId, cid, who, JSON.stringify(mine));
         saved++;
       }
     }
@@ -1267,13 +1335,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     json(res, 200, { status: st.status, qr: qrDataUrlMine });
     return;
   }
+  // Search the CONTENT of messages, not just chat names. Same account scope as the thread itself.
+  if (path === '/api/chats/search') {
+    const q = (u.searchParams.get('q') ?? '').slice(0, 80);
+    const hits = searchChatsByMessage(q, visibleAccount(me), 60);
+    json(res, 200, { q, hits: [...hits].map(([chatId, h]) => ({ chatId, msgId: h.msgId, snippet: h.snippet })) });
+    return;
+  }
   if (path === '/api/chats') {
     // A personal-mode user's session spins up lazily the first time they land here.
     if (me.waMode === 'personal') personalWaRef?.ensure(me);
     // Each user sees ONLY their account's chats: personal users their own linked WhatsApp's,
     // everyone else the shared business account's. Membership comes from each session's catalog.
-    const visible = chatsOfAccount(accountFor(me));
-    const list = (chatStoreRef ? chatStoreRef.chats() : []).filter((c) => visible.has(c.id));
+    const acct = visibleAccount(me);
+    const visible = chatsOfAccount(acct);
+    const list = (chatStoreRef ? chatStoreRef.chats(acct) : []).filter((c) => visible.has(c.id));
     // Unread is PER USER: everything since THIS user's own read marker — one user reading a chat
     // does not clear it for anyone else. (WhatsApp's own unread no longer drives the badge.)
     const mine = unreadCountsFor(me.id);
@@ -1371,11 +1447,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Same account gate as the thread itself: this returns real people's names, so a chat the
     // caller's WhatsApp account cannot see must not answer here either. (Found by audit: the
     // messages endpoint was guarded, this sibling was not.)
-    if (!chatsOfAccount(accountFor(me)).has(pid)) {
+    if (!canSeeChat(me, pid)) {
       json(res, 403, { error: 'This chat is not on your WhatsApp account.' });
       return;
     }
-    json(res, 200, { participants: chatParticipants(pid) });
+    json(res, 200, { participants: chatParticipants(pid, visibleAccount(me)) });
     return;
   }
   const mm = path.match(/^\/api\/chats\/(.+)\/messages$/);
@@ -1387,13 +1463,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     // Both directions of privacy: a personal user cannot open the business chats, and nobody on
     // the business account can open a personal user's chats.
-    if (!chatsOfAccount(accountFor(me)).has(id)) {
+    if (!canSeeChat(me, id)) {
       json(res, 403, { error: 'This chat is not on your WhatsApp account.' });
       return;
     }
-    const msgs = chatStoreRef ? chatStoreRef.messages(id) : [];
+    const msgs = chatStoreRef ? chatStoreRef.messages(id, visibleAccount(me)) : [];
     markChatRead(me.id, id); // opening (and keeping open — this polls) marks the chat read for ME only
     const orderNos = orderNoOf(id); // DDI order numbers typed after Copy, keyed by message
+    const batches = saveBatchesForChat(id); // every save per message: who, which products, which DDI
     // Who is working which message right now — drives the "X is working on this" badge.
     claimsSweep();
     const claims: Record<string, string> = {};
@@ -1402,11 +1479,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (c) claims[m.messageId] = c.username;
     }
     json(res, 200, {
-      mentions: mentionNames(), // '@<id>' in a body -> display name
+      mentions: mentionNames(visibleAccount(me)), // '@<id>' in a body -> display name
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
       claims, // messageId -> username currently extracting it (the lock)
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId) })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, orderNo: orderNos.get(m.messageId), batches: batches.get(m.messageId) ?? [] })),
     });
     return;
   }
@@ -1733,6 +1810,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     const n = setOrderNo(ids, orderNo);
+    // Stamp the number on THIS user's own unnumbered saves only — never on the other half of a
+    // shift-filled order. One user saving twice keeps both numbers; the badge lists them together.
+    stampBatchOrderNo(ids, me.username, orderNo);
     logger.info({ user: me.username, orderNo, messages: n }, 'DDI order number saved');
     logActivity(me.username, 'ddi-number', `#${orderNo} on ${n} message(s)`, clientIp(req));
     // Save COMPLETES the order: the extraction lock is released for everyone…
@@ -1740,13 +1820,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // …and the saver's emoji lands on the customer's message in real WhatsApp (meeting 04-08).
     // Best-effort: a reaction failure must never fail the save. On the shared account only one
     // reaction can exist per message — a later saver's emoji replaces it, as agreed.
-    const saveEmoji = me.emoji || EMOJI_POOL[me.id % EMOJI_POOL.length]!;
+    const saveEmoji = saveEmojiFor(me);
     const vrx = viaFor(me);
     if (reactFn && vrx.ok && waStateFor(me).status === 'connected') {
       for (const mid of ids) {
-        void reactFn(mid, saveEmoji, vrx.via).catch((err) =>
-          logger.warn({ err, mid }, 'save-emoji reaction failed'),
-        );
+        void reactFn(mid, saveEmoji, vrx.via)
+          .then(() => {
+            // Record OUR OWN reaction ourselves. WhatsApp allows one reaction per account per
+            // message, so this replaces whatever this account had on it — exactly what WhatsApp
+            // does. Waiting for the echo is not good enough: it does not always arrive, and the
+            // thread then showed two emojis for one account, which is impossible in WhatsApp.
+            const selfJid = getSetting(`wa.self.${accountFor(me)}`, '');
+            if (selfJid) replaceOwnReaction(mid, selfJid, saveEmoji);
+          })
+          .catch((err) => logger.warn({ err, mid }, 'save-emoji reaction failed'));
       }
     }
     json(res, 200, { ok: true, updated: n, emoji: saveEmoji });
@@ -2099,12 +2186,21 @@ function adminPage(me: User): string {
   ${NAV_CSS}
   .navlink:hover{text-decoration:underline}
   .who{font-size:12px;color:var(--mut)}
-  .wrap{max-width:960px;margin:0 auto;padding:22px 18px 60px}
+  /* Wider than the other admin pages: this table carries nine columns and a three-button action
+     cell. At the old 960px cap the content box was 924px — narrower than the table itself, so it
+     scrolled on every screen, however big the monitor. */
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 18px 60px}
   .bar{display:flex;align-items:center;gap:10px;margin-bottom:14px}
   .bar h2{font-size:14px;margin:0;font-weight:700}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px #0000000f;overflow:hidden}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line);vertical-align:middle}
+  /* overflow-x:auto, not hidden: with the Save-emoji column added the fixed widths can exceed a
+     narrow window, and hidden silently CLIPPED the last column so Delete appeared cut in half.
+     Scrolling shows all of it; the tighter cell padding means it usually does not need to. */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px #0000000f;overflow-x:auto}
+  /* min-width is the point below which columns would start crushing into each other — NOT a target
+     width. It must stay under the page's content box or the table scrolls even on a large screen. */
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:880px}
+  th,td{text-align:left;padding:11px 9px;border-bottom:1px solid var(--line);vertical-align:middle}
+  th:first-child,td:first-child{padding-left:13px} th:last-child,td:last-child{padding-right:13px}
   th{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);font-weight:700;background:#fafbfc}
   tr:last-child td{border-bottom:0}
   .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px}
@@ -2160,8 +2256,9 @@ function adminPage(me: User): string {
   <div class="bar"><h2>Users</h2><span class="muted" id="count"></span><div class="spacer"></div>
     <button class="btn" id="addbtn">+ Add user</button></div>
   <div class="card"><table><thead><tr>
-    <th>Username</th><th>Name</th><th>Email</th><th style="width:96px">Role</th><th style="width:100px">WhatsApp</th><th style="width:96px">Status</th>
-    <th style="width:150px">Last sign-in</th><th style="width:270px"></th>
+    <th>Username</th><th>Name</th><th>Email</th><th style="width:96px">Role</th><th style="width:100px">WhatsApp</th>
+    <th style="width:78px" title="Reacted onto the customer's message when this user saves an order">Save emoji</th><th style="width:96px">Status</th>
+    <th style="width:132px">Last sign-in</th><th style="width:238px"></th>
   </tr></thead><tbody id="tb"></tbody></table></div>
   <p class="muted" style="margin-top:14px">New users must set their own password at first sign-in. Disabling a user
     immediately signs them out everywhere. Signing in from a new browser emails the user a 6-digit code —
@@ -2220,7 +2317,12 @@ function render(){
       '<td>'+esc(u.name||"—")+'</td>'+
       '<td>'+(u.email?esc(u.email):'<span class="pill off" title="No email — this user signs in WITHOUT a verification code. Add one.">no 2FA</span>')+'</td>'+
       '<td><span class="pill '+(u.role==="admin"?"admin":"user")+'">'+(u.role==="admin"?"Admin":"User")+'</span></td>'+
-      '<td><span class="pill '+(u.waMode==="personal"?"admin":"user")+'" title="'+(u.waMode==="personal"?"Links their own WhatsApp":"Uses the shared business WhatsApp")+'">'+(u.waMode==="personal"?"Personal":"Common")+'</span>'+(u.emoji?' <span title="save-emoji">'+esc(u.emoji)+'</span>':'')+'</td>'+
+      '<td><span class="pill '+(u.waMode==="personal"?"admin":"user")+'" title="'+(u.waMode==="personal"?"Links their own WhatsApp":"Uses the shared business WhatsApp")+'">'+(u.waMode==="personal"?"Personal":"Common")+'</span></td>'+
+      // Its own column now. Blank means nobody has picked one — the first order they save assigns
+      // an unused emoji and keeps it, so "auto" is a promise rather than an empty cell.
+      '<td style="text-align:center">'+(u.emoji
+        ? '<span style="font-size:16px" title="Reacted onto the customer\\'s message when '+esc(u.username)+' saves an order">'+esc(u.emoji)+'</span>'
+        : '<span class="muted" title="No emoji chosen yet — one will be assigned automatically the first time this user saves an order">auto</span>')+'</td>'+
       '<td><span class="pill '+(u.active?"on":"off")+'">'+(u.active?"Active":"Disabled")+'</span></td>'+
       '<td class="muted">'+when(u.lastLogin)+'</td>'+
       '<td><div class="acts">'+
@@ -2558,6 +2660,7 @@ function reportPage(me: User): string {
   .scroll{overflow-x:auto}
   table{width:100%;border-collapse:collapse;font-size:13px;min-width:760px}
   th{background:#f8fafc;text-align:left;padding:9px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--mut);border-bottom:1px solid var(--line);white-space:nowrap}
+  ${SORT_CSS}
   td{padding:8px 12px;border-bottom:1px solid #f1f5f9;vertical-align:top}
   tr:last-child td{border-bottom:0}
   .code{font-family:ui-monospace,Consolas,monospace;font-weight:700;color:var(--blue);white-space:nowrap}
@@ -2573,15 +2676,20 @@ function reportPage(me: User): string {
   ${navHtml(me, '/report')}</header>
 <div class="wrap">
   <div class="bar">
-    <input type="text" id="q" placeholder="search SKU or description… (e.g. AC, NHC, coupling)" autocomplete="off">
+    <input type="text" id="q" placeholder="search SKU, product, wording, user, DDI #, date…" autocomplete="off">
     <input type="date" id="from" title="From date"><span class="muted">to</span><input type="date" id="to" title="To date">
     <button class="btn ghost" id="exportbtn" disabled>Export selected (0)</button>
   </div>
   <div class="bar"><span class="muted" id="count"></span></div>
   <div class="card"><div class="scroll"><table><thead><tr>
     <th style="width:34px"><input type="checkbox" id="all" title="Select every product shown"></th>
-    <th style="width:130px">SKU</th><th style="width:26%">Our product</th><th>Customer wrote</th>
-    <th style="width:50px">Qty</th><th style="width:110px">Date</th><th style="width:90px">Saved by</th><th style="width:100px">DDI #</th>
+    <th style="width:130px" class="sortable" data-sort="code">SKU</th>
+    <th style="width:26%" class="sortable" data-sort="desc">Our product</th>
+    <th class="sortable" data-sort="phrase">Customer wrote</th>
+    <th style="width:50px" class="sortable" data-sort="qty">Qty</th>
+    <th style="width:110px" class="sortable" data-sort="ts">Date</th>
+    <th style="width:90px" class="sortable" data-sort="by">Saved by</th>
+    <th style="width:100px" class="sortable" data-sort="orderNo">DDI #</th>
   </tr></thead><tbody id="tb"></tbody></table></div></div>
 </div>
 <script>
@@ -2601,6 +2709,45 @@ function syncExport(){
 // GROUPED BY PRODUCT: a popular SKU that matched many different customer wordings shows ONCE,
 // with every wording as a sub-row under it — not repeated down the page. Most-matched first.
 // The date range is applied by the server, so a group only ever contains in-range lines.
+// Column sorting. The table is GROUPED by product (one block per SKU, rowspan on the left), so
+// sorting reorders the blocks — a line-level column sorts by that block's most recent line, which
+// is what "sort by date" means when a product has ten lines across three days.
+var sortCol="",sortDir=1;
+function sortGroups(){
+  var val=function(k){
+    var g=groups[k],ls=g.lines;
+    if(sortCol==="code")return k.toLowerCase();
+    if(sortCol==="desc")return String(g.desc||"").toLowerCase();
+    if(sortCol==="phrase")return String(ls[0].phrase||"").toLowerCase();
+    if(sortCol==="qty")return Math.max.apply(null,ls.map(function(l){return parseFloat(l.qty)||0;}));
+    if(sortCol==="ts")return Math.max.apply(null,ls.map(function(l){return l.ts||0;}));
+    if(sortCol==="by")return String((ls.find(function(l){return l.by;})||{}).by||"").toLowerCase();
+    if(sortCol==="orderNo")return String((ls.find(function(l){return l.orderNo;})||{}).orderNo||"").toLowerCase();
+    return null;
+  };
+  if(!sortCol){ // default: busiest product first, then most recent
+    gorder.sort(function(a,b){return groups[b].lines.length-groups[a].lines.length||(groups[b].lines[0].ts-groups[a].lines[0].ts);});
+    return;
+  }
+  gorder.sort(function(a,b){
+    var x=val(a),y=val(b);
+    if(typeof x==="number"&&typeof y==="number")return (x-y)*sortDir;
+    return String(x).localeCompare(String(y))*sortDir;
+  });
+}
+function markSortHeaders(){
+  var th=document.querySelectorAll("th.sortable");
+  for(var i=0;i<th.length;i++){
+    var on=th[i].dataset.sort===sortCol;
+    th[i].classList.toggle("sorted",on);
+    th[i].dataset.dir=on?(sortDir>0?"asc":"desc"):"";
+  }
+}
+document.addEventListener("click",function(e){
+  var th=e.target.closest("th.sortable");if(!th)return;
+  if(sortCol===th.dataset.sort)sortDir=-sortDir;else{sortCol=th.dataset.sort;sortDir=1;}
+  markSortHeaders();render();
+});
 function render(){
   groups={};gorder=[];
   rows.forEach(function(r){
@@ -2608,7 +2755,7 @@ function render(){
     if(!groups[k]){groups[k]={desc:r.description,lines:[]};gorder.push(k);}
     groups[k].lines.push(r);
   });
-  gorder.sort(function(a,b){return groups[b].lines.length-groups[a].lines.length||(groups[b].lines[0].ts-groups[a].lines[0].ts);});
+  sortGroups();
   var h="";
   gorder.forEach(function(k){
     var g=groups[k],n=g.lines.length;
@@ -2689,8 +2836,10 @@ function activityPage(me: User): string {
   .bar select{padding:8px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;background:#fff;outline:none}
   .muted{color:var(--mut);font-size:12.5px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
-  table{width:100%;border-collapse:collapse;font-size:13px}
+  .scroll{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px;min-width:660px}
   th{background:#f8fafc;text-align:left;padding:9px 14px;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--mut);border-bottom:1px solid var(--line)}
+  ${SORT_CSS}
   td{padding:8px 14px;border-bottom:1px solid #f1f5f9;vertical-align:top}
   tr:last-child td{border-bottom:0}
   .act{display:inline-block;background:#eef2f6;border:1px solid var(--line);border-radius:7px;padding:1px 8px;font-size:11.5px;font-weight:700;color:#475569;white-space:nowrap}
@@ -2710,11 +2859,16 @@ function activityPage(me: User): string {
     <input type="date" id="fFrom" title="From date" style="padding:7px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none">
     <span class="muted">to</span>
     <input type="date" id="fTo" title="To date" style="padding:7px 10px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none">
+    <input id="q" placeholder="Search user, action, details, IP…" style="flex:1;min-width:190px;padding:7px 11px;font-size:13px;border:1px solid var(--line);border-radius:8px;outline:none">
     <span class="muted" id="count"></span>
   </div>
-  <div class="card"><table><thead><tr>
-    <th style="width:150px">When</th><th style="width:110px">User</th><th style="width:150px">Action</th><th>Details</th><th style="width:120px">IP</th>
-  </tr></thead><tbody id="tb"></tbody></table><button class="more" id="more" style="display:none">Load older entries</button></div>
+  <div class="card"><div class="scroll"><table><thead><tr>
+    <th style="width:150px" class="sortable" data-sort="ts">When</th>
+    <th style="width:110px" class="sortable" data-sort="username">User</th>
+    <th style="width:150px" class="sortable" data-sort="action">Action</th>
+    <th class="sortable" data-sort="detail">Details</th>
+    <th style="width:120px" class="sortable" data-sort="ip">IP</th>
+  </tr></thead><tbody id="tb"></tbody></table></div><button class="more" id="more" style="display:none">Load older entries</button></div>
   <p class="muted" style="margin-top:12px">Sends, deletes, forwards, reactions, sign-ins (including failures), order saves, DDI numbers,
     taught aliases and ignores, user and settings changes — kept for 90 days. Reading chats is not logged.</p>
 </div>
@@ -2723,7 +2877,7 @@ window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();
 function el(id){return document.getElementById(id);}
 function omsLogout(){fetch("/logout",{method:"POST"}).then(function(){location.href="/login";}).catch(function(){location.href="/login";});}
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
-var lastId=0,ACTIONS=["login","login-failed","login-new-device","logout","password-changed","send-message","send-file","forward","delete-message","react","star","unstar","pin","unpin","order-saved","ddi-number","teach-alias","teach-ignore","undo-ignore","rename-chat","user-add","user-edit","user-delete","reset-2fa","settings"];
+var lastId=0,rows=[],total=0,sortCol="",sortDir=1,ACTIONS=["login","login-failed","login-new-device","logout","password-changed","send-message","send-file","forward","delete-message","react","star","unstar","pin","unpin","order-saved","ddi-number","teach-alias","teach-ignore","undo-ignore","rename-chat","user-add","user-edit","user-delete","reset-2fa","settings"];
 function when(ts){var d=new Date(ts);return d.toLocaleDateString([],{month:"short",day:"numeric"})+" "+d.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});}
 function rowHtml(r){
   var warn=r.action==="login-failed"||r.action==="delete-message"||r.action==="user-delete";
@@ -2731,17 +2885,43 @@ function rowHtml(r){
     '<td><span class="act'+(warn?" warn":"")+'">'+esc(r.action)+'</span></td>'+
     '<td class="detail">'+esc(r.detail||"—")+'</td><td class="muted">'+esc(r.ip||"—")+'</td></tr>';
 }
+// Search and sort work on what has been loaded (100 at a time). "Load older entries" pulls more
+// into the same list, so both keep applying as the list grows.
+function draw(){
+  var q=el("q").value.trim().toLowerCase();
+  var view=q?rows.filter(function(r){
+    return (when(r.ts)+" "+r.username+" "+r.action+" "+(r.detail||"")+" "+(r.ip||"")).toLowerCase().indexOf(q)>=0;
+  }):rows.slice();
+  if(sortCol)view.sort(function(a,b){
+    if(sortCol==="ts")return (a.ts-b.ts)*sortDir;
+    return String(a[sortCol]||"").toLowerCase().localeCompare(String(b[sortCol]||"").toLowerCase())*sortDir;
+  });
+  el("tb").innerHTML=view.map(rowHtml).join("")||
+    '<tr><td colspan="5" class="empty">'+(q?"No entry matches that search.":"Nothing recorded yet.")+'</td></tr>';
+  el("count").textContent=q
+    ?(view.length+" of "+rows.length+" loaded"+(rows.length<total?" — load older entries to search further":""))
+    :(total+" entr"+(total===1?"y":"ies"));
+}
+el("q").addEventListener("input",draw);
+document.addEventListener("click",function(e){
+  var th=e.target.closest("th.sortable");if(!th)return;
+  if(sortCol===th.dataset.sort)sortDir=-sortDir;else{sortCol=th.dataset.sort;sortDir=1;}
+  var hs=document.querySelectorAll("th.sortable");
+  for(var i=0;i<hs.length;i++){var on=hs[i].dataset.sort===sortCol;hs[i].classList.toggle("sorted",on);hs[i].dataset.dir=on?(sortDir>0?"asc":"desc"):"";}
+  draw();
+});
 async function load(older){
-  var q="limit=100&user="+encodeURIComponent(el("fUser").value)+"&action="+encodeURIComponent(el("fAction").value)
+  var qs="limit=100&user="+encodeURIComponent(el("fUser").value)+"&action="+encodeURIComponent(el("fAction").value)
        +"&from="+el("fFrom").value+"&to="+el("fTo").value;
-  if(older&&lastId)q+="&before="+lastId;
-  var d=await(await fetch("/api/activity?"+q)).json();
-  var rows=d.rows||[];
-  if(!older){el("tb").innerHTML="";lastId=0;}
-  if(rows.length)lastId=rows[rows.length-1].id;
-  el("tb").insertAdjacentHTML("beforeend",rows.map(rowHtml).join("")||(older?"":'<tr><td colspan="5" class="empty">Nothing recorded yet.</td></tr>'));
-  el("count").textContent=d.total+" entr"+(d.total===1?"y":"ies");
-  el("more").style.display=(rows.length===100)?"block":"none";
+  if(older&&lastId)qs+="&before="+lastId;
+  var d=await(await fetch("/api/activity?"+qs)).json();
+  var got=d.rows||[];
+  if(!older){rows=[];lastId=0;}
+  if(got.length)lastId=got[got.length-1].id;
+  rows=rows.concat(got);
+  total=d.total;
+  draw();
+  el("more").style.display=(got.length===100)?"block":"none";
   // fill the user filter once
   if(el("fUser").options.length===1&&d.users)d.users.forEach(function(u){var o=document.createElement("option");o.value=u;o.textContent=u;el("fUser").appendChild(o);});
   if(el("fAction").options.length===1)ACTIONS.forEach(function(a){var o=document.createElement("option");o.value=a;o.textContent=a;el("fAction").appendChild(o);});
@@ -2844,6 +3024,55 @@ function matchPage(me: User): string {
   .chatcol{width:248px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
   .chatsearch{margin:10px;padding:9px 11px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:9px;font-size:13px;outline:none;transition:border-color .15s}
   .chatsearch:focus{border-color:var(--blue)}
+  /* Bell in the header. Browsers only allow the permission prompt from a real click, so this is a
+     button rather than something the page asks for on load. */
+  /* Chat-list filter tabs (All / Unread / Groups), like WhatsApp's. */
+  .ctabs{display:flex;gap:6px;padding:0 10px 8px}
+  .ctab{flex:1;border:1px solid var(--line);background:#fff;color:var(--mut);border-radius:999px;
+    padding:4px 0;font-size:11.5px;font-weight:700;cursor:pointer;transition:background .12s,color .12s,border-color .12s}
+  .ctab:hover{border-color:var(--em)}
+  .ctab.on{background:var(--emdim);border-color:var(--em);color:var(--em2)}
+  /* Search WITHIN the open chat. Sits under the thread header; arrows step through the hits. */
+  .findbar{display:flex;align-items:center;gap:6px;padding:6px 12px;background:#fffbe8;
+    border-bottom:1px solid var(--line)}
+  .findbar input{flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;padding:5px 9px;font-size:12.5px;outline:none}
+  .findbar input:focus{border-color:var(--blue)}
+  .findn{font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .findbtn{border:1px solid var(--line);background:#fff;border-radius:7px;padding:3px 8px;font-size:11px;cursor:pointer}
+  .findbtn:hover{border-color:var(--blue);color:var(--blue)}
+  /* Every hit is tinted; the one the arrows are on is stronger, so stepping is visible. */
+  .fhit{background:#ffe9a8;border-radius:3px}
+  .fhit.cur{background:#ffb703;color:#231a00}
+  /* Jump-to-latest button, shown only once the reader has scrolled up. */
+  .tobottom{position:absolute;right:18px;bottom:76px;width:36px;height:36px;border-radius:50%;
+    border:1px solid var(--line);background:#fff;color:var(--tx);font-size:15px;cursor:pointer;
+    box-shadow:0 2px 8px #0000001f;z-index:5}
+  .tobottom:hover{border-color:var(--em);color:var(--em2)}
+  /* Group members: click the chat title to list them, click one to message privately. */
+  .memberpop{position:absolute;left:50%;transform:translateX(-50%);top:96px;z-index:30;width:min(320px,86%);
+    max-height:60%;overflow:auto;background:#fff;border:1px solid var(--line);border-radius:12px;
+    box-shadow:0 10px 30px #00000026;padding:6px}
+  .memberpop .mh{font-size:11px;font-weight:700;color:var(--mut);padding:6px 10px;text-transform:uppercase;letter-spacing:.4px}
+  .memberrow{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px}
+  .memberrow:hover{background:var(--bg)}
+  .memberrow .mname{font-weight:600;color:var(--tx)}
+  .memberrow .mnum{color:var(--mut);font-size:11px}
+  .memberrow .mgo{margin-left:auto;color:var(--em2);font-size:11px;font-weight:700}
+  .tt.clickable{cursor:pointer}
+  .tt.clickable:hover{text-decoration:underline}
+  /* Final Order collapse. Fades and folds away; the arrow flips. */
+  .foldbtn{border:0;background:#0000;color:var(--mut);cursor:pointer;font-size:12px;padding:2px 6px;line-height:1}
+  .foldbtn:hover{color:var(--tx)}
+  .finalbox table{transition:opacity .18s ease}
+  .finalbox.collapsed table{display:none}
+  .finalbox.collapsed .foldbtn{transform:rotate(180deg)}
+  .notifbtn{border:1px solid var(--line);background:#fff;border-radius:9px;padding:4px 8px;
+    font-size:14px;line-height:1;cursor:pointer;opacity:.55;transition:opacity .15s,border-color .15s}
+  .notifbtn:hover{opacity:1}
+  .notifbtn.on{opacity:1;border-color:var(--em);background:#eafaf0}
+  /* A row matched on message CONTENT shows the matching text instead of the usual last-message
+     preview, so it is obvious why a chat with an unrelated name is in the results. */
+  .chatrow .p.hit{color:var(--em2);font-style:italic}
   .chatlist{flex:1;overflow-y:auto;padding:0 6px 6px}
   .more{padding:8px 12px;color:var(--mut);font-size:12px;text-align:center}
   .chatrow{padding:10px 11px;border-radius:9px;cursor:pointer;margin-top:3px;transition:background .12s}
@@ -2858,7 +3087,8 @@ function matchPage(me: User): string {
   /* Matched by similarity rather than an exact code or a learned alias — worth a glance. */
   .guess{background:#fffbeb;color:#b45309;border:1px solid #fde68a;border-radius:10px;padding:1px 7px;font-size:11px;margin-left:6px;font-weight:600}
   .row.guessed{border-left-color:var(--amber)}
-  .thread{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg)}
+  /* position:relative anchors the jump-to-latest button and the member list to the thread pane. */
+  .thread{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--chatbg);position:relative}
   .threadhead{padding:9px 16px;background:#f0f2f5;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
   .threadhead .tt{font-weight:600;font-size:15px;color:var(--tx)}
   .btn{background:var(--blue);color:#fff;border:0;border-radius:9px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s,transform .05s,border-color .15s,color .15s;display:inline-flex;align-items:center;gap:6px}
@@ -2874,6 +3104,11 @@ function matchPage(me: User): string {
   .daysep span{background:#fff;color:#54656f;font-size:12.5px;font-weight:500;padding:5px 12px;border-radius:8px;box-shadow:0 1px .5px rgba(11,20,26,.13)}
   .bubble{position:relative;max-width:min(74%,540px);min-width:96px;padding:6px 9px 8px;border-radius:7.5px;font-size:14.2px;line-height:19px;box-shadow:0 1px .5px rgba(11,20,26,.13);margin-top:8px}
   .bubble.grp{margin-top:2px}
+  /* An order message is read like a TABLE, not a chat line: once it carries coloured lines the
+     bubble stretches to its full allowance so each tint spans a complete row. Left content-sized,
+     a short line like "3 flux" painted only a stub of colour and the rows looked ragged. Ordinary
+     conversation bubbles are untouched and keep hugging their text. */
+  .bubble.ext,.bubble.done{width:100%;max-width:100%}
   .in{align-self:flex-start;background:#fff;border-top-left-radius:0}
   .out{align-self:flex-end;background:var(--wa);border-top-right-radius:0}
   .bubble.grp.in{border-top-left-radius:7.5px}.bubble.grp.out{border-top-right-radius:7.5px}
@@ -2890,8 +3125,67 @@ function matchPage(me: User): string {
   /* While an extraction is OPEN, message lines whose products are all matched turn the same light
      green as their rows — staff skip them and go straight to what still needs work. Scoped to
      .ext on purpose: Copy or Clear drops that class and the bubble goes back to normal. */
-  .bubble.ext .ml.mlok{background:#d1efd7;border-radius:5px;padding:0 4px;margin:0 -4px}
+  .bubble.ext .ml.mlok{background:#d1efd7;border-radius:4px;padding:1px 9px;margin:0 -9px}
   .bubble.ext .ml.mlok .mln{color:var(--em2);font-weight:700}
+  /* PERSISTENT per-saver colouring, unlike .mlok above which only lives while an extraction is
+     open. One customer message is often filled in shifts, so each line is tinted with the colour
+     of whoever completed it. A line whose products were only partly filled gets a proportional
+     gradient — that is the "half coloured" state. Colours are allocated per MESSAGE in save order
+     (first saver = own1) and kept light so the customer's own text stays readable. */
+  /* -9px cancels the bubble's own 9px side padding, so the tint runs the FULL width of the bubble.
+     At -4px it stopped 5px short on each side and the rows looked ragged rather than banded. */
+  .ml.own{border-radius:4px;padding:1px 9px;margin:0 -9px}
+  .ml.own1{background:#d1efd7} .ml.own1 .mln{color:#059669;font-weight:700}
+  .ml.own2{background:#d6e4ff} .ml.own2 .mln{color:#2563eb;font-weight:700}
+  .ml.own3{background:#ffe8c7} .ml.own3 .mln{color:#b45309;font-weight:700}
+  .ml.own4{background:#f3d9f7} .ml.own4 .mln{color:#a21caf;font-weight:700}
+  .ml.own5{background:#ffd9de} .ml.own5 .mln{color:#be123c;font-weight:700}
+  .ml.own6{background:#cdf0f5} .ml.own6 .mln{color:#0e7490;font-weight:700}
+  /* Colour key above the thread. Shown only once a chat actually has processed orders — on a fresh
+     chat there is nothing to explain and it would just be clutter. It says what the STATES mean;
+     which person owns which colour is on the badges, because colours are per message. */
+  .legend{display:flex;flex-wrap:wrap;align-items:center;gap:4px 12px;padding:5px 16px;
+    background:#f7f8fa;border-bottom:1px solid var(--line);font-size:10.5px;color:var(--mut)}
+  .legend b{font-weight:700;color:var(--tx)}
+  /* nowrap keeps a swatch glued to its own label. The prose items carry no swatch, so they get
+     .lgtext and are allowed to wrap — without it they ran off the right edge on a phone. */
+  .lgi{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  .lgi.lgtext{white-space:normal;display:inline}
+  .lgsw{width:15px;height:11px;border-radius:3px;flex:none;border:1px solid #0000001f}
+  /* RESERVED grey — "somebody already finished this line", shown only while an extraction is open.
+     Never assigned to a person, so it can never be mistaken for one. It deliberately recedes: the
+     lines that still need you are the ones that are NOT grey. */
+  .ml.owndone{background:#e7e9ec}
+  .ml.owndone .mln{color:#9aa3ad;font-weight:700}
+  .ml.owndone .mlt{opacity:.62}
+  .ml.owndone.half{background:linear-gradient(90deg,#e7e9ec 50%,transparent 50%)}
+  /* Partly filled: the tint covers only half the line, so "some of this is still open" is visible
+     at a glance without reading the order panel. */
+  .ml.own1.half{background:linear-gradient(90deg,#d1efd7 50%,transparent 50%)}
+  .ml.own2.half{background:linear-gradient(90deg,#d6e4ff 50%,transparent 50%)}
+  .ml.own3.half{background:linear-gradient(90deg,#ffe8c7 50%,transparent 50%)}
+  .ml.own4.half{background:linear-gradient(90deg,#f3d9f7 50%,transparent 50%)}
+  .ml.own5.half{background:linear-gradient(90deg,#ffd9de 50%,transparent 50%)}
+  .ml.own6.half{background:linear-gradient(90deg,#cdf0f5 50%,transparent 50%)}
+  /* The order number shown beside a product, only when that person saved under more than one. */
+  .mlord{font-size:10px;opacity:.75;white-space:nowrap;font-variant-numeric:tabular-nums}
+  /* One badge PER PERSON on the bubble, in that person's colour. Only its owner can double-click
+     it to re-open their own work, so nobody reopens someone else's half of the order. */
+  .sbrow{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+  /* Three classes on purpose: plain .sb.own2 ties with .sb.d further down the sheet, and the
+     later rule won — which painted every badge green regardless of whose it was. */
+  .sb.d.own1{background:#d1efd7;color:#065f46;border-color:#a7f3d0}
+  .sb.d.own2{background:#d6e4ff;color:#1e40af;border-color:#a8c7ff}
+  .sb.d.own3{background:#ffe8c7;color:#92400e;border-color:#fcd9a0}
+  .sb.d.own4{background:#f3d9f7;color:#86198f;border-color:#e9b8f0}
+  .sb.d.own5{background:#ffd9de;color:#9f1239;border-color:#ffb8c2}
+  .sb.d.own6{background:#cdf0f5;color:#155e75;border-color:#a5e2ec}
+  .sb.mine{cursor:pointer}
+  .sbhint{opacity:.7;font-weight:400}
+  /* "Remaining" — the products nobody has saved yet. Shown to everyone, hidden when none are left. */
+  .rembtn{border:1px solid var(--amber);background:#fff7ea;color:#b45309;border-radius:999px;
+    padding:2px 10px;font-size:11px;font-weight:700;cursor:pointer}
+  .rembtn:hover{background:#ffedd0}
   /* Media in the thread. Fetched lazily, so a chat with hundreds of photos stays fast. */
   .mediaimg{display:block;margin:0 0 3px}
   .mediaimg img{display:block;max-width:100%;max-height:320px;border-radius:6px;background:#00000008}
@@ -3133,6 +3427,15 @@ function matchPage(me: User): string {
   .lno{flex:none;min-width:18px;height:18px;line-height:18px;text-align:center;border-radius:9px;background:var(--bg);border:1px solid var(--line);color:var(--mut);font-size:10px;font-weight:600}
   .unitchip{background:#fef3c7;border:1px solid #fcd34d;color:#92400e;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
   .matchip{background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;border-radius:7px;padding:0 5px;font-size:9.5px;font-weight:700;text-transform:uppercase}
+  /* Unit of measure on a matched row. A dropdown only when the product really has alternatives;
+     otherwise a plain chip, so nobody clicks hoping for a choice that does not exist. */
+  /* Sized to be NOTICED: at 10px it read as decoration and the client could not find the unit
+     picker at all on a call. */
+  .uomsel{margin-left:7px;border:1.5px solid var(--blue);background:#eff5ff;color:#1e40af;border-radius:7px;
+    padding:2px 5px;font-size:12.5px;font-weight:700;cursor:pointer;vertical-align:middle;max-width:190px}
+  .uomsel:hover{background:#dbe8ff}
+  .uomfix{margin-left:7px;background:#eef2f6;border:1px solid var(--line);color:#334155;border-radius:7px;
+    padding:2px 7px;font-size:11.5px;font-weight:700;vertical-align:middle}
   /* Template shape on every row: product line, then "Customer Require ->" on its OWN line.
      Nothing shares a line and nothing is cut off — long text wraps and the row grows. */
   .pinfo{flex:1;min-width:0}
@@ -3174,7 +3477,7 @@ function matchPage(me: User): string {
   .rmfinal:hover{background:#fee2e2;color:#dc2626}
   .placeholder{color:var(--mut);text-align:center;padding:34px 16px;font-size:13px;line-height:1.6}
 </style></head><body>
-<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${navHtml(me, '/')}</header>
+<header><h1>WhatsApp Order Matching</h1><span class="muted" id="catmeta"></span><div class="spacer"></div><span class="live" id="live" title="WhatsApp connection"><span class="ldot"></span><span id="livetx">connecting…</span></span><button class="notifbtn" id="notifbtn" title="Turn on desktop alerts for new messages">&#128276;</button><span class="user" title="${esc(me.name || me.username)}">${esc(me.username)}</span>${navHtml(me, '/')}</header>
 <div class="offline" id="offline">
   <div class="offbox">
     <div class="officon" id="officon">⏳</div>
@@ -3185,11 +3488,31 @@ function matchPage(me: User): string {
 </div>
 <div class="wrap">
   <div class="left">
-    <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off"><div class="chatlist" id="chatlist"></div></div>
+    <div class="chatcol"><input id="chatsearch" class="chatsearch" placeholder="search chats…" autocomplete="off">
+      <div class="ctabs" id="ctabs">
+        <button class="ctab on" data-tab="all">All</button>
+        <button class="ctab" data-tab="unread">Unread</button>
+        <button class="ctab" data-tab="groups">Groups</button>
+      </div>
+      <div class="chatlist" id="chatlist"></div></div>
     <div class="thread">
-      <div class="threadhead"><button class="backchat" id="tolist" title="All chats" aria-label="Back to all chats">&#8592;</button><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
+      <div class="threadhead"><button class="backchat" id="tolist" title="All chats" aria-label="Back to all chats">&#8592;</button><span id="threadtitle" class="muted">Select a chat</span><button class="btn iconbtn ghost" id="renamebtn" disabled title="Rename this chat">&#9998;</button><div class="spacer"></div><button class="btn iconbtn ghost" id="findopen" title="Search in this chat">&#128269;</button><span class="muted" id="navlabel" style="display:none">extracted</span><button class="btn iconbtn ghost" id="navprev" title="Previous extracted message">&#9650;</button><button class="btn iconbtn ghost" id="navnext" title="Next extracted message">&#9660;</button></div>
+      <div class="legend" id="legend" style="display:none"></div>
+      <!-- Search INSIDE the open chat, like WhatsApp: every hit is highlighted and the arrows
+           step through them oldest/newest. Separate from the chat-list search on the left. -->
+      <div class="findbar" id="findbar" style="display:none">
+        <input id="findq" placeholder="search in this chat…" autocomplete="off">
+        <span class="findn" id="findn"></span>
+        <button class="findbtn" id="findprev" title="Previous match">&#9650;</button>
+        <button class="findbtn" id="findnext" title="Next match">&#9660;</button>
+        <button class="findbtn" id="findclose" title="Close search">&#10005;</button>
+      </div>
+      <!-- Members of the open GROUP; clicking one opens a private chat with them. -->
+      <div class="memberpop" id="memberpop" style="display:none"></div>
       <div class="pinbar" id="pinbar"></div>
       <div class="msgs" id="msgs"><div class="placeholder">Pick a conversation on the left.</div></div>
+      <!-- Jump back to the newest message after scrolling up, like WhatsApp. -->
+      <button class="tobottom" id="tobottom" style="display:none" title="Go to the latest message">&#9660;</button>
       <div class="mentionbox" id="mbox"></div>
       <div class="filechip" id="filechip"></div>
       <div class="replybar" id="replybar"><div class="rq"><div class="rqn" id="rqn"></div><div class="rqt" id="rqt"></div></div><button class="rx" id="rx" title="Cancel reply" aria-label="Cancel reply">&#10005;</button></div>
@@ -3222,10 +3545,18 @@ function matchPage(me: User): string {
 <script>
 window.addEventListener("pageshow",function(e){if(e.persisted)location.reload();});
 var chats=[],curChat=null,items=[],active={},sources=[],proc={},procBy={},openIdx=null,lastSig="",mentionMap={};
+// DDI's unit-of-measure codes with what each one MEANS. Both are shown in the picker because the
+// codes alone are genuinely ambiguous — BX is a plain box while BOX is a box of 35 — and picking
+// the wrong one changes what the customer is actually sent.
+var UOMS=[["EA","ONE"],["BX","BOX"],["BOX","BOX OF 35PC"],["BOX50","BOX50"],["PK","PACK"],
+  ["PC14","14PC"],["PC20","20PC"],["CRT","Crate"],["M/C","MAster Carton"],["SKI","PALLET"],
+  ["PIPE","PIPE"],["ROL","ROLL"],["FT","FOOT"],["FT50","50FT"],["IN","INCH"],["HR","HOURS"]];
+var UOMNAME={};UOMS.forEach(function(u){UOMNAME[u[0]]=u[1];});
 var meName=${jsIn(me.name || me.username)},meUser=${jsIn(me.username)},WA_PERSONAL=${me.waMode === 'personal' ? 'true' : 'false'},IS_ADMIN=${me.role === 'admin' ? 'true' : 'false'},appUsers=[];
 var msgIndex={},replyTo=null,menuMid=null; // message-menu state (reply / copy / forward / delete)
 var orderNos={},lastCopied=[]; // DDI order numbers per processed message; messages of the last Copy
 var claims={}; // messageId -> username currently extracting it (the lock)
+var finalHidden=false; // Final Order folded away? Sticky while the panel re-renders.
 var pendingReacts={}; // messageId -> emoji just saved here, shown before WhatsApp echoes it back
 // --- mobile: chat list and conversation are two screens, like WhatsApp ---
 function isMobile(){return window.matchMedia("(max-width:860px)").matches;}
@@ -3368,18 +3699,23 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;if(m.batches&&m.batches.length)batchesOf[m.messageId]=m.batches;else delete batchesOf[m.messageId];var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?'<span class="ck">✓✓</span>':"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
 // The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
 var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
 var arrow=revoked?"":'<button class="mbtn" title="Message menu" aria-label="Message menu">&#9662;</button>';
 var starTag=m.starred?'<span class="starred" title="Starred">&#9733;</span>':"";
-var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
+var inner=arrow+nm+sentTag+quoteHtml(m)+mediaHtml+(revoked?'<div class="tx del">&#128683; This message was deleted</div>':(body?'<div class="tx">'+(xable?fmtBodyLines(body):fmtBody(body))+'</div>':''))+'<div class="metarow"><span class="sb" style="display:none"></span><span class="sbrow" style="display:none"></span><span class="meta">'+starTag+esc(fmtTime(m.ts))+ck+'</span></div>'+(xable?'<div class="xrow"><button class="rembtn" style="display:none" data-rem="1" data-mid="'+esc(m.messageId)+'">Remaining</button><button class="xbtn" data-mid="'+mid+'">Extract</button></div>':"")+re;o.push('<div class="bubble '+(out?"out":"in")+(grp?" grp":"")+(xable?" xable":"")+(hr?" hasreact":"")+'" data-mid="'+mid+'">'+inner+'</div>');}return o.join("");}
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
 // While an extraction is open here, keep its lock fresh (the server expires idle locks).
 function heartbeatClaims(){var mids=Object.keys(active);if(!mids.length)return;fetch("/api/extract/heartbeat",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({messageIds:mids})}).catch(function(){});}
-async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};heartbeatClaims();var sig=threadSig(ms);if(sig===lastSig){applyStates();return;}lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();mb.scrollTop=atBottom?mb.scrollHeight:prev;}catch(e){}}
+async function refreshThread(){var cid=curChat;if(!cid)return;if(document.querySelector(".msgs .bubble.busy"))return;try{var r0=await fetch("/api/chats/"+encodeURIComponent(cid)+"/messages");if(r0.status===401){location.href="/login";return;}var d=await r0.json();if(cid!==curChat)return;var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};heartbeatClaims();var sig=threadSig(ms);if(sig===lastSig){applyStates();return;}lastSig=sig;var mb=el("msgs");var atBottom=(mb.scrollHeight-mb.scrollTop-mb.clientHeight)<80;var prev=mb.scrollTop;el("msgs").innerHTML=ms.length?renderThread(ms):el("msgs").innerHTML;applyStates();
+// A re-render replaces the bubbles, taking the search highlights with them — put them back so an
+// open in-chat search keeps working while new messages arrive.
+if(el("findbar").style.display!=="none"&&(el("findq").value||"").trim().length>1){var _keep=findAt;runFind();if(_keep>=0&&_keep<findHits.length){findAt=_keep;showFindHit();}}
+mb.scrollTop=atBottom?mb.scrollHeight:prev;
+el("tobottom").style.display=(curChat&&!threadAtBottom(200))?"":"none";}catch(e){}}
 
 async function loadCat(){try{var d=await(await fetch("/api/products/count")).json();el("catmeta").textContent=(d.count||0).toLocaleString()+" products · "+(d.aliases||0)+" learned";}catch(e){}}
 async function loadChats(){try{var r=await fetch("/api/chats");
@@ -3390,7 +3726,70 @@ async function loadChats(){try{var r=await fetch("/api/chats");
   // The chat that is OPEN on screen is read by definition — a poll that raced the read marker
   // must not flash its badge back for a few seconds.
   for(var i=0;i<chats.length;i++)if(chats[i].id===curChat)chats[i].unread=0;
+  notifyNewMessages(chats);
   setLive(d.status);renderChats();}catch(e){setLive("offline");}}
+// --- desktop notifications -----------------------------------------------------------------
+// A chat "moved" when its newest message is later than the one we last saw. seenTs starts EMPTY
+// and is filled silently on the first poll, so opening the page never fires a burst of alerts for
+// conversations that were already there.
+var seenTs={},notifPrimed=false;
+function notifyNewMessages(list){
+  var first=!notifPrimed;
+  for(var i=0;i<list.length;i++){
+    var c=list[i],ts=c.lastTs||0,was=seenTs[c.id];
+    seenTs[c.id]=ts;
+    if(first||was===undefined||ts<=was)continue;
+    // Not for the chat you are already reading, and not for your own outgoing messages —
+    // unread is 0 in both cases, which is exactly the signal for "nothing to tell them about".
+    if(c.id===curChat||!c.unread)continue;
+    showDesktopNote(c);
+  }
+  notifPrimed=true;
+}
+function notifyMuted(){try{return localStorage.getItem("oms.notify")==="off";}catch(e){return false;}}
+function showDesktopNote(c){
+  if(!("Notification" in window)||Notification.permission!=="granted"||notifyMuted())return;
+  try{
+    var n=new Notification(c.title||"New message",{
+      body:stripSig(c.lastText||"").slice(0,140),
+      tag:"chat-"+c.id,       // one notification per chat: a busy group replaces, never stacks
+      icon:"/favicon.ico"
+    });
+    n.onclick=function(){window.focus();selectChat(c.id);n.close();};
+  }catch(e){}
+}
+/**
+ * The bell is a TOGGLE. First click asks the browser for permission; after that each click turns
+ * alerts off and on again. Browser permission can only be granted once and cannot be revoked from
+ * script, so the on/off state is ours and lives in localStorage — per browser, which is what you
+ * want when the same account is open on the counter PC and someone's laptop.
+ */
+function askNotifyPermission(){
+  if(!("Notification" in window))return;
+  if(Notification.permission==="default"){
+    Notification.requestPermission().then(function(p){
+      if(p==="granted"){try{localStorage.setItem("oms.notify","on");}catch(e){}}
+      syncNotifyBtn();
+    });
+    return;
+  }
+  if(Notification.permission==="granted"){
+    try{localStorage.setItem("oms.notify",notifyMuted()?"on":"off");}catch(e){}
+    toast(notifyMuted()?"Desktop alerts turned off":"Desktop alerts turned on");
+  }
+  syncNotifyBtn();
+}
+function syncNotifyBtn(){
+  var b=el("notifbtn");if(!b)return;
+  if(!("Notification" in window)){b.style.display="none";return;}
+  var p=Notification.permission,on=(p==="granted"&&!notifyMuted());
+  b.textContent=on?"🔔":"🔕";
+  b.title=on?"Desktop alerts are ON — click to turn them off"
+    :p==="denied"?"Desktop alerts are blocked — allow notifications for this site in your browser settings"
+    :p==="granted"?"Desktop alerts are OFF — click to turn them on"
+    :"Turn on desktop alerts for new messages";
+  b.classList.toggle("on",on);
+}
 // Header pill: green "Live chat" only when WhatsApp is actually linked; red/amber otherwise.
 function setLive(s){var box=el("live"),tx=el("livetx");if(!box||!tx)return;var cls="",label="";
   if(s==="connected"){cls="";label="Live chat";}
@@ -3439,14 +3838,103 @@ function showOffline(s){
   box.querySelector(".offbox").className="offbox"+(bad?" bad":"");
   box.className="offline on";
 }
-function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0);}):chats;var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+(c.unread>99?"99+":c.unread)+'</span>':"")+'</div><div class="p">'+esc(stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?"No chats match.":"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
-async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};lastCopied=[];pendingReacts={};navIdx=-1;
+function renderChats(){var q=((el("chatsearch")&&el("chatsearch").value)||"").toLowerCase().trim();var list=(q?chats.filter(function(c){return (String(c.title||"").toLowerCase().indexOf(q)>=0)||(String(c.id||"").toLowerCase().indexOf(q)>=0)||!!msgHits[c.id];}):chats).filter(tabAllows);var capped=list.slice(0,300);var more=list.length-capped.length;var html=capped.length?capped.map(function(c){return '<div class="chatrow'+(c.id===curChat?" active":"")+(c.unread>0?" un":"")+'" data-id="'+esc(c.id)+'"><div class="t"><span>'+(c.isGroup?"👥 ":"")+esc(c.title||c.id)+'</span>'+(c.unread>0?'<span class="badge">'+(c.unread>99?"99+":c.unread)+'</span>':"")+'</div><div class="p'+(msgHits[c.id]?" hit":"")+'">'+esc(msgHits[c.id]?stripSig(msgHits[c.id].snippet):stripSig(c.lastText||""))+'</div></div>';}).join(""):'<div class="placeholder">'+(chats.length?(chatTab==="unread"?"Nothing unread.":chatTab==="groups"?"No groups match.":"No chats match."):"Loading chats…")+'</div>';if(more>0)html+='<div class="more">+'+more+' more — refine search</div>';el("chatlist").innerHTML=html;}
+async function selectChat(id){if(typeof recStop==="function")recStop(false);curChat=id;items=[];active={};sources=[];proc={};procBy={};orderNos={};batchesOf={};lastCopied=[];pendingReacts={};navIdx=-1;
   // Clear the badge the INSTANT the chat is opened — the server marker is set by the thread
   // fetch below, but the badge must not wait the few seconds until the next list poll.
   for(var ci=0;ci<chats.length;ci++)if(chats[ci].id===id)chats[ci].unread=0;
-  renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var t=(chats.find(function(c){return c.id===id;})||{}).title||id;el("threadtitle").textContent=t;el("threadtitle").className="tt";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();var mb=el("msgs");mb.scrollTop=mb.scrollHeight;}
+  renderChats();renderRight();closePanel();showChat();el("renamebtn").disabled=false;drafted=[];clearFile();clearReply();hideMentions();syncComposer();loadParticipants(id);var _c=chats.find(function(c){return c.id===id;})||{};var t=_c.title||id;el("threadtitle").textContent=t;
+// Only a GROUP title opens a member list, so only a group title looks clickable.
+el("threadtitle").className=_c.isGroup?"tt clickable":"tt";
+el("threadtitle").title=_c.isGroup?"Show group members":"";
+hideMembers();closeFind();el("tobottom").style.display="none";var d=await(await fetch("/api/chats/"+encodeURIComponent(id)+"/messages")).json();var ms=d.messages||[];if(d.mentions)mentionMap=d.mentions;if(d.appUsers)appUsers=d.appUsers;renderPinBar(d.pinned||null);claims=d.claims||{};el("msgs").innerHTML=ms.length?renderThread(ms):'<div class="placeholder">No messages captured for this chat yet. Messages are stored from the moment they arrive; older history is not available.</div>';lastSig=threadSig(ms);applyStates();renderRight();scrollThreadToBottom();}
+/**
+ * Land on the NEWEST message when a chat opens.
+ *
+ * One scroll is not enough: images, stickers and voice players finish loading after the thread is
+ * rendered and each one makes the list taller, so the first scroll ends up short and the newest
+ * messages sit below the fold — which is why opening a chat sometimes needed a manual scroll down.
+ * Re-pin after layout, and again as media reports its real height.
+ */
+function scrollThreadToBottom(){
+  var mb=el("msgs");if(!mb)return;
+  var pin=function(){mb.scrollTop=mb.scrollHeight;};
+  pin();
+  requestAnimationFrame(pin);
+  setTimeout(pin,120);setTimeout(pin,400);setTimeout(pin,1000);
+  // Media that loads later would otherwise push the newest message out of view.
+  var media=mb.querySelectorAll("img,video,audio");
+  for(var i=0;i<media.length;i++){
+    media[i].addEventListener("load",pin,{once:true});
+    media[i].addEventListener("loadedmetadata",pin,{once:true});
+  }
+}
+/** True when the reader is already at the bottom — used to avoid yanking them down mid-scroll. */
+function threadAtBottom(px){
+  var mb=el("msgs");if(!mb)return true;
+  return mb.scrollHeight-mb.scrollTop-mb.clientHeight<(px||120);
+}
 
 function rebuildSources(){sources=Object.keys(active).map(function(m){return {messageId:m,text:active[m]};});}
+// --- shift-filled orders -------------------------------------------------------------------
+// One customer message can be completed by several people in turn. batchesOf[mid] holds every
+// save in order, so the thread can show a badge per person, colour the lines they filled, and
+// offer whatever is still open. Colour is allocated PER MESSAGE by save order — first saver own1.
+var batchesOf={};
+function ownerColours(mid){
+  var bs=batchesOf[mid]||[],map={},next=1;
+  for(var i=0;i<bs.length;i++){var w=bs[i].by||"";if(w&&!map[w]){map[w]=next>6?6:next;next++;}}
+  return map;
+}
+/** Products this save covered (the open ones are flagged and are not part of it). */
+function batchSaved(b){return (b&&b.items||[]).filter(function(x){return x&&!x.open;});}
+/**
+ * What genuinely still needs doing.
+ *
+ * The newest save's "open" list is the starting point, but it CANNOT be trusted on its own: it is a
+ * snapshot of that person's panel at that moment, and re-opening your own work (double-clicking
+ * your badge) pulls already-finished rows back onto the desk — so anything you did not re-save that
+ * time is recorded as open again. Subtracting everything saved in ANY batch is what makes it true.
+ *
+ * Matched on line + phrase, not line + code: an open row has no product code yet, so a code-based
+ * key would never match its finished twin.
+ */
+function remainingOf(mid){
+  var bs=batchesOf[mid]||[];
+  if(!bs.length)return [];
+  var done={};
+  for(var i=0;i<bs.length;i++){
+    var s=batchSaved(bs[i]);
+    for(var j=0;j<s.length;j++)done[(s[j].line||0)+"|"+(s[j].phrase||"")]=1;
+  }
+  return (bs[bs.length-1].items||[]).filter(function(x){
+    return x&&x.open&&!done[(x.line||0)+"|"+(x.phrase||"")];
+  });
+}
+/** line -> {owner colour index, count} for every line a save covered, newest save winning. */
+function lineOwners(mid){
+  var bs=batchesOf[mid]||[],cols=ownerColours(mid),out={};
+  for(var i=0;i<bs.length;i++){
+    var ci=cols[bs[i].by||""]||1,saved=batchSaved(bs[i]);
+    for(var j=0;j<saved.length;j++){
+      var ln=+saved[j].line||0;if(!ln)continue;
+      if(!out[ln])out[ln]={c:ci,ords:{},half:false,by:""};
+      out[ln].c=ci;out[ln].by=bs[i].by||""; // a later save re-filling a line takes it over
+      if(bs[i].orderNo)out[ln].ords[bs[i].orderNo]=1;
+    }
+  }
+  // A line whose products were only PARTLY filled — the customer wrote two things on one line and
+  // only one got matched — is shown half-filled rather than claimed outright.
+  var open=remainingOf(mid);
+  for(var k=0;k<open.length;k++){var oln=+open[k].line||0;if(oln&&out[oln])out[oln].half=true;}
+  return out;
+}
+/** Order numbers this person used on this message — several when they saved in more than one go. */
+function ordersOf(mid,who){
+  var bs=batchesOf[mid]||[],seen={},out=[];
+  for(var i=0;i<bs.length;i++){if((bs[i].by||"")===who&&bs[i].orderNo&&!seen[bs[i].orderNo]){seen[bs[i].orderNo]=1;out.push(bs[i].orderNo);}}
+  return out;
+}
 // Single source of truth for message visual state: extracted (active) vs processed (proc) vs plain.
 function applyStates(){
   var bubbles=document.querySelectorAll(".msgs .xable");
@@ -3459,15 +3947,47 @@ function applyStates(){
     // "Extracted" twice on the same bubble. The badge is only for the persistent Processed state,
     // where it also names who completed the order.
     var lk=claims[mid]&&claims[mid]!==meUser?claims[mid]:null; // locked by someone ELSE
-    if(sb){if(done&&!on){var by=procBy[mid];var dno=orderNos[mid];sb.className="sb d";sb.textContent=(by?("✓ Processed by "+by):"✓ Processed")+(dno?(" · DDI #"+dno):"");sb.style.display="";}
-      else if(lk&&!on){sb.className="sb lk";sb.textContent="⏳ "+lk+" is working on this";sb.style.display="";}
+    // The single .sb now carries ONLY the live lock. Everything about who completed the order
+    // moved to .sbrow, which holds one badge per person in that person's colour.
+    if(sb){if(lk&&!on){sb.className="sb lk";sb.textContent="⏳ "+lk+" is working on this";sb.style.display="";}
       else{sb.style.display="none";sb.textContent="";}}
+    var row=b.querySelector(".sbrow"),bs=batchesOf[mid]||[];
+    if(row){
+      if(bs.length&&!on){
+        var cols=ownerColours(mid),seen={},order=[],h2="";
+        for(var q=0;q<bs.length;q++){var w=bs[q].by||"";if(w&&!seen[w]){seen[w]=1;order.push(w);}}
+        for(var q2=0;q2<order.length;q2++){
+          var who=order[q2],ords=ordersOf(mid,who),ci=cols[who]||1,mineB=(who===meName||who===meUser);
+          // Only its owner may re-open their own half — hence the hint appears just for them.
+          h2+='<span class="sb d own'+ci+(mineB?" mine":"")+'" data-own="'+esc(who)+'" data-mid="'+esc(mid)+'">'
+            +"✓ Processed by "+esc(who)+(ords.length?(" · DDI #"+esc(ords.join(", #"))):"")
+            +(mineB?' <span class="sbhint">· double-click to re-extract</span>':"")+"</span>";
+        }
+        row.innerHTML=h2;row.style.display="";
+      } else if(done&&!on){
+        // Orders saved BEFORE per-person batches existed have no batch rows. They still deserve
+        // their badge — and since the Re-Extract button is gone, double-click here is now their
+        // only way back in, so it stays clickable for whoever saved it.
+        var lby=procBy[mid]||"",lno=orderNos[mid],lmine=(lby===meName||lby===meUser);
+        row.innerHTML='<span class="sb d own1'+(lmine?" mine":"")+'" data-own="'+esc(lby)+'" data-mid="'+esc(mid)+'">'
+          +(lby?("✓ Processed by "+esc(lby)):"✓ Processed")+(lno?(" · DDI #"+esc(lno)):"")
+          +(lmine?' <span class="sbhint">· double-click to re-extract</span>':"")+"</span>";
+        row.style.display="";
+      } else {row.style.display="none";row.innerHTML="";}
+    }
+    // "Remaining" = what nobody has filled yet. Hidden the moment nothing is left, as agreed.
+    var rem=b.querySelector(".rembtn"),left=remainingOf(mid).length;
+    if(rem)rem.style.display=(left&&!on&&!lk)?"":"none";
     var btn=b.querySelector(".xbtn");
+    // Re-Extract is gone from the bubble: on a saved message the badge (double-click) and the
+    // Remaining button are the two ways back in, so the button would be a confusing third door.
     if(btn&&!busy){btn.disabled=!!lk&&!on;btn.classList.toggle("on",on);btn.classList.toggle("done",done&&!on&&!lk);
-      btn.textContent=on?"Extracted ✓":(lk?"Locked by "+lk:(done?"Re-Extract":"Extract"));}
+      btn.style.display=(done&&!on&&!lk)?"none":"";
+      btn.textContent=on?"Extracted ✓":(lk?"Locked by "+lk:"Extract");}
   }
   var any=document.querySelectorAll(".msgs .bubble.ext, .msgs .bubble.done").length;
   el("navlabel").style.display=any?"":"none";
+  renderLegend();
   highlightLines(); // thread re-renders rebuild the bubbles, so the green lines must be re-applied
 }
 // Toggle one message: OFF removes only that message's items; ON appends its items (others untouched).
@@ -3509,7 +4029,76 @@ function showReactors(mid,x,y){
   p.style.top=Math.min(y,window.innerHeight-ph-8)+"px";
 }
 function hideReactors(){el("rpop").className="rpop";}
+/**
+ * The colour key. It shows the states, not a person-to-colour map: colours are allocated per
+ * MESSAGE in save order, so the same person can be green on one order and blue on the next — a
+ * fixed key would be wrong. Each badge already carries its owner's name in their colour.
+ *
+ * The key follows what you are doing, because the colours themselves do: extracting collapses
+ * everyone's finished lines to one reserved grey, and resting brings the person-colours back.
+ */
+function renderLegend(){
+  var lg=el("legend");if(!lg)return;
+  var working=Object.keys(active).length>0;
+  var anySaved=false;
+  for(var k in batchesOf){if((batchesOf[k]||[]).length){anySaved=true;break;}}
+  if(!working&&!anySaved){lg.style.display="none";lg.innerHTML="";return;}
+  var sw=function(css,label){return '<span class="lgi"><span class="lgsw" style="'+css+'"></span>'+label+"</span>";};
+  var h;
+  if(working){
+    h='<b>While you work:</b>'
+      +sw("background:#d1efd7","you matched this")
+      +sw("background:#e7e9ec","already done by someone")
+      +sw("background:#fff","nobody has done it yet")
+      +'<span class="lgi lgtext">half shaded = only part of the line is done</span>';
+  } else {
+    h='<b>Finished lines:</b>'
+      +'<span class="lgi lgtext">each person has their own colour — the badge under the message names them</span>'
+      +sw("background:#fff","not processed")
+      +'<span class="lgi lgtext">half shaded = part of the line still open</span>';
+  }
+  lg.innerHTML=h;lg.style.display="";
+}
+/**
+ * Re-open a saved message. Two modes, deliberately different:
+ *   "mine"      — double-clicking your OWN badge: your products come back so you can correct them,
+ *                 plus whatever is still open. Other people's work is left out of the panel.
+ *   "remaining" — the Remaining button: ONLY what nobody has filled yet.
+ * Both re-run the normal extraction (so matching and suggestions are fresh) and then drop the rows
+ * that belong to someone else, matching by line + product code.
+ */
+async function reopen(mid,mode){
+  if(!mid||active[mid])return;
+  if(claims[mid]&&claims[mid]!==meUser){toast(claims[mid]+" is working on this order — only they can extract it right now.",true);return;}
+  var bs=batchesOf[mid]||[];
+  var keep={},drop={};
+  for(var i=0;i<bs.length;i++){
+    var who=bs[i].by||"",saved=batchSaved(bs[i]);
+    for(var j=0;j<saved.length;j++){
+      var k=(saved[j].line||0)+"|"+(saved[j].code||"");
+      if(mode==="mine"&&(who===meName||who===meUser))keep[k]=1;else drop[k]=1;
+    }
+  }
+  await toggleExtract(mid);
+  if(!active[mid])return; // locked or failed — toggleExtract already said why
+  items=items.filter(function(it){
+    if(it.mid!==mid)return true;
+    var k=(it.line||0)+"|"+((it.chosen&&it.chosen.code)||"");
+    if(keep[k])return true;          // my own row, brought back for correction
+    if(drop[k])return false;         // somebody else's finished product — not mine to touch
+    return true;                     // never saved by anyone = still remaining
+  });
+  rebuildSources();renderRight();applyStates();
+}
 document.addEventListener("click",function(e){if(!e.target.closest("#rpop")&&!e.target.closest(".react"))hideReactors();});
+// Re-extract now lives on the badge, not on a button in the bubble. Double-click guards against
+// reopening a finished order by a stray click, and only the badge's OWNER carries the handler.
+el("msgs").addEventListener("dblclick",function(e){
+  var sb=e.target.closest(".sb.mine");
+  if(!sb)return;
+  e.preventDefault();e.stopPropagation();
+  reopen(sb.dataset.mid,"mine");
+});
 el("msgs").addEventListener("click",function(e){
   // The ⌄ arrow opens the message menu — the visible way in; right-click/long-press still work.
   var mb=e.target.closest(".mbtn");
@@ -3530,6 +4119,9 @@ el("msgs").addEventListener("click",function(e){
     else toast("That message is further back than this view loads.",true);
     return;
   }
+  // "Remaining" — pick up only what nobody has filled yet, leaving other people's work alone.
+  var rb=e.target.closest(".rembtn");
+  if(rb){e.stopPropagation();reopen(rb.dataset.mid,"remaining");return;}
   // Extraction ONLY via the Extract button. Clicking the message body selects/copies text like a
   // normal page — staff kept triggering extraction while trying to copy an address.
   var xb=e.target.closest(".xbtn");
@@ -3544,8 +4136,180 @@ el("navnext").addEventListener("click",function(){navExtracted(1);});
 
 el("renamebtn").addEventListener("click",async function(){if(!curChat)return;var cur=(chats.find(function(c){return c.id===curChat;})||{}).title||"";var name=window.prompt("Chat name:",cur);if(!name||!name.trim())return;await fetch("/api/chats/rename",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,name:name.trim()})});await loadChats();el("threadtitle").textContent=name.trim();});
 
-el("chatlist").addEventListener("click",function(e){var r=e.target.closest(".chatrow");if(r)selectChat(r.dataset.id);});
-el("chatsearch").addEventListener("input",renderChats);
+// --- chat list tabs -------------------------------------------------------------------------
+var chatTab="all";
+el("ctabs").addEventListener("click",function(e){
+  var b=e.target.closest(".ctab");if(!b)return;
+  chatTab=b.dataset.tab;
+  var all=el("ctabs").querySelectorAll(".ctab");
+  for(var i=0;i<all.length;i++)all[i].classList.toggle("on",all[i]===b);
+  renderChats();
+});
+/** Does this chat belong in the tab the user is on? Unread counts are per user, as elsewhere. */
+function tabAllows(c){
+  if(chatTab==="unread")return (c.unread||0)>0;
+  if(chatTab==="groups")return !!c.isGroup;
+  return true;
+}
+
+// --- search WITHIN the open chat -------------------------------------------------------------
+// Highlights every occurrence in the loaded thread and steps through them, like WhatsApp. Works on
+// what is rendered, so it covers the messages the thread holds rather than the whole history.
+var findHits=[],findAt=-1;
+function clearFindMarks(){
+  var m=el("msgs").querySelectorAll(".fhit");
+  for(var i=0;i<m.length;i++){var p=m[i].parentNode;p.replaceChild(document.createTextNode(m[i].textContent),m[i]);p.normalize();}
+  findHits=[];findAt=-1;el("findn").textContent="";
+}
+function runFind(){
+  clearFindMarks();
+  var q=(el("findq").value||"").trim();
+  if(q.length<2){el("findn").textContent=q?"type 2+ letters":"";return;}
+  var ql=q.toLowerCase();
+  // Walk only text nodes so the surrounding markup (links, mentions) is never broken.
+  var walker=document.createTreeWalker(el("msgs"),NodeFilter.SHOW_TEXT,null);
+  var targets=[],n;
+  while((n=walker.nextNode())){
+    if(!n.nodeValue||n.nodeValue.toLowerCase().indexOf(ql)<0)continue;
+    if(n.parentNode&&/^(SCRIPT|STYLE)$/.test(n.parentNode.nodeName))continue;
+    targets.push(n);
+  }
+  for(var t=0;t<targets.length;t++){
+    var node=targets[t],text=node.nodeValue,frag=document.createDocumentFragment(),from=0,idx;
+    while((idx=text.toLowerCase().indexOf(ql,from))>=0){
+      if(idx>from)frag.appendChild(document.createTextNode(text.slice(from,idx)));
+      var mark=document.createElement("span");mark.className="fhit";mark.textContent=text.slice(idx,idx+q.length);
+      frag.appendChild(mark);findHits.push(mark);
+      from=idx+q.length;
+    }
+    if(from<text.length)frag.appendChild(document.createTextNode(text.slice(from)));
+    node.parentNode.replaceChild(frag,node);
+  }
+  if(!findHits.length){el("findn").textContent="no matches";return;}
+  findAt=findHits.length-1;      // newest first, the way WhatsApp lands you
+  showFindHit();
+}
+function showFindHit(){
+  for(var i=0;i<findHits.length;i++)findHits[i].classList.toggle("cur",i===findAt);
+  var h=findHits[findAt];
+  if(h)h.scrollIntoView({block:"center",behavior:"smooth"});
+  el("findn").textContent=(findAt+1)+" / "+findHits.length;
+}
+function stepFind(d){
+  if(!findHits.length)return;
+  findAt=(findAt+d+findHits.length)%findHits.length;
+  showFindHit();
+}
+function openFind(){
+  if(!curChat)return;
+  el("findbar").style.display="flex";el("findq").focus();el("findq").select();
+}
+function closeFind(){clearFindMarks();el("findq").value="";el("findbar").style.display="none";}
+el("findq").addEventListener("input",runFind);
+el("findq").addEventListener("keydown",function(e){
+  if(e.key==="Enter"){e.preventDefault();stepFind(e.shiftKey?-1:1);}
+  if(e.key==="Escape")closeFind();
+});
+el("findopen").addEventListener("click",function(){
+  if(el("findbar").style.display==="none")openFind();else closeFind();
+});
+// Ctrl/Cmd+F searches THIS chat rather than the browser page — the thread is what people mean.
+document.addEventListener("keydown",function(e){
+  if((e.ctrlKey||e.metaKey)&&(e.key==="f"||e.key==="F")&&curChat){e.preventDefault();openFind();}
+});
+el("findprev").addEventListener("click",function(){stepFind(-1);});
+el("findnext").addEventListener("click",function(){stepFind(1);});
+el("findclose").addEventListener("click",closeFind);
+
+// --- jump to the latest message --------------------------------------------------------------
+el("msgs").addEventListener("scroll",function(){
+  el("tobottom").style.display=(curChat&&!threadAtBottom(200))?"":"none";
+});
+el("tobottom").addEventListener("click",function(){
+  var mb=el("msgs");mb.scrollTo({top:mb.scrollHeight,behavior:"smooth"});
+  el("tobottom").style.display="none";
+});
+
+// --- group members --------------------------------------------------------------------------
+// Clicking a GROUP's title lists who has spoken in it; clicking a name opens a private chat with
+// that person — the existing one if we already have it, otherwise a new conversation.
+async function showMembers(){
+  var c=chats.find(function(x){return x.id===curChat;});
+  if(!c||!c.isGroup)return;
+  var pop=el("memberpop");
+  pop.innerHTML='<div class="mh">Loading members…</div>';pop.style.display="";
+  try{
+    var d=await(await fetch("/api/chats/"+encodeURIComponent(curChat)+"/participants")).json();
+    var list=d.participants||[];
+    if(!list.length){pop.innerHTML='<div class="mh">No members seen yet</div>';return;}
+    var h='<div class="mh">'+list.length+' member'+(list.length>1?"s":"")+' · click to message privately</div>';
+    for(var i=0;i<list.length;i++){
+      var m=list[i],nm=m.name&&m.name!==m.id?m.name:"";
+      h+='<div class="memberrow" data-jid="'+esc(m.jid)+'" data-name="'+esc(nm||m.id)+'">'
+        +'<span class="mname">'+esc(nm||m.id)+'</span>'
+        +(nm?'<span class="mnum">'+esc(m.id)+'</span>':'')
+        +'<span class="mgo">message &#8594;</span></div>';
+    }
+    pop.innerHTML=h;
+  }catch(e){pop.innerHTML='<div class="mh">Could not load members</div>';}
+}
+function hideMembers(){el("memberpop").style.display="none";}
+el("memberpop").addEventListener("click",async function(e){
+  var row=e.target.closest(".memberrow");if(!row)return;
+  var jid=row.dataset.jid,name=row.dataset.name;
+  hideMembers();
+  var existing=chats.find(function(c){return c.id===jid;});
+  if(existing){selectChat(existing.id);return;}
+  // No conversation with this person yet — opening one starts a NEW WhatsApp chat, so say so.
+  if(!window.confirm('Start a new private chat with '+name+'?\\n\\nThis opens a conversation that does not exist yet.'))return;
+  await loadChats();
+  var again=chats.find(function(c){return c.id===jid;});
+  if(again)selectChat(again.id);
+  else toast("No messages with "+name+" yet — send one from the box below once the chat opens.",true);
+});
+document.addEventListener("click",function(e){
+  if(!e.target.closest("#memberpop")&&!e.target.closest("#threadtitle"))hideMembers();
+});
+el("threadtitle").addEventListener("click",function(){
+  var c=chats.find(function(x){return x.id===curChat;});
+  if(!c||!c.isGroup)return;
+  if(el("memberpop").style.display==="none")showMembers();else hideMembers();
+});
+
+el("chatlist").addEventListener("click",async function(e){
+  var r=e.target.closest(".chatrow");if(!r)return;
+  var id=r.dataset.id,hit=msgHits[id];
+  await selectChat(id);
+  // Opening from a CONTENT search should land on the message that matched, not at the bottom of
+  // the thread — otherwise you have found the chat but still have to hunt for the line.
+  if(hit&&hit.msgId)jumpToMessage(hit.msgId);
+});
+/** Scroll a message into view and flash it, the same way a tapped reply-quote does. */
+function jumpToMessage(mid){
+  var t=document.querySelector('.msgs .bubble[data-mid="'+cssq(mid)+'"]');
+  if(!t){toast("That message is further back than this view loads.",true);return;}
+  t.scrollIntoView({behavior:"smooth",block:"center"});
+  t.classList.add("flash");
+  setTimeout(function(){t.classList.remove("flash");},1600);
+}
+// Searching by NAME is instant and local; searching message CONTENT needs the server, so it is
+// debounced and merged in when it lands. The name results never wait for the network.
+var msgHits={},msgHitQ="",msgTimer=null;
+function runMsgSearch(){
+  var q=((el("chatsearch")&&el("chatsearch").value)||"").trim();
+  if(q.length<2){if(msgHitQ){msgHits={};msgHitQ="";renderChats();}return;}
+  if(msgTimer)clearTimeout(msgTimer);
+  msgTimer=setTimeout(async function(){
+    try{
+      var d=await(await fetch("/api/chats/search?q="+encodeURIComponent(q))).json();
+      // A slower earlier request must not overwrite a newer one's results.
+      if(((el("chatsearch")||{}).value||"").trim()!==q)return;
+      msgHits={};(d.hits||[]).forEach(function(h){msgHits[h.chatId]={msgId:h.msgId,snippet:h.snippet};});
+      msgHitQ=q;renderChats();
+    }catch(e){}
+  },260);
+}
+el("chatsearch").addEventListener("input",function(){renderChats();runMsgSearch();});
 
 // One compact row: qty + primary line; chosen rows also show "↳ Customer wrote: <text>".
 // The whole header is clickable to expand an inline search (accordion, one open at a time).
@@ -3560,7 +4324,30 @@ function rowHtml(i){
   var lno=it.line?'<span class="lno" title="line '+it.line+' of the message">'+it.line+'</span>':'';
   // Template shape, the same on every row (the client's ask): the product on its own line, then
   // "Customer Require -> <their words>" on a NEW line. Nothing shares a line, nothing is cut off.
-  var prod=ch?'<div class="pmain">'+fmt(ch)+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div>'
+  // Unit of measure. DDI gives each product a default unit and sometimes alternatives (303 items
+  // can be ordered by BOX/PIPE/ROL as well as EA), so a product with a choice gets a dropdown and
+  // one without just states its unit — a select with a single option would only invite clicking.
+  var uom='';
+  if(ch){
+    // ONLY the units DDI lists for this product. NHFFTC4020 sells as EA, BOX or SKI, so those are
+    // the three offered — showing all sixteen invites ordering a unit the product cannot be sold in.
+    var own=(ch.uoms&&ch.uoms.length?ch.uoms:(ch.uom?[ch.uom]:[]));
+    var def=ch.uom||own[0]||"EA";
+    var cur=it.uom||def;
+    if(own.indexOf(cur)<0&&own.length)cur=def;   // a stale pick from another product never sticks
+    if(own.length>1){
+      uom='<select class="uomsel" data-uom="'+i+'" title="Unit of measure sent to DDI — this item&#39;s default is '+esc(def)+'">';
+      for(var a=0;a<own.length;a++){
+        var c=own[a];
+        uom+='<option value="'+esc(c)+'"'+(c===cur?" selected":"")+'>'+esc(c)
+          +(UOMNAME[c]&&UOMNAME[c]!==c?" — "+esc(UOMNAME[c]):"")+(c===def?" (default)":"")+'</option>';
+      }
+      uom+='</select>';
+    } else if(cur){
+      uom='<span class="uomfix" title="Unit of measure sent to DDI'+(UOMNAME[cur]&&UOMNAME[cur]!==cur?" — "+esc(UOMNAME[cur]):"")+'">'+esc(cur)+'</span>';
+    }
+  }
+  var prod=ch?'<div class="pmain">'+fmt(ch)+uom+(it.learned?' <span class="learned">learned &#10003;</span>':'')+(it.guess&&!it.learned?' <span class="guess">check</span>':'')+'</div>'
              :'<div class="pmain nopick">not matched yet — click to choose</div>';
   var custText=it.manual?"":(it.raw||it.phrase);
   var cust=custText?'<div class="cust"><span class="creq">Customer Require</span> &#10132; '+esc(custText)+chips+'</div>':(chips?'<div class="cust">'+chips+'</div>':'');
@@ -3598,6 +4385,57 @@ function highlightLines(){
       if(elLn)elLn.classList.add("mlok");
     }
   }
+  paintSavedLines();
+}
+// The PERSISTENT half: lines already filled stay tinted with their saver's colour after the
+// extraction closes, so anyone opening the chat later sees who did what. Runs on every thread
+// render because the bubbles are rebuilt each time.
+function paintSavedLines(){
+  var old=document.querySelectorAll(".msgs .ml.own");
+  for(var i=0;i<old.length;i++){
+    var e0=old[i];e0.className="ml";
+    var tag=e0.querySelector(".mlord");if(tag)tag.remove();
+  }
+  for(var mid in batchesOf){
+    var owners=lineOwners(mid);
+    // WHILE EXTRACTING, other people's finished lines go neutral GREY instead of their own colour.
+    // Six person-colours competing with your live highlight made "already done" and "I just matched
+    // this" look alike — worse, the live green was the very same green as the first saver's. Grey
+    // is reserved and never assigned to anyone, so during a working pass the message reads simply:
+    // grey = someone did it, highlighted = you are doing it, plain = nobody has. Who did what is
+    // still on the badges, and the colours come back the moment the extraction closes.
+    var working=!!active[mid];
+    // Lines you have pulled BACK onto your desk are not "done" any more, they are what you are
+    // working on — so they must follow the ordinary matched/unmatched colours, not the grey that
+    // means "finished, not your problem". Only other people's finished lines stay grey.
+    var onDesk={};
+    if(working){
+      for(var w=0;w<items.length;w++){
+        if(items[w].mid===mid&&items[w].line)onDesk[items[w].line]=1;
+      }
+    }
+    var bubble=document.querySelector('.msgs .bubble[data-mid="'+cssq(mid)+'"]');
+    if(!bubble)continue;
+    var mls=bubble.querySelectorAll(".ml");
+    for(var ln in owners){
+      var elLn=mls[+ln-1];if(!elLn)continue;
+      if(working&&onDesk[ln])continue; // back in your panel: highlightLines paints it green/plain
+      elLn.classList.add("own",working?"owndone":("own"+owners[ln].c));
+      if(owners[ln].half)elLn.classList.add("half");
+      if(working)continue; // grey says "already done"; the order number belongs to the resting view
+      // Every finished line carries its order number, not just the people who used more than one.
+      // Reading a line should never require cross-referencing a badge to learn which DDI order it
+      // went out under.
+      var ords=Object.keys(owners[ln].ords||{});
+      if(ords.length){
+        var t=elLn.querySelector(".mlt");
+        if(t&&!elLn.querySelector(".mlord")){
+          var s=document.createElement("span");s.className="mlord";s.textContent=" - #"+ords.join(", #");
+          t.appendChild(s);
+        }
+      }
+    }
+  }
 }
 function renderRight(){
   openIdx=null;
@@ -3615,7 +4453,7 @@ function renderRight(){
   h+=items.map(function(_,i){return rowHtml(i);}).join("");
   h+='<button class="addbtnrow" id="additem">+ Add item &nbsp;<span style="font-weight:400;color:var(--mut)">(a product the customer did not write)</span></button>';
   h+='</div>';
-  h+='</div><div class="finalbox"><div class="h"><h2>Final Order</h2><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table>'
+  h+='</div><div class="finalbox'+(finalHidden?" collapsed":"")+'" id="finalbox"><div class="h"><h2>Final Order</h2><button class="foldbtn" id="foldfinal" title="Show or hide the order lines">&#9650;</button><div style="display:flex;gap:8px"><button class="btn ghost" id="clearbtn">Clear</button><button class="btn green" id="copybtn">Copy</button></div></div><table><thead><tr><th style="width:54px">Qty</th><th style="width:52px" title="Unit of measure">Unit</th><th style="width:118px">SKU</th><th>Product</th><th style="width:30px" aria-label="remove"></th></tr></thead><tbody id="finalbody"></tbody></table>'
    +'<div class="ddirow" id="ddirow" style="display:none"><label for="ddino">DDI order #</label><input id="ddino" placeholder="order number from DDI" maxlength="40"><button class="btn green" id="ddisave">Save</button></div></div>';
   el("right").innerHTML=h;
   updateFinal();
@@ -3673,14 +4511,22 @@ function choose(i,code){var p=findProduct(i,code);if(!p)return;
 function addItemAt(after){
   var at=(after==null)?items.length:after+1;
   var line=(after!=null&&items[after])?items[after].line:0;
-  items.splice(at,0,{mid:"",manual:true,phrase:"",quantity:"1",line:line,raw:"",unit:"",material:"",matched:null,chosen:null,guess:false,suggestions:[],results:[]});
+  // A hand-added row BELONGS to the message it was added under: the "+" on a row takes that row's
+  // message, the bottom button takes the last row's (or the only extracted message when the list is
+  // empty). Without this the row carried no message id, so un-extracting cleared the customer's
+  // products and left the hand-added ones stranded in the panel.
+  var owner=(after!=null&&items[after])?items[after]:items[items.length-1];
+  var mid=(owner&&owner.mid)||Object.keys(active)[0]||"";
+  items.splice(at,0,{mid:mid,manual:true,phrase:"",quantity:"1",line:line,raw:"",unit:"",material:"",matched:null,chosen:null,guess:false,suggestions:[],results:[]});
   renderRight();
   expandRow(at);
   var row=el("right").querySelector('.row[data-row="'+at+'"]');
   if(row){var ps=row.querySelector(".psearch");if(ps)ps.placeholder="search the product to add…";}
 }
 function addItem(){addItemAt(null);}
-function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="4" class="muted">Resolve products to build the order.</td></tr>';}
+function updateFinal(){var body=el("finalbody");if(!body)return;var html="";items.forEach(function(it,i){if(!it.chosen)return;html+='<tr><td>'+esc(it.quantity)+'</td><td class="uomcell">'+esc(uomOf(it))+'</td><td><span class="code">'+esc(it.chosen.code)+'</span></td><td>'+esc(it.chosen.description)+'</td><td style="text-align:right"><button class="rmfinal" data-idx="'+i+'" title="Remove — move back to Unmatched" aria-label="Remove">&#10005;</button></td></tr>';});body.innerHTML=html||'<tr><td colspan="5" class="muted">Resolve products to build the order.</td></tr>';}
+/** The unit this line goes out in: what the user picked, else the product's DDI default. */
+function uomOf(it){return (it&&(it.uom||(it.chosen&&it.chosen.uom)))||"";}
 
 // Typing in a row's search: <2 chars falls back to its suggestions; else live catalog search into .results.
 // limit=200: DDI shows pages of results for a short code like "SDS" and staff were getting six.
@@ -3688,6 +4534,13 @@ function updateFinal(){var body=el("finalbody");if(!body)return;var html="";item
 var doSearch=debounce(async function(i,q){if(!q||q.length<2){renderResults(i,items[i].suggestions||[]);return;}try{var d=await(await fetch("/api/products/search?limit=200&q="+encodeURIComponent(q))).json();items[i].results=d.results||[];var box=el("right").querySelector('.results[data-res="'+i+'"]');if(!box)return;var n=items[i].results.length,tot=d.total||n;if(!n){box.innerHTML='<div class="noopt">No matches.</div>';return;}var cnt=(tot>n?('showing '+n+' of '+tot+' — type more to narrow'):(tot+(tot===1?' match':' matches')));box.innerHTML='<div class="rescount">'+cnt+'</div>'+items[i].results.map(function(p){return '<button class="opt" data-idx="'+i+'" data-code="'+esc(p.code)+'">'+fmt(p)+'</button>';}).join("");}catch(e){}},220);
 
 el("right").addEventListener("input",function(e){var t=e.target;if(t.classList.contains("qty")){items[t.dataset.idx].quantity=t.value;updateFinal();}else if(t.classList.contains("psearch")){doSearch(t.dataset.idx,t.value);}});
+// Picking a different unit for ONE line. Kept on the item, not the product: the same product can
+// go out by the box on this order and singly on the next.
+el("right").addEventListener("change",function(e){
+  var s=e.target.closest(".uomsel");if(!s)return;
+  var it=items[+s.dataset.uom];if(!it)return;
+  it.uom=s.value;updateFinal();
+});
 el("right").addEventListener("click",function(e){
   var o=e.target.closest(".opt");if(o){choose(o.dataset.idx,o.dataset.code);return;}
   var rm=e.target.closest(".rmfinal");if(rm){var ri=+rm.dataset.idx;if(items[ri]){if(items[ri].manual){items.splice(ri,1);}else{items[ri].chosen=null;items[ri].learned=false;}}renderRight();return;}
@@ -3707,11 +4560,18 @@ el("right").addEventListener("click",function(e){
     return;
   }
   if(e.target.closest("#ddisave")){saveDdiNo();return;}
+  if(e.target.closest("#foldfinal")){
+    finalHidden=!finalHidden;
+    var fb=el("finalbox");if(fb)fb.classList.toggle("collapsed",finalHidden);
+    return;
+  }
   if(e.target.closest("#clearbtn")){clearOrder();return;}
   if(e.target.closest("#copybtn")){copyCsv();return;}
   if(e.target.closest(".psearch")||e.target.closest(".expand"))return; // don't toggle when interacting inside the open panel
   var top=e.target.closest(".top");
-  if(top&&!e.target.closest(".qty"))expandRow(+top.dataset.idx);
+  // The unit dropdown lives inside the row header, so a click on it used to ALSO count as a click
+  // on the header and expand the product search underneath the open list.
+  if(top&&!e.target.closest(".qty")&&!e.target.closest(".uomsel"))expandRow(+top.dataset.idx);
 });
 // Clear = discard the current extraction and reset the right panel (bubbles revert to Extract/Re-Extract).
 // Does NOT touch the database — nothing is un-processed; it just wipes the unsaved working order.
@@ -3744,8 +4604,22 @@ async function copyCsv(){
   if(!rows.length){var cb=el("copybtn");if(cb){var o=cb.textContent;cb.textContent="Resolve a product first";setTimeout(function(){cb.textContent=o;},1600);}return;}
   // Already saved by someone? Ask BEFORE touching anything. Cancel leaves the old save — who
   // saved it, its DDI number, everything — exactly as it was.
+  // Warn only about a genuine RE-save: putting a product on the order that somebody has already
+  // saved. Finishing the untouched remainder of a shift-filled order is ordinary work, and telling
+  // that person "OK replaces who saved it" would be both alarming and untrue — batches are additive.
   var midsPre=Object.keys(active),prevMid=null;
-  for(var pi=0;pi<midsPre.length;pi++){if(proc[midsPre[pi]]){prevMid=midsPre[pi];break;}}
+  for(var pi=0;pi<midsPre.length;pi++){
+    var pm=midsPre[pi];
+    if(!proc[pm])continue;
+    var bl=batchesOf[pm]||[];
+    // No batch history (saved before per-person batches existed) — we cannot tell what it covered,
+    // so keep the original warning rather than risk silently overwriting it.
+    if(!bl.length){prevMid=pm;break;}
+    var already={};
+    bl.forEach(function(b){batchSaved(b).forEach(function(x){already[(x.line||0)+"|"+(x.code||"")]=1;});});
+    var clash=rows.some(function(it){return it.mid===pm&&already[(it.line||0)+"|"+((it.chosen&&it.chosen.code)||"")];});
+    if(clash){prevMid=pm;break;}
+  }
   if(prevMid){
     var pwho=procBy[prevMid]||"someone",pno=orderNos[prevMid];
     var q="This order was already saved by "+pwho+(pno?(" with DDI order #"+pno):" (no DDI order number yet)")+".";
@@ -3754,7 +4628,9 @@ async function copyCsv(){
     q+=" Cancel keeps everything as it is.";
     if(!window.confirm(q))return;
   }
-  var csv=rows.map(function(it){return (it.quantity||"1")+","+it.chosen.code;}).join("\\n");
+  // What DDI expects on paste: qty, SKU, qty, UOM — the quantity twice, then the unit CODE
+  // (BX, EA, CRT…), never its description.
+  var csv=rows.map(function(it){var q=it.quantity||"1";return q+","+it.chosen.code+","+q+","+(uomOf(it)||"EA");}).join("\\n");
   // The clipboard can refuse (permission, unfocused page, browser policy). If it does we must NOT
   // mark the order Processed — otherwise staff paste nothing and the order silently looks done.
   var copied=await copyText(csv);
@@ -3765,7 +4641,15 @@ async function copyCsv(){
   }
   var mids=Object.keys(active),cnt=mids.length;
   if(!cnt)return;
-  var saveItems=rows.map(function(it){return {qty:it.quantity||"1",code:it.chosen.code,description:it.chosen.description,phrase:it.phrase};});
+  // mid + line ride along so the thread can later show WHICH lines this save covered, and colour
+  // them by whoever filled them. Without them a saved batch is just a flat product list.
+  var saveItems=rows.map(function(it){return {qty:it.quantity||"1",uom:uomOf(it),code:it.chosen.code,description:it.chosen.description,phrase:it.phrase,mid:it.mid||"",line:it.line||0};});
+  // …plus what is STILL open at this moment, flagged. The newest save's open list IS the remaining
+  // work, so the "Remaining" button needs no re-extraction to know whether anything is left.
+  items.forEach(function(it){
+    if(it.chosen)return;
+    saveItems.push({phrase:it.phrase||"",mid:it.mid||"",line:it.line||0,qty:it.quantity||"1",code:"",description:"",open:true});
+  });
   try{await fetch("/api/save",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({chatId:curChat,sources:sources,items:saveItems})});}catch(e){}
   // COMMIT the lessons now — picks only teach once the order is actually copied (Clear = forget).
   var lessons=items.filter(function(it){return it.learned&&it.chosen&&it.phrase;});
@@ -4281,6 +5165,8 @@ el("mbox").addEventListener("mousedown",function(e){   // mousedown: fires befor
 
 wireSwipe(el("msgs"));wireSwipe(el("right"));
 // Selecting a different chat resets the working order, so the sheet should not stay open over it.
+el("notifbtn").addEventListener("click",askNotifyPermission);
+syncNotifyBtn();
 loadCat();loadChats();setInterval(loadChats,6000);setInterval(refreshThread,4000);
 </script></body></html>`;
 }

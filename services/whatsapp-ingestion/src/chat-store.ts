@@ -10,11 +10,13 @@ export type ChatMsg = store.MsgRow;
  * is why only chats with a live message since the last start ever showed up.
  */
 export class ChatStore {
-  record(e: WaEvent): void {
+  /** `account` is the session that captured this message — it decides who may ever read it back. */
+  record(e: WaEvent, account: string): void {
     if (e.type !== 'message') return;
     store.saveMessage({
       messageId: e.messageId,
       chatId: e.groupId,
+      account,
       sender: e.sender,
       pushName: e.pushName,
       text: e.text ?? '',
@@ -38,11 +40,11 @@ export class ChatStore {
     store.saveReaction(e.reaction.targetMessageId, e.sender, e.reaction.emoji, e.ts);
   }
 
-  chats(): ChatSummary[] {
-    return store.listChats();
+  chats(account: string): ChatSummary[] {
+    return store.listChats(account);
   }
 
-  messages(id: string): ChatMsg[] {
-    return store.chatMessages(id, 500);
+  messages(id: string, account: string): ChatMsg[] {
+    return store.chatMessages(id, 500, account);
   }
 }

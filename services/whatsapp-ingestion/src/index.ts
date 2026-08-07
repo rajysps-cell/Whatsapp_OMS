@@ -13,14 +13,19 @@ import { scheduleDailyTimes } from './scheduler';
 import {
   bumpUnread,
   clearUnread,
+  dropAccount,
+  getSetting,
   markRevoked,
   hasMessagesFor,
+  pruneAccountChats,
+  retireAccountMessages,
   recordAccountChats,
   recordSentBy,
   saveMessage,
+  setSetting,
   upsertCatalog,
 } from './store';
-import { startWaClient, type WaClient } from './wa-client';
+import { CATALOG_EVERY_MS, startWaClient, type WaClient } from './wa-client';
 import {
   closeWebServer,
   mediaCacheDir,
@@ -138,32 +143,48 @@ function main(): void {
    * We cannot use the id returned by sendMessage: on @lid chats whatsapp-web.js gives back a
    * message whose id is unusable (empty), so the attribution record was silently skipped. The
    * 'message_create' event, by contrast, carries the same id we persist in `messages` — so the
-   * username is queued just before sending and claimed when that event arrives. Shared across
-   * sessions: a chat id is unique enough, and each session only claims for its own chats.
+   * username is queued just before sending and claimed when that event arrives.
+   *
+   * Keyed by ACCOUNT + chat. A chat id is NOT unique enough: a 1:1 id is the other person's jid,
+   * so two accounts messaging the same person share a key and either could claim the other's
+   * queued username.
    */
   const pendingSends = new Map<string, Array<{ who: string; at: number }>>();
   const PENDING_TTL_MS = 60_000; // a stale entry must never attribute a phone-typed message
-  const queueSend = (chatId: string, who: string): void => {
-    const q = pendingSends.get(chatId) ?? [];
+  const sendKey = (account: string, chatId: string): string => `${account}|${chatId}`;
+  const queueSend = (account: string, chatId: string, who: string): void => {
+    const k = sendKey(account, chatId);
+    const q = pendingSends.get(k) ?? [];
     q.push({ who, at: Date.now() });
-    pendingSends.set(chatId, q);
+    pendingSends.set(k, q);
   };
-  const claimSend = (chatId: string): string | null => {
-    const q = pendingSends.get(chatId);
+  const claimSend = (account: string, chatId: string): string | null => {
+    const k = sendKey(account, chatId);
+    const q = pendingSends.get(k);
     if (!q?.length) return null;
     const fresh = q.filter((e) => Date.now() - e.at < PENDING_TTL_MS);
     const next = fresh.shift() ?? null;
-    if (fresh.length) pendingSends.set(chatId, fresh);
-    else pendingSends.delete(chatId);
+    if (fresh.length) pendingSends.set(k, fresh);
+    else pendingSends.delete(k);
     return next ? next.who : null;
   };
 
+  /** account -> that session's own WhatsApp id ('…@lid'/'…@c.us'), learned when it connects. */
+  const selfJids = new Map<string, string>();
+
   /** The full ingestion pipeline for one session; identical logic for common and personal. */
-  const buildHandlers = (account: string, session: WaSession): Parameters<typeof startWaClient>[0] => ({
+  const buildHandlers = (account: string, session: WaSession): Parameters<typeof startWaClient>[0] => {
+    // Pruning is only meaningful once this session has had time to report itself fully: history
+    // backfill is what stamps a chat's messages, and chat admission depends on those stamps. Judge
+    // membership before that settles and the first sweep would delete every 1:1 chat the account
+    // legitimately has.
+    const startedAt = Date.now();
+    const mayPrune = (): boolean => Date.now() - startedAt > 3 * CATALOG_EVERY_MS;
+    return {
     onMessage: async (msg) => {
       const event = await toMessageEvent(msg);
       if (!event) return;
-      chats.record(event);
+      chats.record(event, account);
       // Membership on ARRIVAL, not only at the 2-min catalog sync — a brand-new chat must be
       // openable the moment its first message lands, or the thread endpoint 403s until the sync.
       // Only for real content: protocol notifications must not conjure chats into the list.
@@ -204,12 +225,12 @@ function main(): void {
       // and chats where our side spoke also appear. No order extraction on our own messages.
       const event = await toMessageEvent(msg);
       if (event) {
-        chats.record(event);
+        chats.record(event, account);
         if (event.text || event.media) recordAccountChats(account, [event.groupId]);
         if (event.media) void cacheMediaNow(session.client.media, event.messageId, event.kind);
         clearUnread(event.groupId); // replying from the account marks the chat read in WhatsApp
         // If this chat has a queued send from the app, this is that message — attribute it.
-        const who = claimSend(event.groupId);
+        const who = claimSend(account, event.groupId);
         if (who) {
           recordSentBy(event.messageId, who);
           logger.info({ chatId: event.groupId, user: who, messageId: event.messageId }, 'attributed sent message');
@@ -245,15 +266,47 @@ function main(): void {
       // bare contact entries — a personal account synced 832 of those as raw-number "chats".
       // (lastTs looked like a discriminator but WhatsApp stamps times onto contact entries too.)
       // The rule that matches what the user sees in their own WhatsApp: groups are chats, and a
-      // 1:1 is a chat once ANY message of it exists in our store (live or backfilled).
-      recordAccountChats(account, rows.filter((r) => r.isGroup || hasMessagesFor(r.id)).map((r) => r.id));
+      // 1:1 is a chat once ANY message of it exists in our store FOR THIS ACCOUNT.
+      const sweptAt = Date.now();
+      const ids = rows.filter((r) => r.isGroup || hasMessagesFor(r.id, account)).map((r) => r.id);
+      recordAccountChats(account, ids);
+      // …and forget what this sweep did NOT see, so a chat left on the phone (or one belonging to
+      // a previous number on this account slot) stops being visible. Guarded twice: an EMPTY
+      // catalog is a normal transient result (the watchdog treats it as valid), and one blank or
+      // partial read must never revoke a live account — hence the 3-sweep grace.
+      // ponytail: seen_at IS the generation; no epoch column needed.
+      if (ids.length && mayPrune()) {
+        const dropped = pruneAccountChats(account, sweptAt - 3 * CATALOG_EVERY_MS);
+        if (dropped) logger.info({ session: account, dropped }, 'pruned stale chat membership');
+      }
     },
     // Recovered history goes straight to the messages table (dedup on msg id) — no order
     // extraction on backfill; the /match "only new messages" flow decides what to process.
-    onHistory: (rows) => rows.forEach(saveMessage),
+    onHistory: (rows) => rows.forEach((r) => saveMessage({ ...r, account })),
     // Someone deleted-for-everyone (their phone or this app) — show WhatsApp's placeholder.
     onRevoked: (messageId) => markRevoked(messageId),
-  });
+    // Remember which WhatsApp number this account is, so our own reactions can be identified.
+    onIdentity: (wid) => {
+      if (selfJids.get(account) === wid) return;
+      // A DIFFERENT number now occupies this slot — someone unlinked and scanned another phone.
+      // Whether or not the Unlink button was used (the phone can drop the device on its own), the
+      // previous number's chats and history must stop belonging to this account, or they surface
+      // inside the new number's threads.
+      const prev = getSetting(`wa.self.${account}`, '');
+      if (prev && prev !== wid) {
+        const chats = dropAccount(account);
+        const msgs = retireAccountMessages(account, `${account}#${prev}`);
+        logger.warn(
+          { session: account, previous: prev, now: wid, chatsDropped: chats, messagesRetired: msgs },
+          'this account now points at a different WhatsApp number — the previous number\'s chats and history were retired',
+        );
+      }
+      selfJids.set(account, wid);
+      setSetting(`wa.self.${account}`, wid); // the web layer reads it from here
+      logger.info({ session: account, wid }, 'session identity');
+    },
+    };
+  };
 
   const startSession = (account: string, authDir: string): WaSession => {
     cleanSingletons(authDir);
@@ -289,10 +342,14 @@ function main(): void {
     },
     unlink(u: User): void {
       const s = sessions.get(`u${u.id}`);
+      // Revoke the chat list with the device. Otherwise the snapshot outlives the login and the
+      // user keeps READ access to every chat until they happen to link the same number again.
+      dropAccount(`u${u.id}`);
       if (s) void s.client.logout().catch((err) => logger.warn({ err, session: `u${u.id}` }, 'personal unlink failed'));
     },
     stop(userId: number): void {
       const k = `u${userId}`;
+      dropAccount(k); // same reason as unlink: no session, no chat list
       const s = sessions.get(k);
       if (!s) return;
       sessions.delete(k);
@@ -304,13 +361,19 @@ function main(): void {
   // Every injected action takes an optional `via` (the acting user's own client, resolved by the
   // web layer for personal-mode users); without it the shared business session acts.
   const asClient = (via: unknown): WaClient => (via as WaClient) ?? common.client;
+  /** Which account a `via` client belongs to — the other half of the send-attribution key. */
+  const accountOf = (via: unknown): string => {
+    if (via) for (const [k, s] of sessions) if (s.client === via) return k;
+    return 'common';
+  };
 
   const server = startWebServer(() => orders.all(), chats, async (chatId, text, mentions, sentBy, quotedId, via) => {
-    if (sentBy) queueSend(chatId, sentBy); // queue BEFORE sending so message_create can claim it
+    const acct = accountOf(via);
+    if (sentBy) queueSend(acct, chatId, sentBy); // queue BEFORE sending so message_create can claim it
     try {
       return await asClient(via).send(chatId, text, mentions, quotedId);
     } catch (err) {
-      claimSend(chatId); // send failed — drop the queued entry so it can't mis-attribute later
+      claimSend(acct, chatId); // send failed — drop the queued entry so it can't mis-attribute later
       throw err;
     }
   },
@@ -318,11 +381,12 @@ function main(): void {
   async (chatId, file, caption, mentions, sentBy, asVoice, via) => {
     // Same attribution path as a text send: the id that comes back is unusable on @lid chats,
     // so queue the sender and let the message_create event claim it.
-    if (sentBy) queueSend(chatId, sentBy);
+    const acct = accountOf(via);
+    if (sentBy) queueSend(acct, chatId, sentBy);
     try {
       return await asClient(via).sendMedia(chatId, file, caption, mentions, sentBy, asVoice);
     } catch (err) {
-      claimSend(chatId);
+      claimSend(acct, chatId);
       throw err;
     }
   },
@@ -333,7 +397,11 @@ function main(): void {
   personalWa,
   // The admin Settings page's "Unlink" for the BUSINESS account: log the device out; the
   // reconnect surfaces a fresh QR that the same page then displays for the new number.
-  () => common.client.logout());
+  // Drop the chat list too — linking a DIFFERENT number must not inherit the old one's chats.
+  () => {
+    dropAccount('common');
+    return common.client.logout();
+  });
 
   startProductImport(); // daily catalog refresh from the DDI export email (in-process, hot-reloads)
 
