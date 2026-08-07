@@ -148,6 +148,13 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
    * Close the browser and come back on a FRESH client, re-attaching every handler.
    * The only way back from a dead page — see makeClient() for why re-initializing is not.
    */
+  // Errors that mean the PAGE IS GONE, not that a call merely failed. These are unambiguous, so
+  // they justify rebuilding on the first occurrence instead of waiting three catalog sweeps (~6
+  // minutes) during which every send fails and every reaction is lost.
+  const PAGE_DEAD = /detached frame|target closed|session closed|execution context was destroyed|protocol error/i;
+  const isDeadPage = (err: unknown): boolean =>
+    PAGE_DEAD.test(String((err as { message?: string } | null)?.message ?? err ?? ''));
+
   const spawnFresh = (label: string): Promise<void> => {
     client = makeClient();
     sawReadyEvent = false; // a new browser has not proved its event hooks yet
@@ -245,6 +252,15 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
             // 2 minutes for 15.7 hours and nothing noticed.
             syncFails++;
             logger.error({ err, consecutiveFailures: syncFails }, 'catalog sync failed');
+            // A detached frame is proof, not a symptom: go now rather than in three sweeps.
+            if (isDeadPage(err) && syncRestarts < MAX_SYNC_RESTARTS) {
+              syncFails = 0;
+              syncRestarts++;
+              restartClient('the WhatsApp page is detached — rebuilding the session now', {
+                attempt: syncRestarts,
+              });
+              return;
+            }
             if (syncFails < MAX_SYNC_FAILS) return;
             syncFails = 0;
             if (syncRestarts >= MAX_SYNC_RESTARTS) return; // stop hammering a genuinely broken host
@@ -342,11 +358,18 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   const checkFalseReady = (): void => {
     if (!ready || sawReadyEvent || sawQr) return;
     if (!readyAt || Date.now() - readyAt < REAL_READY_GRACE_MS) return;
+    // Traffic beats theory. whatsapp-web.js' 'ready' event has not fired ONCE on this WhatsApp Web
+    // version — every session here connects through the catalog probe — so "no ready event" alone
+    // condemned healthy sessions and restarted them every 3 minutes, which is worse than the
+    // problem: each restart drops the reactions that arrive during it, and WhatsApp never re-sends
+    // those. A probe-only session that is still delivering events is simply a working session.
+    if (Date.now() - lastEventAt < SILENT_MS) return;
     if (bridgeRestarts >= MAX_BRIDGE_RESTARTS) return;
     bridgeRestarts++;
-    restartClient('connected only via the catalog probe — whatsapp-web.js never became ready, so no message can arrive; restarting', {
+    restartClient('connected only via the catalog probe AND silent since then — no message can arrive; restarting', {
       attempt: bridgeRestarts,
       readySince: new Date(readyAt).toISOString(),
+      silentForMs: Date.now() - lastEventAt,
     });
   };
   const checkEventBridge = (rows: CatalogRow[]): void => {

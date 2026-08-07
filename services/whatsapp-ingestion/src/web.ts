@@ -3200,6 +3200,20 @@ function matchPage(me: User): string {
   .mediaimg{display:block;margin:0 0 3px}
   .mediaimg img{display:block;max-width:100%;max-height:320px;border-radius:6px;background:#00000008}
   .mediaaud{display:block;width:min(260px,100%);height:38px;margin:2px 0 3px}
+  /* Voice note: play on the left, seek in the middle, time on the right. The right margin keeps
+     the seek bar clear of the bubble's message-menu button (42px wide, pinned to the corner). */
+  .voice{display:flex;align-items:center;gap:9px;width:min(272px,100%);margin:3px 46px 4px 0}
+  .voice .vaud{display:none}
+  .vplay{flex:0 0 auto;width:32px;height:32px;border:0;border-radius:50%;background:var(--em);
+    color:#04210f;font-size:13px;line-height:32px;cursor:pointer;padding:0}
+  .vplay:hover{filter:brightness(1.06)}
+  .vplay.playing{font-size:12px}
+  .vseek{flex:1;min-width:0;height:4px;-webkit-appearance:none;appearance:none;background:#c8d3d8;
+    border-radius:3px;outline:none;cursor:pointer}
+  .vseek::-webkit-slider-thumb{-webkit-appearance:none;width:11px;height:11px;border-radius:50%;
+    background:var(--em2);cursor:pointer}
+  .vseek::-moz-range-thumb{width:11px;height:11px;border:0;border-radius:50%;background:var(--em2)}
+  .vtime{flex:0 0 auto;font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums;min-width:30px}
   .mediavid{display:block;max-width:100%;max-height:320px;border-radius:6px;margin-bottom:3px;background:#000}
   .mediadoc{display:inline-block;margin-bottom:3px;padding:7px 11px;background:rgba(0,0,0,.05);
     border-radius:7px;color:var(--tx);text-decoration:none;font-size:13px}
@@ -3631,7 +3645,13 @@ function mediaBlock(m){
   // "we don't see voice notes" looked like from the outside.
   var fail=function(msg){return ' onerror="this.outerHTML=\\'<div class=&quot;medianote&quot;>'+msg+'</div>\\'"';};
   if(k==="voice"||k==="ptt"||k==="audio")
-    return '<audio class="mediaaud" controls preload="none" src="'+src+'"'+fail("Voice note unavailable")+'></audio>';
+    // Our own player, not <audio controls>: Chrome's native one puts its overflow menu at the far
+    // right, directly under the bubble's message-menu button, so that corner could not be clicked.
+    // Owning the layout puts Play on the LEFT (never covered) and leaves the corner clear.
+    return '<div class="voice"><button class="vplay" type="button" aria-label="Play voice note">&#9654;</button>'
+      +'<input class="vseek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek">'
+      +'<span class="vtime">0:00</span>'
+      +'<audio class="vaud" preload="none" src="'+src+'"'+fail("Voice note unavailable")+'></audio></div>';
   if(k==="video"||k==="ptv")
     return '<video class="mediavid" controls preload="none" src="'+src+'"'+fail("Video unavailable")+'></video>';
   if(k==="document")
@@ -3729,6 +3749,57 @@ function ackHtml(a){
   if(n===2)return '<span class="ck" title="Delivered">&#10003;&#10003;</span>';
   return '<span class="ck" title="Sent">&#10003;</span>';
 }
+// --- voice notes -----------------------------------------------------------------------------
+// One delegated set of handlers for every voice bubble, so re-rendering the thread costs nothing.
+function vfmt(sec){
+  if(!isFinite(sec)||sec<0)sec=0;
+  var m=Math.floor(sec/60),s2=Math.floor(sec%60);
+  return m+":"+(s2<10?"0":"")+s2;
+}
+function vrow(node){return node?node.closest(".voice"):null;}
+document.addEventListener("click",function(e){
+  var btn=e.target.closest(".vplay");if(!btn)return;
+  var row=vrow(btn),a=row&&row.querySelector(".vaud");if(!a)return;
+  if(a.paused){
+    // Only one voice note at a time, like WhatsApp.
+    var all=document.querySelectorAll(".vaud");
+    for(var i=0;i<all.length;i++)if(all[i]!==a&&!all[i].paused)all[i].pause();
+    a.play().catch(function(){});
+  }else a.pause();
+});
+// Dragging the seek bar before playback has loaded needs the metadata, so pull it in on demand.
+document.addEventListener("input",function(e){
+  var sk=e.target.closest(".vseek");if(!sk)return;
+  var row=vrow(sk),a=row&&row.querySelector(".vaud");if(!a||!isFinite(a.duration)||!a.duration)return;
+  a.currentTime=(Number(sk.value)/1000)*a.duration;
+},true);
+// timeupdate/play/pause do not bubble, so listen in the capture phase on the container.
+el("msgs").addEventListener("play",function(e){
+  var a=e.target.closest?e.target.closest(".vaud"):null;if(!a)return;
+  var row=vrow(a),b=row&&row.querySelector(".vplay");
+  if(b){b.innerHTML="&#10074;&#10074;";b.classList.add("playing");b.setAttribute("aria-label","Pause voice note");}
+},true);
+function vstop(e){
+  var a=e.target.closest?e.target.closest(".vaud"):null;if(!a)return;
+  var row=vrow(a),b=row&&row.querySelector(".vplay");
+  if(b){b.innerHTML="&#9654;";b.classList.remove("playing");b.setAttribute("aria-label","Play voice note");}
+}
+el("msgs").addEventListener("pause",vstop,true);
+el("msgs").addEventListener("ended",function(e){
+  vstop(e);
+  var a=e.target.closest?e.target.closest(".vaud"):null,row=vrow(a);
+  if(row){row.querySelector(".vseek").value=0;row.querySelector(".vtime").textContent=vfmt(a.duration);}
+},true);
+el("msgs").addEventListener("timeupdate",function(e){
+  var a=e.target.closest?e.target.closest(".vaud"):null;if(!a)return;
+  var row=vrow(a);if(!row)return;
+  if(isFinite(a.duration)&&a.duration)row.querySelector(".vseek").value=Math.round((a.currentTime/a.duration)*1000);
+  row.querySelector(".vtime").textContent=vfmt(a.currentTime);
+},true);
+el("msgs").addEventListener("loadedmetadata",function(e){
+  var a=e.target.closest?e.target.closest(".vaud"):null;if(!a)return;
+  var row=vrow(a);if(row)row.querySelector(".vtime").textContent=vfmt(a.duration);
+},true);
 // Live thread auto-refresh: re-poll the open chat, re-render only when messages/reactions change.
 function threadSig(ms){if(!ms.length)return"0";var last=ms[ms.length-1],rc=0,sp=0;for(var i=0;i<ms.length;i++){rc+=(ms[i].reactions?ms[i].reactions.length:0);if(ms[i].starred)sp++;if(ms[i].pinned)sp+=100;if(ms[i].kind==="revoked")sp+=10000;sp+=(ms[i].ack||0);/* a tick going grey->blue must re-render */}return ms.length+"|"+last.messageId+"|"+rc+"|"+sp;}
 // While an extraction is open here, keep its lock fresh (the server expires idle locks).

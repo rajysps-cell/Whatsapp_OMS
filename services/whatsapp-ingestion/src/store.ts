@@ -566,6 +566,22 @@ const insMessage = db.prepare(
     "ON CONFLICT(msg_id) DO UPDATE SET account = excluded.account WHERE messages.account = ''",
 );
 // Latest message per chat (window fn), newest chat first. Powers the /match chat list.
+// Kinds that carry no readable content. Hidden ONLY when the body is empty, so a real message that
+// happens to land in one of these buckets is never lost. WhatsApp does not draw them either — they
+// are protocol chatter that showed up in the thread as bare "[other]" / "[ciphertext]" bubbles.
+const SYSTEM_KINDS = [
+  'unknown',
+  'other', // two of these arrived alongside one real message in the Raj Patel chat
+  'ciphertext', // a message that failed to decrypt; the readable copy arrives separately
+  'e2e_notification',
+  'gp2',
+  'notification_template',
+  'call_log',
+  'message_history_notice',
+  'biz_content_placeholder',
+  'interactive',
+];
+
 const listChatsStmt = db.prepare(`
   SELECT chat_id, is_group, cnt, ts AS last_ts, body AS last_text, kind FROM (
     SELECT chat_id, is_group, body, kind, ts,
@@ -573,6 +589,8 @@ const listChatsStmt = db.prepare(`
       ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY ts DESC, msg_id DESC) AS rn
     FROM messages
     WHERE ${ACCOUNT_SCOPE}
+      AND deleted = 0
+      AND NOT (COALESCE(body, '') = '' AND kind IN (${SYSTEM_KINDS.map((k) => `'${k}'`).join(',')}))
   ) WHERE rn = 1
   ORDER BY last_ts DESC
   LIMIT 1000
@@ -587,16 +605,6 @@ const catalogAllStmt = db.prepare('SELECT chat_id, name, is_group, last_ts, unre
 // stored but has neither text nor media, so it rendered as a blank bubble AND ate a slot in the
 // LIMIT window below, pushing real messages out of the thread. Drop the content-free ones only:
 // anything with a body, and every media kind, still shows.
-const SYSTEM_KINDS = [
-  'unknown',
-  'e2e_notification',
-  'gp2',
-  'notification_template',
-  'call_log',
-  'message_history_notice',
-  'biz_content_placeholder',
-  'interactive',
-];
 const chatMsgsStmt = db.prepare(`
   SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned, ack FROM (
     SELECT msg_id, sender, push_name, body, kind, from_me, is_group, ts, reply_to, reply_text, reply_sender, starred, pinned, ack
@@ -1123,8 +1131,11 @@ export function listChats(account: string): ChatRow[] {
   }
   const out = Array.from(byId.values());
   for (const r of out) if (!r.title) r.title = tail(r.id);
-  // Unread chats float to the top (newest first within each group), then everything else by recency.
-  return out.sort((a, b) => (b.unread > 0 ? 1 : 0) - (a.unread > 0 ? 1 : 0) || b.lastTs - a.lastTs);
+  // Newest activity first, exactly like WhatsApp — the chat you just replied in belongs at the top.
+  // Unread chats used to be floated above everything else, which stranded a 2-day-old unread chat
+  // over one that had just moved. Worse, that float keyed on WhatsApp's OWN unread count while the
+  // badge shown in the list is per-user, so the order did not even match the badges beside it.
+  return out.sort((a, b) => b.lastTs - a.lastTs);
 }
 
 /** Recent persisted history for one chat, chronological. */
