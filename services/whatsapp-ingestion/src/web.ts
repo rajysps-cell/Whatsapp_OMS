@@ -425,20 +425,43 @@ function checkInlineScripts(): void {
 }
 
 /** Caller's IP — behind the Cloudflare tunnel the socket is always localhost, so prefer its header. */
+/**
+ * True when this connection came from the Cloudflare tunnel running on this machine, which is the
+ * ONLY peer allowed to tell us who the real caller is. cloudflared connects over loopback.
+ */
+function viaLocalTunnel(req: http.IncomingMessage): boolean {
+  const peer = req.socket.remoteAddress ?? '';
+  return peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+}
+/**
+ * The caller's IP — used for the login lockout and the activity log, so it must not be something
+ * the caller can choose.
+ *
+ * CF-Connecting-IP / X-Forwarded-For used to be trusted from ANY peer. The server also answers on
+ * its LAN address, so a request straight to that port could name its own IP: verified by posting a
+ * failed login with CF-Connecting-IP: 203.0.113.77 and finding exactly that value in the lockout
+ * table. A new value on each attempt means the 8-try lockout never fires — unlimited password
+ * guessing. Now only the local tunnel is believed; anyone else is recorded by their real socket.
+ */
 function clientIp(req: http.IncomingMessage): string {
+  const socketIp = req.socket.remoteAddress ?? '';
+  if (!viaLocalTunnel(req)) return socketIp;
   const cf = req.headers['cf-connecting-ip'];
   const cfIp = Array.isArray(cf) ? cf[0] : cf;
   if (cfIp) return cfIp.trim();
   const xff = req.headers['x-forwarded-for'];
   const xffVal = Array.isArray(xff) ? xff[0] : xff;
   if (xffVal) return xffVal.split(',')[0]?.trim() ?? '';
-  return req.socket.remoteAddress ?? '';
+  return socketIp;
 }
 /** True when the browser reached us over HTTPS (directly, or through the Cloudflare tunnel). */
 function isSecureReq(req: http.IncomingMessage): boolean {
-  const proto = req.headers['x-forwarded-proto'];
-  const first = Array.isArray(proto) ? proto[0] : proto;
-  if (first) return first.split(',')[0]?.trim() === 'https';
+  // Same trust rule as clientIp: only the local tunnel may claim the request arrived over HTTPS.
+  if (viaLocalTunnel(req)) {
+    const proto = req.headers['x-forwarded-proto'];
+    const first = Array.isArray(proto) ? proto[0] : proto;
+    if (first) return first.split(',')[0]?.trim() === 'https';
+  }
   return (req.socket as { encrypted?: boolean }).encrypted === true;
 }
 /** Minimal mime<->extension mapping for the media cache (only what WhatsApp actually sends). */
