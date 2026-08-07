@@ -188,6 +188,9 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
   // list and sends fine but NEVER receives. Measured: every probe-only session delivered zero
   // messages, while every real-ready session delivered them normally.
   let sawReadyEvent = false;
+  // When the history backfill last ran. See becomeReady for why this is throttled.
+  const BACKFILL_EVERY_MS = 30 * 60 * 1000;
+  let lastBackfillAt = 0;
   let readyAt = 0;
   // Consecutive catalog-sync throws. Zero on any answer; three in a row (~6 min) means the page
   // is gone rather than merely quiet, and only a fresh browser brings it back.
@@ -275,7 +278,15 @@ export function startWaClient(handlers: WaClientHandlers, opts: WaSessionOpts = 
       if (catalogTimer) clearInterval(catalogTimer); // 'ready' re-fires after reconnects
       catalogTimer = setInterval(sync, CATALOG_EVERY_MS);
     }
-    if (handlers.onHistory) {
+    // ONCE per half hour, not on every reconnect. The backfill walks every chat and calls
+    // loadEarlierMsgs up to 15 times each to pull it 300 messages deep — 575 chats' worth of
+    // history dragged into the page's model store. Re-running that on each reconnect was a
+    // feedback loop: the page died about a minute after each backfill, the guard rebuilt the
+    // session, and the fresh session immediately backfilled again. Sends failed for the whole
+    // window because sendMessage needs that same page. History does not change retroactively and
+    // live messages arrive as events, so once is enough.
+    if (handlers.onHistory && Date.now() - lastBackfillAt > BACKFILL_EVERY_MS) {
+      lastBackfillAt = Date.now();
       historyBackfill(client, handlers.onHistory).catch((err) =>
         logger.error({ err }, 'history backfill failed'),
       );
