@@ -1493,7 +1493,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       appUsers: allUsernames(), // names recognised in the "-- <username>" signature
       pinned: pinnedMessage(id), // newest pinned message -> the banner above the thread
       claims, // messageId -> username currently extracting it (the lock)
-      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, ack: m.ack, orderNo: orderNos.get(m.messageId), batches: batches.get(m.messageId) ?? [] })),
+      messages: msgs.map((m) => ({ messageId: m.messageId, fromMe: m.fromMe, pushName: m.pushName, sender: m.sender, text: m.text, kind: m.kind, hasMedia: m.kind !== 'text', ts: m.ts, processed: isProcessed(m.messageId), outgoing: isWarehouseMsg(m), reactions: m.reactions, reactors: m.reactors, isGroup: m.isGroup, replyTo: m.replyTo, replyText: m.replyText, replySender: m.replySender, processedBy: m.processedBy, sentBy: m.sentBy, starred: m.starred, pinned: m.pinned, ack: m.ack, orderNo: orderNos.get(m.messageId), batches: batches.get(m.messageId) ?? [] })),
     });
     return;
   }
@@ -3264,6 +3264,8 @@ function matchPage(me: User): string {
   .mbtn:hover{color:#000}
   .bubble:hover .mbtn,.mbtn:focus{opacity:1}
   @media (hover:none){.mbtn{opacity:.8}}
+  .who.tap{cursor:pointer}
+  .who.tap:hover{text-decoration:underline}
   .starred{color:#f59e0b;margin-right:4px;font-size:11px}
   /* Pinned-message bar above the thread, like WhatsApp's. Click scrolls to the message. */
   .pinbar{display:none;align-items:center;gap:8px;background:var(--panel);border-bottom:1px solid var(--line);
@@ -3730,7 +3732,10 @@ var sig=splitSignature(m.text||"",!!m.fromMe);var sentBy=m.sentBy||sig.by;
 msgIndex[m.messageId]=m;m._sby=m.sentBy||null;m._clean=sig.body||m.text||""; // for the message menu (delete needs the DB attribution, not the spoofable signature)
 var mediaHtml=mediaBlock(m);
 var revoked=(m.kind==="revoked"); // sender deleted it in WhatsApp; show what WhatsApp shows, not "[revoked]"
-var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;if(m.batches&&m.batches.length)batchesOf[m.messageId]=m.batches;else delete batchesOf[m.messageId];var mid=esc(m.messageId);var nm=(!out&&m.isGroup&&!grp)?'<div class="who" style="color:'+nameColor(sk)+'">'+esc(m.pushName||"~")+'</div>':"";var ck=out?ackHtml(m.ack):"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
+var body=revoked?"":(sig.body||(m.hasMedia&&!mediaHtml?("["+(m.kind||"media")+"]"):(m.text?"":(mediaHtml?"":"["+(m.kind||"msg")+"]"))));var xable=(!out&&m.text&&!isBareUrl(m.text));if(xable&&m.processed){proc[m.messageId]=true;if(m.processedBy)procBy[m.messageId]=m.processedBy;}if(m.orderNo)orderNos[m.messageId]=m.orderNo;if(m.batches&&m.batches.length)batchesOf[m.messageId]=m.batches;else delete batchesOf[m.messageId];var mid=esc(m.messageId);var wj=(!out&&m.isGroup)?bareJid(m.sender||""):"";
+var nm=(!out&&m.isGroup&&!grp)?'<div class="who'+(wj?" tap":"")+'" style="color:'+nameColor(sk)+'"'
+  +(wj?' data-jid="'+esc(wj)+'" data-name="'+esc(m.pushName||wj)+'" title="Message this person privately"':'')
+  +'>'+esc(m.pushName||"~")+'</div>':"";var ck=out?ackHtml(m.ack):"";var rx=(m.reactions||[]).slice();var pr=pendingReacts[m.messageId];if(pr){if(rx.indexOf(pr)>=0)delete pendingReacts[m.messageId];else rx.push(pr);}var hr=rx.length;var re=hr?'<div class="react" title="See who reacted">'+reactSummary(rx)+'</div>':"";
 // The familiar oval "Sent by" pill — kept as it was, just moved ABOVE the message text.
 var sentTag=sentBy?'<div><span class="sentby">Sent by <b>'+esc(sentBy)+'</b></span></div>':"";
 // ⌄ opens the message menu — visible on hover (always on touch). Star shows next to the time.
@@ -4352,9 +4357,19 @@ async function showMembers(){
   }catch(e){pop.innerHTML='<div class="mh">Could not load members</div>';}
 }
 function hideMembers(){el("memberpop").style.display="none";}
-el("memberpop").addEventListener("click",async function(e){
-  var row=e.target.closest(".memberrow");if(!row)return;
-  var jid=row.dataset.jid,name=row.dataset.name;
+/** Drop any device suffix: 1234:52@lid and 1234@lid are the same person. */
+function bareJid(j){var at=String(j||"").indexOf("@");if(at<1)return "";return j.slice(0,at).split(":")[0]+j.slice(at);}
+/**
+ * Open a private chat with someone — from the group member list, or from tapping their name above
+ * a message in a group. One path, so both behave identically.
+ */
+async function openPrivateChat(jid,name){
+  if(!jid)return;
+  // Some senders have no pushName, so the label would be the raw jid. Fall back to the contact
+  // name we already resolve for @mentions before showing a wall of digits in the dialog.
+  var id=String(jid).split("@")[0];
+  if((!name||name===jid||name===id)&&mentionMap&&mentionMap[id])name=mentionMap[id];
+  if(!name)name=id;
   hideMembers();
   var existing=chats.find(function(c){return c.id===jid;});
   if(existing){selectChat(existing.id);return;}
@@ -4369,6 +4384,16 @@ el("memberpop").addEventListener("click",async function(e){
   chats.unshift({id:jid,title:name,isGroup:false,unread:0,lastText:"",lastTs:Math.floor(Date.now()/1000)});
   await selectChat(jid);
   toast("New chat with "+name+" — your first message starts the conversation.");
+}
+el("memberpop").addEventListener("click",function(e){
+  var row=e.target.closest(".memberrow");if(!row)return;
+  openPrivateChat(row.dataset.jid,row.dataset.name);
+});
+// Tapping the sender name above a group message does the same thing, like WhatsApp.
+el("msgs").addEventListener("click",function(e){
+  var w=e.target.closest(".who.tap");if(!w)return;
+  e.preventDefault();e.stopPropagation();
+  openPrivateChat(w.dataset.jid,w.dataset.name);
 });
 document.addEventListener("click",function(e){
   if(!e.target.closest("#memberpop")&&!e.target.closest("#threadtitle"))hideMembers();
